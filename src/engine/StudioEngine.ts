@@ -4,6 +4,7 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import type {
   AxisConstraint,
+  CameraOrientationState,
   CameraPose,
   DetachedPartSource,
   EditorCameraPreset,
@@ -12,6 +13,7 @@ import type {
   HoverTargetInfo,
   IkChainType,
   IkTargetData,
+  LiveSizeInfo,
   MotionPathData,
   NodeMaterialOverride,
   SceneGroupData,
@@ -19,10 +21,14 @@ import type {
   ScenePropData,
   SelectionFilter,
   SelectionTarget,
+  SizeUnit,
   SnapSettings,
+  StageEnvironmentConfig,
+  StageWallConfig,
   Transform3D,
   Vec3,
 } from '../core/types';
+import { createDefaultStageConfig } from '../core/types';
 import { sampleMotionPathCurve } from '../animation/MotionPath';
 import type { EvaluatedGroupState, EvaluatedLightState, EvaluatedPropState } from '../animation/SceneEvaluator';
 import type { AnyCharacterAdapter } from '../characters/CharacterRegistry';
@@ -48,6 +54,8 @@ export interface StudioEngineCallbacks {
   onMarqueeSelect?: (targets: SelectionTarget[], additive?: boolean) => void;
   onPoseModeChange?: (instanceId: string | null, preferredNodeId?: string) => void;
   onHoverChanged?: (hover: HoverTargetInfo | null) => void;
+  onLiveSizeChange?: (info: LiveSizeInfo | null) => void;
+  onCameraOrientationChange?: (state: CameraOrientationState) => void;
   onContextMenuRequest?: (clientX: number, clientY: number, target: SelectionTarget) => void;
   onCharacterTransformCommit: (instanceId: string, transform: Transform3D) => void;
   onNodeTransformCommit: (
@@ -114,8 +122,22 @@ export class StudioEngine {
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointerNdc = new THREE.Vector2();
 
-  private readonly gridHelper: THREE.GridHelper;
-  private readonly floorMesh: THREE.Mesh;
+  private gridHelper: THREE.GridHelper;
+  private floorMesh: THREE.Mesh;
+  private readonly wallsGroup = new THREE.Group();
+  private readonly cloudsGroup = new THREE.Group();
+  private readonly scaleHandleGroup = new THREE.Group();
+  private scaleHandleMesh: THREE.Mesh;
+  private scaleHandleLine: THREE.Line;
+  private stageConfig: StageEnvironmentConfig = createDefaultStageConfig();
+  private stageFloorSig = '';
+  private stageGridSig = '';
+  private stageWallsSig = '';
+  private stageCloudsSig = '';
+  private floorLockEnabled = true;
+  private showGridFlag = true;
+  private lastOrientationSig = '';
+  private lastLiveSizeSig = '';
   private readonly sceneCameraMarker: THREE.Group;
   private readonly selectionBoxHelper: THREE.BoxHelper;
   private readonly selectionBoxesGroup = new THREE.Group();
@@ -220,7 +242,18 @@ export class StudioEngine {
     startObjPos: THREE.Vector3;
     startHitPoint: THREE.Vector3;
     dragPlane: THREE.Plane;
+    isHorizontalPlane: boolean;
     groupMemberStarts?: { obj: THREE.Object3D; startPos: THREE.Vector3 }[];
+    active: boolean;
+  } | null = null;
+  private directScaleNodeDrag: {
+    target: SelectionTarget;
+    obj: THREE.Object3D;
+    startClientX: number;
+    startClientY: number;
+    startScale: THREE.Vector3;
+    startObjPos: THREE.Vector3;
+    groupMemberStarts?: { obj: THREE.Object3D; startScale: THREE.Vector3; startPos: THREE.Vector3 }[];
     active: boolean;
   } | null = null;
 
@@ -292,13 +325,13 @@ export class StudioEngine {
     pmrem.dispose();
 
     this.scene.background = new THREE.Color('#16181c');
-    this.scene.fog = new THREE.FogExp2('#16181c', 0.014);
+    this.scene.fog = new THREE.FogExp2('#16181c', 0.0045);
 
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
     const aspect = width / height;
 
-    this.editorCamera = new THREE.PerspectiveCamera(42, aspect, 0.1, 160);
+    this.editorCamera = new THREE.PerspectiveCamera(42, aspect, 0.1, 400);
     this.editorCamera.position.set(7.5, 4.8, 12.8);
 
     this.editorOrthoCamera = new THREE.OrthographicCamera(
@@ -307,15 +340,15 @@ export class StudioEngine {
       this.editorOrthoSize,
       -this.editorOrthoSize,
       0.1,
-      160,
+      400,
     );
     this.editorOrthoCamera.position.copy(this.editorCamera.position);
 
-    this.sceneCamera = new THREE.PerspectiveCamera(40, aspect, 0.1, 160);
+    this.sceneCamera = new THREE.PerspectiveCamera(40, aspect, 0.1, 400);
     this.sceneCamera.position.set(0, 2.9, 12.8);
     this.sceneCamera.lookAt(0, 2.0, 0);
 
-    this.orthoSceneCamera = new THREE.OrthographicCamera(-6 * aspect, 6 * aspect, 6, -6, 0.1, 160);
+    this.orthoSceneCamera = new THREE.OrthographicCamera(-6 * aspect, 6 * aspect, 6, -6, 0.1, 400);
     this.orthoSceneCamera.position.copy(this.sceneCamera.position);
     this.orthoSceneCamera.lookAt(0, 2.0, 0);
 
@@ -323,22 +356,77 @@ export class StudioEngine {
     this.scene.add(this.lightMarkersGroup);
     this.scene.add(this.propsGroup);
     this.scene.add(this.groupProxiesGroup);
+    this.scene.add(this.wallsGroup);
+    this.scene.add(this.cloudsGroup);
 
-    const floorGeom = new THREE.CircleGeometry(28, 64);
-    floorGeom.rotateX(-Math.PI / 2);
+    // Default floor is a crisp Square canvas stage flush at y = 0
+    const floorGeom = new THREE.BoxGeometry(28, 0.08, 28);
     const floorMat = new THREE.MeshStandardMaterial({
       color: 0x1b1e24,
-      roughness: 0.92,
+      roughness: 0.88,
       metalness: 0.05,
+      side: THREE.FrontSide,
     });
     this.floorMesh = new THREE.Mesh(floorGeom, floorMat);
-    this.floorMesh.position.y = -0.01;
+    this.floorMesh.position.y = -0.04;
     this.floorMesh.receiveShadow = true;
+    this.floorMesh.frustumCulled = false;
     this.scene.add(this.floorMesh);
 
     this.gridHelper = new THREE.GridHelper(28, 28, 0x3a404d, 0x262a33);
     this.gridHelper.position.y = 0.005;
     this.scene.add(this.gridHelper);
+
+    // Build stylized sky clouds
+    this.rebuildStageClouds(this.stageConfig);
+
+    // Interactive 3D Scale Handle Node (floating diamond node at top-right corner of selected object)
+    this.scaleHandleGroup.name = 'interactive_scale_node_group';
+    this.scaleHandleGroup.visible = false;
+    this.scaleHandleGroup.userData.__isSelectionHighlight = true;
+
+    const handleGeom = new THREE.OctahedronGeometry(0.18, 0);
+    const handleMat = new THREE.MeshBasicMaterial({
+      color: 0xf59e0b,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.96,
+    });
+    this.scaleHandleMesh = new THREE.Mesh(handleGeom, handleMat);
+    this.scaleHandleMesh.renderOrder = 999;
+    this.scaleHandleMesh.userData.isScaleNodeHandle = true;
+    this.scaleHandleMesh.userData.__isSelectionHighlight = true;
+    // Crisp cyan halo ring around the scale node so it is unmistakable
+    const ringGeom = new THREE.RingGeometry(0.22, 0.27, 24);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      side: THREE.DoubleSide,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.92,
+    });
+    const ringMesh = new THREE.Mesh(ringGeom, ringMat);
+    ringMesh.renderOrder = 998;
+    ringMesh.userData.isScaleNodeHandle = true;
+    ringMesh.userData.__isSelectionHighlight = true;
+    this.scaleHandleMesh.add(ringMesh);
+    this.scaleHandleGroup.add(this.scaleHandleMesh);
+
+    const connGeom = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0.4, 0.4, 0.4),
+    ]);
+    const connMat = new THREE.LineBasicMaterial({
+      color: 0xf59e0b,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.85,
+    });
+    this.scaleHandleLine = new THREE.Line(connGeom, connMat);
+    this.scaleHandleLine.renderOrder = 997;
+    this.scaleHandleLine.userData.__isSelectionHighlight = true;
+    this.scaleHandleGroup.add(this.scaleHandleLine);
+    this.scene.add(this.scaleHandleGroup);
 
     this.sceneCameraMarker = this.buildSceneCameraMarker();
     this.scene.add(this.sceneCameraMarker);
@@ -380,6 +468,8 @@ export class StudioEngine {
       if (this.editorProjection === 'perspective') {
         this.syncEditorOrthoCamera();
       }
+      this.updateScaleHandleVisual();
+      this.emitCameraOrientation();
       this.requestRender();
     });
 
@@ -393,12 +483,26 @@ export class StudioEngine {
       this.orbitControls.enabled = !dragging && this.viewMode === 'editor';
       if (!dragging) {
         this.commitGizmoTransform();
+        this.emitLiveSize(false);
       }
       this.requestRender();
     });
 
     this.transformControls.addEventListener('objectChange', () => {
+      const attached = this.transformControls.object;
+      if (
+        attached &&
+        this.floorLockEnabled &&
+        this.transformControls.getMode() === 'translate' &&
+        (this.currentSelection.kind === 'character' ||
+          this.currentSelection.kind === 'prop' ||
+          this.currentSelection.kind === 'group')
+      ) {
+        this.clampObjectAboveFloor(attached);
+      }
       this.updateSelectionBoxesOnly();
+      this.updateScaleHandleVisual();
+      this.emitLiveSize(this.transformControls.getMode() === 'scale');
       if (this.lastRigInstanceId) {
         this.rigVisualizer.updateLivePositions(
           this.adapters.get(this.lastRigInstanceId),
@@ -578,35 +682,75 @@ export class StudioEngine {
 
   setEditorCameraPreset(preset: EditorCameraPreset): void {
     this.focusAnim = null;
-    const target = this.getSelectionWorldCenter() ?? new THREE.Vector3(0, 1.8, 0);
-    const dist = Math.max(3.2, this.editorCamera.position.distanceTo(this.orbitControls.target));
+    const target = this.getSelectionWorldCenter() ?? new THREE.Vector3(0, 1.5, 0);
+    const dist = THREE.MathUtils.clamp(
+      this.editorCamera.position.distanceTo(this.orbitControls.target),
+      4.5,
+      26,
+    );
     const offset = new THREE.Vector3(0, 0, dist);
     switch (preset) {
       case 'front':
-        offset.set(0, 0.2, dist);
+        offset.set(0, 0, dist);
         break;
       case 'back':
-        offset.set(0, 0.2, -dist);
+        offset.set(0, 0, -dist);
         break;
       case 'left':
-        offset.set(-dist, 0.2, 0);
+        offset.set(-dist, 0, 0);
         break;
       case 'right':
-        offset.set(dist, 0.2, 0);
+        offset.set(dist, 0, 0);
         break;
       case 'top':
-        offset.set(0, dist, 0.01);
+        offset.set(0, dist, 0.02);
         break;
       case 'bottom':
-        offset.set(0, -dist, 0.01);
+        // Ensure orbit allows viewing from underneath when user explicitly picks Bottom
+        if (this.orbitControls.maxPolarAngle < Math.PI * 0.96) {
+          this.orbitControls.maxPolarAngle = Math.PI * 0.96;
+        }
+        offset.set(0, -dist, 0.02);
         break;
       default:
-        offset.set(dist * 0.55, dist * 0.28, dist * 0.85);
+        offset.set(dist * 0.52, dist * 0.3, dist * 0.82);
         break;
     }
     const nextPos = target.clone().add(offset);
     this.focusAnim = { targetPos: nextPos, targetLook: target, remainingFrames: 16 };
     this.requestRender();
+  }
+
+  getCameraOrientation(): CameraOrientationState {
+    const cam = this.getActiveEditorCamera();
+    cam.updateMatrixWorld();
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion).normalize();
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion).normalize();
+
+    let viewLabel = this.editorProjection === 'orthographic' ? '3D Ortho' : '3D View';
+    if (forward.z < -0.94 && Math.abs(forward.y) < 0.25) viewLabel = 'Front';
+    else if (forward.z > 0.94 && Math.abs(forward.y) < 0.25) viewLabel = 'Back';
+    else if (forward.x < -0.94 && Math.abs(forward.y) < 0.25) viewLabel = 'Right';
+    else if (forward.x > 0.94 && Math.abs(forward.y) < 0.25) viewLabel = 'Left';
+    else if (forward.y < -0.94) viewLabel = 'Top';
+    else if (forward.y > 0.94) viewLabel = 'Bottom';
+
+    return {
+      forward: { x: forward.x, y: forward.y, z: forward.z },
+      right: { x: right.x, y: right.y, z: right.z },
+      up: { x: up.x, y: up.y, z: up.z },
+      viewLabel,
+    };
+  }
+
+  private emitCameraOrientation(): void {
+    if (!this.callbacks.onCameraOrientationChange) return;
+    const st = this.getCameraOrientation();
+    const sig = `${st.viewLabel}:${st.forward.x.toFixed(2)},${st.forward.y.toFixed(2)},${st.forward.z.toFixed(2)}:${st.up.x.toFixed(2)},${st.up.y.toFixed(2)},${st.up.z.toFixed(2)}`;
+    if (sig === this.lastOrientationSig) return;
+    this.lastOrientationSig = sig;
+    this.callbacks.onCameraOrientationChange(st);
   }
 
   /**
@@ -764,20 +908,231 @@ export class StudioEngine {
   }
 
   setSceneAppearance(backgroundColor: string, showGrid: boolean, floorColor?: string): void {
+    const nextCfg: StageEnvironmentConfig = {
+      ...this.stageConfig,
+      floorColor: floorColor || this.stageConfig.floorColor,
+    };
+    this.setStageConfig(nextCfg, backgroundColor, showGrid);
+  }
+
+  setStageConfig(config: StageEnvironmentConfig, backgroundColor: string, showGrid: boolean): void {
+    this.stageConfig = config;
+    this.showGridFlag = showGrid;
+    this.setFloorLockEnabled(config.floorLockEnabled);
+
     const col = new THREE.Color(backgroundColor || '#16181c');
     this.scene.background = col;
-    this.scene.fog = new THREE.FogExp2(col.getHex(), 0.014);
-    this.gridHelper.visible = showGrid && this.viewMode === 'editor';
-    if (floorColor) {
-      (this.floorMesh.material as THREE.MeshStandardMaterial).color.set(floorColor);
+    this.scene.fog = new THREE.FogExp2(col.getHex(), 0.0045);
+
+    this.rebuildStageFloor(config);
+    this.rebuildStageGrid(config, showGrid);
+    this.rebuildStageWalls(config.walls);
+    this.rebuildStageClouds(config);
+    this.requestRender();
+  }
+
+  setFloorLockEnabled(enabled: boolean): void {
+    this.floorLockEnabled = enabled;
+    this.orbitControls.maxPolarAngle = enabled ? Math.PI * 0.495 : Math.PI * 0.96;
+    const mat = this.floorMesh.material as THREE.MeshStandardMaterial;
+    if (mat) {
+      mat.side = enabled ? THREE.FrontSide : THREE.DoubleSide;
+      mat.needsUpdate = true;
     }
     this.requestRender();
+  }
+
+  private rebuildStageFloor(config: StageEnvironmentConfig): void {
+    const sides = Math.max(3, Math.min(64, Math.round(config.floorSides || 4)));
+    const size = Math.max(6, Math.min(120, Number(config.floorSize) || 28));
+    const sig = `${config.floorShape}:${sides}:${size}`;
+    if (sig !== this.stageFloorSig) {
+      this.stageFloorSig = sig;
+      let geom: THREE.BufferGeometry;
+      if (config.floorShape === 'circle') {
+        geom = new THREE.CylinderGeometry(size * 0.5, size * 0.5, 0.08, 64);
+      } else if (config.floorShape === 'rectangle') {
+        geom = new THREE.BoxGeometry(size * 1.45, 0.08, size * 0.85);
+      } else if (config.floorShape === 'polygon') {
+        geom = new THREE.CylinderGeometry(size * 0.5, size * 0.5, 0.08, sides);
+        if (sides === 4) {
+          geom.rotateY(Math.PI / 4);
+        }
+      } else {
+        // Default: crisp Square canvas stage
+        geom = new THREE.BoxGeometry(size, 0.08, size);
+      }
+      this.floorMesh.geometry.dispose();
+      this.floorMesh.geometry = geom;
+      this.floorMesh.position.y = -0.04;
+    }
+
+    const mat = this.floorMesh.material as THREE.MeshStandardMaterial;
+    mat.color.set(config.floorColor || '#1b1e24');
+    mat.roughness = THREE.MathUtils.clamp(config.floorRoughness ?? 0.88, 0.05, 1);
+    mat.side = this.floorLockEnabled ? THREE.FrontSide : THREE.DoubleSide;
+    mat.needsUpdate = true;
+  }
+
+  private rebuildStageGrid(config: StageEnvironmentConfig, showGrid: boolean): void {
+    const size = Math.max(6, Math.min(120, Math.round(config.floorSize || 28)));
+    const divisions = Math.max(6, Math.min(80, size));
+    const gridColor = config.gridColor || '#3a404d';
+    const gridSec = config.gridSecondaryColor || '#262a33';
+    const sig = `${size}:${divisions}:${gridColor}:${gridSec}`;
+    if (sig !== this.stageGridSig) {
+      this.stageGridSig = sig;
+      this.scene.remove(this.gridHelper);
+      this.gridHelper.dispose();
+      this.gridHelper = new THREE.GridHelper(
+        size,
+        divisions,
+        new THREE.Color(gridColor).getHex(),
+        new THREE.Color(gridSec).getHex(),
+      );
+      this.gridHelper.position.y = 0.005;
+      this.scene.add(this.gridHelper);
+    }
+    this.gridHelper.visible = showGrid && this.viewMode === 'editor';
+  }
+
+  private rebuildStageWalls(walls: StageWallConfig[]): void {
+    const sig = JSON.stringify(walls);
+    if (sig === this.stageWallsSig) return;
+    this.stageWallsSig = sig;
+
+    while (this.wallsGroup.children.length > 0) {
+      const child = this.wallsGroup.children[0];
+      this.wallsGroup.remove(child);
+      const mesh = child as THREE.Mesh;
+      if (mesh.geometry) mesh.geometry.dispose();
+      if (mesh.material) {
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach((m) => m.dispose());
+      }
+    }
+
+    for (const wall of walls) {
+      if (!wall.visible) continue;
+      const w = Math.max(0.5, wall.width || 16);
+      const h = Math.max(0.5, wall.height || 8);
+      const t = Math.max(0.05, wall.thickness || 0.25);
+      const geom = new THREE.BoxGeometry(w, h, t);
+      const opacity = THREE.MathUtils.clamp(wall.opacity ?? 1, 0.05, 1);
+      const mat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(wall.color || '#252a34'),
+        roughness: 0.85,
+        metalness: 0.04,
+        transparent: opacity < 0.99,
+        opacity,
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.set(wall.position.x, wall.position.y + h * 0.5, wall.position.z);
+      mesh.rotation.y = wall.rotationY || 0;
+      mesh.receiveShadow = true;
+      mesh.castShadow = true;
+      mesh.frustumCulled = false;
+      mesh.userData.stageWallId = wall.id;
+      this.wallsGroup.add(mesh);
+    }
+  }
+
+  private rebuildStageClouds(config: StageEnvironmentConfig): void {
+    const show = config.showClouds !== false;
+    const color = config.cloudColor || '#cbd5e1';
+    const opacity = THREE.MathUtils.clamp(config.cloudOpacity ?? 0.42, 0.05, 1);
+    const sig = `${show}:${color}:${opacity.toFixed(2)}`;
+    if (sig === this.stageCloudsSig) return;
+    this.stageCloudsSig = sig;
+
+    while (this.cloudsGroup.children.length > 0) {
+      const child = this.cloudsGroup.children[0];
+      this.cloudsGroup.remove(child);
+      child.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (m.geometry) m.geometry.dispose();
+        if (m.material) {
+          const mats = Array.isArray(m.material) ? m.material : [m.material];
+          mats.forEach((mt) => mt.dispose());
+        }
+      });
+    }
+
+    this.cloudsGroup.visible = show;
+    if (!show) return;
+
+    const cloudDefs = [
+      { x: -18, y: 15.5, z: -26, s: 2.3 },
+      { x: 14, y: 17.2, z: -30, s: 2.8 },
+      { x: -28, y: 14.0, z: -8, s: 2.0 },
+      { x: 26, y: 15.0, z: -12, s: 2.4 },
+      { x: -6, y: 19.0, z: -34, s: 3.1 },
+      { x: 22, y: 16.5, z: 18, s: 2.2 },
+      { x: -24, y: 16.0, z: 20, s: 2.1 },
+    ];
+    const puffOffsets = [
+      { x: 0, y: 0, z: 0, r: 1.0 },
+      { x: -0.95, y: -0.18, z: 0.12, r: 0.78 },
+      { x: 0.98, y: -0.15, z: -0.1, r: 0.82 },
+      { x: 0.32, y: 0.36, z: 0.2, r: 0.72 },
+      { x: -0.35, y: 0.25, z: -0.25, r: 0.68 },
+    ];
+
+    const col = new THREE.Color(color);
+    const baseMat = new THREE.MeshStandardMaterial({
+      color: col,
+      emissive: col.clone().multiplyScalar(0.22),
+      roughness: 0.95,
+      metalness: 0,
+      transparent: true,
+      opacity,
+      depthWrite: false,
+    });
+
+    for (const def of cloudDefs) {
+      const cluster = new THREE.Group();
+      cluster.position.set(def.x, def.y, def.z);
+      cluster.scale.set(def.s * 1.45, def.s * 0.62, def.s * 0.92);
+      for (const puff of puffOffsets) {
+        const geom = new THREE.SphereGeometry(puff.r, 12, 10);
+        const mesh = new THREE.Mesh(geom, baseMat.clone());
+        mesh.position.set(puff.x, puff.y, puff.z);
+        mesh.frustumCulled = false;
+        cluster.add(mesh);
+      }
+      this.cloudsGroup.add(cluster);
+    }
+    baseMat.dispose();
+  }
+
+  private clampObjectAboveFloor(obj: THREE.Object3D, extraMembers?: THREE.Object3D[]): void {
+    if (!this.floorLockEnabled) return;
+    obj.updateMatrixWorld(true);
+    const box = this.computeVisibleBox3(obj);
+    if (extraMembers) {
+      for (const m of extraMembers) {
+        m.updateMatrixWorld(true);
+        box.union(this.computeVisibleBox3(m));
+      }
+    }
+    if (!box.isEmpty() && Number.isFinite(box.min.y) && box.min.y < 0) {
+      const lift = -box.min.y;
+      obj.position.y += lift;
+      if (extraMembers) {
+        for (const m of extraMembers) {
+          m.position.y += lift;
+        }
+      }
+      obj.updateMatrixWorld(true);
+    }
   }
 
   setViewMode(mode: CameraViewMode): void {
     this.viewMode = mode;
     const isEditor = mode === 'editor';
     this.orbitControls.enabled = isEditor;
+    this.gridHelper.visible = this.showGridFlag && isEditor;
     this.sceneCameraMarker.visible = isEditor;
     this.lightMarkersGroup.visible = isEditor;
     this.rigOverlayGroup.visible = isEditor && this.showRigOverlay;
@@ -786,10 +1141,12 @@ export class StudioEngine {
     this.selectionBoxHelper.visible = false;
     this.motionPathGroup.visible = isEditor;
     if (!isEditor) {
+      this.scaleHandleGroup.visible = false;
       this.clearHoverHighlight();
       this.clearSelectionHighlight();
     } else {
       this.refreshSelectionVisuals();
+      this.updateScaleHandleVisual();
     }
     this.requestRender();
   }
@@ -1358,7 +1715,6 @@ export class StudioEngine {
       if (
         !obj.visible ||
         obj.userData?.__detachedHidden === true ||
-        obj.userData?.__isStagePropsGroup === true ||
         obj.userData?.__isSelectionHighlight === true
       ) {
         return;
@@ -2000,7 +2356,229 @@ export class StudioEngine {
     this.attachGizmoToSelection();
     this.refreshSelectionVisuals();
     this.rebuildRigVisuals();
+    this.updateScaleHandleVisual();
+    this.emitLiveSize(false);
     this.requestRender();
+  }
+
+  private getScalableSelectionObject(): {
+    target: SelectionTarget;
+    obj: THREE.Object3D;
+    label: string;
+    locked: boolean;
+    groupMembers?: THREE.Object3D[];
+  } | null {
+    const sel = this.currentSelection;
+    if (sel.kind === 'character') {
+      const a = this.adapters.get(sel.instanceId);
+      if (!a) return null;
+      return {
+        target: sel,
+        obj: a.rootGroup,
+        label: a.rootGroup.name || 'Character',
+        locked: this.lockedObjects.has(sel.instanceId),
+      };
+    }
+    if (sel.kind === 'body-part') {
+      const a = this.adapters.get(sel.instanceId);
+      const nodeObj =
+        a && 'getNodeObject' in a && typeof a.getNodeObject === 'function'
+          ? a.getNodeObject(sel.nodeId)
+          : undefined;
+      if (!nodeObj || !this.isObjectEffectivelyVisible(nodeObj)) return null;
+      return {
+        target: sel,
+        obj: nodeObj,
+        label: sel.nodeName || sel.nodeId,
+        locked:
+          this.lockedObjects.has(sel.instanceId) ||
+          Boolean(this.lockedCharacterNodes.get(sel.instanceId)?.has(sel.nodeId)),
+      };
+    }
+    if (sel.kind === 'prop') {
+      const p = this.propObjects.get(sel.propId);
+      if (!p || !p.visible) return null;
+      return {
+        target: sel,
+        obj: p,
+        label: (p.userData.propName as string) || 'Prop',
+        locked: this.lockedObjects.has(sel.propId),
+      };
+    }
+    if (sel.kind === 'group') {
+      const proxy = this.groupProxies.get(sel.groupId);
+      const meta = this.groupMeta.get(sel.groupId);
+      if (!proxy || !meta) return null;
+      const groupMembers: THREE.Object3D[] = [];
+      for (const mId of meta.memberIds) {
+        const ch = this.adapters.get(mId);
+        if (ch) groupMembers.push(ch.rootGroup);
+        const pr = this.propObjects.get(mId);
+        if (pr) groupMembers.push(pr);
+      }
+      return {
+        target: sel,
+        obj: proxy,
+        label: meta.name || 'Group',
+        locked: meta.locked,
+        groupMembers,
+      };
+    }
+    return null;
+  }
+
+  getSelectionLiveSize(activeDragging = false): LiveSizeInfo | null {
+    const resolved = this.getScalableSelectionObject();
+    if (!resolved) return null;
+    const box = this.getSelectionWorldBox();
+    const size = new THREE.Vector3(1, 1, 1);
+    if (box && !box.isEmpty()) {
+      box.getSize(size);
+    }
+    let scaleFactor = (resolved.obj.scale.x + resolved.obj.scale.y + resolved.obj.scale.z) / 3;
+    if (resolved.target.kind === 'body-part') {
+      const a = this.adapters.get(resolved.target.instanceId);
+      if (a && 'getNodeDeltaScale' in a && typeof a.getNodeDeltaScale === 'function') {
+        const ds = a.getNodeDeltaScale(resolved.target.nodeId, resolved.obj.scale);
+        scaleFactor = (ds.x + ds.y + ds.z) / 3;
+      }
+    }
+    return {
+      label: resolved.label,
+      scaleFactor: Math.max(0.01, scaleFactor),
+      widthM: Math.max(0.001, size.x),
+      heightM: Math.max(0.001, size.y),
+      depthM: Math.max(0.001, size.z),
+      activeDragging,
+    };
+  }
+
+  private emitLiveSize(activeDragging: boolean): void {
+    if (!this.callbacks.onLiveSizeChange) return;
+    const info = this.getSelectionLiveSize(activeDragging);
+    const sig = info
+      ? `${info.label}:${info.scaleFactor.toFixed(3)}:${info.widthM.toFixed(3)}:${info.heightM.toFixed(3)}:${info.depthM.toFixed(3)}:${Boolean(info.activeDragging)}`
+      : 'none';
+    if (sig === this.lastLiveSizeSig) return;
+    this.lastLiveSizeSig = sig;
+    this.callbacks.onLiveSizeChange(info);
+  }
+
+  applyTargetSizeToSelection(targetValue: number, unit: SizeUnit): boolean {
+    if (!Number.isFinite(targetValue) || targetValue <= 0) return false;
+    const resolved = this.getScalableSelectionObject();
+    if (!resolved || resolved.locked) return false;
+
+    const currentInfo = this.getSelectionLiveSize(false);
+    if (!currentInfo) return false;
+
+    let multiplier = 1;
+    if (unit === '%') {
+      multiplier = targetValue / 100 / Math.max(0.01, currentInfo.scaleFactor);
+    } else {
+      // Reference dimension: height (or max dimension for flat objects) in meters
+      const currentDimM = Math.max(0.01, currentInfo.heightM > 0.02 ? currentInfo.heightM : Math.max(currentInfo.widthM, currentInfo.depthM));
+      let targetMeters = targetValue;
+      if (unit === 'px') {
+        // Stage pixel scale: 100 px = 1.00 m
+        targetMeters = targetValue / 100;
+      } else if (unit === 'cm') {
+        targetMeters = targetValue / 100;
+      } else if (unit === 'ft') {
+        targetMeters = targetValue * 0.3048;
+      }
+      multiplier = targetMeters / currentDimM;
+    }
+
+    if (!Number.isFinite(multiplier) || multiplier <= 0) return false;
+
+    const obj = resolved.obj;
+    const nextScale = obj.scale.clone().multiplyScalar(multiplier);
+    nextScale.x = THREE.MathUtils.clamp(nextScale.x, 0.02, 40);
+    nextScale.y = THREE.MathUtils.clamp(nextScale.y, 0.02, 40);
+    nextScale.z = THREE.MathUtils.clamp(nextScale.z, 0.02, 40);
+    obj.scale.copy(nextScale);
+
+    if (resolved.target.kind === 'group' && resolved.groupMembers) {
+      for (const m of resolved.groupMembers) {
+        m.scale.multiplyScalar(multiplier);
+        m.scale.x = THREE.MathUtils.clamp(m.scale.x, 0.02, 40);
+        m.scale.y = THREE.MathUtils.clamp(m.scale.y, 0.02, 40);
+        m.scale.z = THREE.MathUtils.clamp(m.scale.z, 0.02, 40);
+      }
+    }
+
+    if (this.floorLockEnabled && (resolved.target.kind === 'character' || resolved.target.kind === 'prop' || resolved.target.kind === 'group')) {
+      this.clampObjectAboveFloor(obj, resolved.groupMembers);
+    }
+
+    // Commit to React state / undo history
+    if (resolved.target.kind === 'body-part') {
+      const { instanceId, nodeId, nodeName } = resolved.target;
+      const adapter = this.adapters.get(instanceId);
+      const deltaRot =
+        adapter && 'getNodeDeltaRotation' in adapter && typeof adapter.getNodeDeltaRotation === 'function'
+          ? adapter.getNodeDeltaRotation(nodeId, obj.rotation)
+          : { x: obj.rotation.x, y: obj.rotation.y, z: obj.rotation.z };
+      const deltaPos =
+        adapter && 'getNodeDeltaPosition' in adapter && typeof adapter.getNodeDeltaPosition === 'function'
+          ? adapter.getNodeDeltaPosition(nodeId, obj.position)
+          : { x: 0, y: 0, z: 0 };
+      const deltaScale =
+        adapter && 'getNodeDeltaScale' in adapter && typeof adapter.getNodeDeltaScale === 'function'
+          ? adapter.getNodeDeltaScale(nodeId, obj.scale)
+          : { x: obj.scale.x, y: obj.scale.y, z: obj.scale.z };
+      this.callbacks.onNodeTransformCommit(instanceId, nodeId, nodeName, deltaRot, deltaPos, deltaScale);
+    } else {
+      this.commitObjectDragTransform(resolved.target, obj);
+    }
+
+    this.updateSelectionBoxesOnly();
+    this.updateScaleHandleVisual();
+    this.emitLiveSize(false);
+    this.requestRender();
+    return true;
+  }
+
+  private updateScaleHandleVisual(): void {
+    if (this.viewMode !== 'editor') {
+      this.scaleHandleGroup.visible = false;
+      return;
+    }
+    const resolved = this.getScalableSelectionObject();
+    if (!resolved || resolved.locked) {
+      this.scaleHandleGroup.visible = false;
+      return;
+    }
+    const box = this.getSelectionWorldBox();
+    if (!box || box.isEmpty()) {
+      this.scaleHandleGroup.visible = false;
+      return;
+    }
+
+    const cam = this.getActiveEditorCamera();
+    cam.updateMatrixWorld();
+    const corner = new THREE.Vector3(box.max.x, box.max.y, box.max.z);
+    const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion).normalize();
+    const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion).normalize();
+    const dist = Math.max(1.2, cam.position.distanceTo(corner));
+    const offsetMag = THREE.MathUtils.clamp(dist * 0.045, 0.14, 0.85);
+    const handlePos = corner
+      .clone()
+      .addScaledVector(camRight, offsetMag * 0.85)
+      .addScaledVector(camUp, offsetMag * 0.85);
+
+    this.scaleHandleMesh.position.copy(handlePos);
+    const nodeScale = THREE.MathUtils.clamp(dist * 0.065, 0.35, 1.85);
+    this.scaleHandleMesh.scale.setScalar(nodeScale);
+    this.scaleHandleMesh.quaternion.copy(cam.quaternion);
+
+    const posAttr = this.scaleHandleLine.geometry.getAttribute('position') as THREE.BufferAttribute;
+    posAttr.setXYZ(0, corner.x, corner.y, corner.z);
+    posAttr.setXYZ(1, handlePos.x, handlePos.y, handlePos.z);
+    posAttr.needsUpdate = true;
+
+    this.scaleHandleGroup.visible = true;
   }
 
   private clearSelectionBoxes(): void {
@@ -2457,9 +3035,11 @@ export class StudioEngine {
           ? adapter.getNodeDeltaPosition(nodeId, obj.position)
           : { x: 0, y: 0, z: 0 };
       const deltaScale =
-        adapter && 'getNodeDeltaScale' in adapter && typeof adapter.getNodeDeltaScale === 'function'
-          ? adapter.getNodeDeltaScale(nodeId, obj.scale)
-          : { x: 1, y: 1, z: 1 };
+        this.transformControls.getMode() === 'scale'
+          ? adapter && 'getNodeDeltaScale' in adapter && typeof adapter.getNodeDeltaScale === 'function'
+            ? adapter.getNodeDeltaScale(nodeId, obj.scale)
+            : { x: obj.scale.x, y: obj.scale.y, z: obj.scale.z }
+          : undefined;
 
       this.callbacks.onNodeTransformCommit(instanceId, nodeId, nodeName, deltaRot, deltaPos, deltaScale);
     } else if (this.currentSelection.kind === 'ik-handle') {
@@ -2590,10 +3170,27 @@ export class StudioEngine {
     description: string;
     locked: boolean;
     ringAxis?: 'x' | 'y' | 'z';
+    isScaleHandle?: boolean;
   } | null {
     this.updateRayFromEvent(clientX, clientY);
     const allow = (k: SelectionFilter) =>
       options?.ignoreFilter || this.selectionFilter === 'all' || this.selectionFilter === k;
+
+    // -1. Interactive 3D Scale Size Node (highest priority when visible)
+    if (this.scaleHandleGroup.visible) {
+      const scaleHits = this.raycaster.intersectObject(this.scaleHandleMesh, true);
+      if (scaleHits.length > 0) {
+        return {
+          target: this.currentSelection,
+          hitMesh: null,
+          worldPoint: scaleHits[0].point,
+          title: 'Resize Size Node',
+          description: 'Drag up/right to enlarge or down/left to shrink (live size readout)',
+          locked: false,
+          isScaleHandle: true,
+        };
+      }
+    }
 
     // 0. Interactive Rig Rotation Rings (highest priority when a joint is selected)
     if (this.showRigOverlay && this.rigVisualizer.axisRingHandles.length > 0) {
@@ -3232,6 +3829,60 @@ export class StudioEngine {
       return;
     }
 
+    // Live interactive 3D Scale Node drag (smooth uniform scaling with live size readout)
+    if (this.directScaleNodeDrag) {
+      const drag = this.directScaleNodeDrag;
+      const dx = e.clientX - drag.startClientX;
+      const dy = e.clientY - drag.startClientY;
+      if (!drag.active && Math.hypot(dx, dy) > 2) {
+        drag.active = true;
+        this.suppressNextDblClickUntilMs = performance.now() + 350;
+        this.focusAnim = null;
+        this.orbitControls.enabled = false;
+        this.transformControls.enabled = false;
+      }
+      if (drag.active) {
+        const deltaPx = dx - dy;
+        const mult = THREE.MathUtils.clamp(Math.exp(deltaPx * 0.0055), 0.05, 25);
+        drag.obj.scale.set(
+          THREE.MathUtils.clamp(drag.startScale.x * mult, 0.02, 40),
+          THREE.MathUtils.clamp(drag.startScale.y * mult, 0.02, 40),
+          THREE.MathUtils.clamp(drag.startScale.z * mult, 0.02, 40),
+        );
+        drag.obj.position.copy(drag.startObjPos);
+        if (drag.groupMemberStarts) {
+          for (const m of drag.groupMemberStarts) {
+            m.obj.scale.set(
+              THREE.MathUtils.clamp(m.startScale.x * mult, 0.02, 40),
+              THREE.MathUtils.clamp(m.startScale.y * mult, 0.02, 40),
+              THREE.MathUtils.clamp(m.startScale.z * mult, 0.02, 40),
+            );
+            m.obj.position.copy(m.startPos);
+          }
+        }
+        if (
+          this.floorLockEnabled &&
+          (drag.target.kind === 'character' || drag.target.kind === 'prop' || drag.target.kind === 'group')
+        ) {
+          this.clampObjectAboveFloor(
+            drag.obj,
+            drag.groupMemberStarts?.map((m) => m.obj),
+          );
+        }
+        this.updateSelectionBoxesOnly();
+        this.updateScaleHandleVisual();
+        this.emitLiveSize(true);
+        if (this.lastRigInstanceId) {
+          this.rigVisualizer.updateLivePositions(
+            this.adapters.get(this.lastRigInstanceId),
+            this.getActiveEditorCamera(),
+          );
+        }
+        this.requestRender();
+      }
+      return;
+    }
+
     // Live click-and-drag / trackpad double-click-and-drag object translation anywhere in viewport
     if (this.directObjectDrag) {
       const drag = this.directObjectDrag;
@@ -3242,22 +3893,35 @@ export class StudioEngine {
         this.suppressNextDblClickUntilMs = performance.now() + 350;
         this.focusAnim = null;
         this.orbitControls.enabled = false;
+        this.transformControls.enabled = false;
       }
       if (drag.active) {
         this.updateRayFromEvent(e.clientX, e.clientY);
         const intersectPt = new THREE.Vector3();
         if (this.raycaster.ray.intersectPlane(drag.dragPlane, intersectPt)) {
+          // Guard against rays intersecting behind camera or shooting to infinity at grazing horizon angles
+          const alongRay = intersectPt.clone().sub(this.raycaster.ray.origin).dot(this.raycaster.ray.direction);
+          if (alongRay <= 0.05) return;
+
           const delta = intersectPt.sub(drag.startHitPoint);
+          if (delta.length() > 45) {
+            delta.setLength(45);
+          }
+
           if (this.axisConstraint === 'x') {
             delta.y = 0;
             delta.z = 0;
-          } else if (this.axisConstraint === 'y') {
+          } else if (this.axisConstraint === 'y' || (!drag.isHorizontalPlane && e.shiftKey)) {
             delta.x = 0;
             delta.z = 0;
           } else if (this.axisConstraint === 'z') {
             delta.x = 0;
             delta.y = 0;
+          } else if (drag.isHorizontalPlane) {
+            // Keep clean horizontal floor-parallel movement (no accidental camera-zoom or underground dive)
+            delta.y = 0;
           }
+
           const nextPos = drag.startObjPos.clone().add(delta);
           if (this.snapTranslateStep && this.snapTranslateStep > 0) {
             const step = this.snapTranslateStep;
@@ -3272,18 +3936,29 @@ export class StudioEngine {
               m.obj.position.copy(m.startPos).add(appliedDelta);
             }
           }
+
+          // Respect Floor Lock so objects cannot vanish beneath floor unless unlocked
+          if (
+            this.floorLockEnabled &&
+            (drag.target.kind === 'character' || drag.target.kind === 'prop' || drag.target.kind === 'group')
+          ) {
+            this.clampObjectAboveFloor(
+              drag.obj,
+              drag.groupMemberStarts?.map((m) => m.obj),
+            );
+          }
+
           if (drag.target.kind === 'light') {
             const dynLight = this.dynamicLights.get(drag.target.lightId);
-            if (dynLight) dynLight.position.copy(nextPos);
+            if (dynLight) dynLight.position.copy(drag.obj.position);
           } else if (drag.target.kind === 'character') {
             this.rigVisualizer.updateLivePositions(
               this.adapters.get(drag.target.instanceId),
               this.getActiveEditorCamera(),
             );
           }
-          if (this.selectionBoxHelper.visible) {
-            this.selectionBoxHelper.update();
-          }
+          this.updateSelectionBoxesOnly();
+          this.updateScaleHandleVisual();
           this.requestRender();
         }
       }
@@ -3373,13 +4048,16 @@ export class StudioEngine {
   };
 
   private handlePointerCancel = (e: PointerEvent) => {
-    if (this.directLimbDrag || this.directObjectDrag || this.marqueeDrag) {
+    if (this.directLimbDrag || this.directObjectDrag || this.directScaleNodeDrag || this.marqueeDrag) {
       this.directLimbDrag = null;
       this.directObjectDrag = null;
+      this.directScaleNodeDrag = null;
       this.marqueeDrag = null;
       this.hideMarqueeOverlay();
       this.activeRingAxis = null;
       this.orbitControls.enabled = this.viewMode === 'editor';
+      this.transformControls.enabled = true;
+      this.emitLiveSize(false);
       try {
         if (this.renderer.domElement.hasPointerCapture(e.pointerId)) {
           this.renderer.domElement.releasePointerCapture(e.pointerId);
@@ -3548,6 +4226,36 @@ export class StudioEngine {
         preferBodyPart: e.altKey || this.selectionFilter !== 'character',
         ignoreGroups: e.altKey,
       });
+
+      // Interactive 3D Scale Size Node grab
+      if (hit?.isScaleHandle) {
+        const resolved = this.getScalableSelectionObject();
+        if (resolved && !resolved.locked) {
+          this.directScaleNodeDrag = {
+            target: resolved.target,
+            obj: resolved.obj,
+            startClientX: e.clientX,
+            startClientY: e.clientY,
+            startScale: resolved.obj.scale.clone(),
+            startObjPos: resolved.obj.position.clone(),
+            groupMemberStarts: resolved.groupMembers?.map((m) => ({
+              obj: m,
+              startScale: m.scale.clone(),
+              startPos: m.position.clone(),
+            })),
+            active: false,
+          };
+          this.orbitControls.enabled = false;
+          this.transformControls.enabled = false;
+          try {
+            this.renderer.domElement.setPointerCapture(e.pointerId);
+          } catch {
+            // Ignore pointer capture failure in synthetic environments
+          }
+          return;
+        }
+      }
+
       const canDragRing = Boolean(hit?.ringAxis);
       const canDragLimb =
         hit &&
@@ -3659,13 +4367,30 @@ export class StudioEngine {
         preferBodyPart: false,
         ignoreGroups: e.altKey,
       });
-      if (objHit && !objHit.locked) {
+      if (objHit && !objHit.locked && !objHit.isScaleHandle) {
         const resolved = this.resolveDraggableObject(objHit.target);
         if (resolved) {
           const cam = this.getActiveEditorCamera();
           cam.updateMatrixWorld();
           const camForward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
-          const dragPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(camForward, objHit.worldPoint);
+          const wantsVertical =
+            this.axisConstraint === 'y' || e.shiftKey || Math.abs(camForward.y) < 0.14;
+          let dragPlane: THREE.Plane;
+          let isHorizontalPlane = false;
+          if (!wantsVertical) {
+            // Stable horizontal plane parallel to the floor so objects glide cleanly without auto-zooming or disappearing
+            dragPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+              new THREE.Vector3(0, 1, 0),
+              objHit.worldPoint,
+            );
+            isHorizontalPlane = true;
+          } else {
+            // Vertical plane facing the camera horizontally (never tilted into the floor)
+            const horizNormal = new THREE.Vector3(camForward.x, 0, camForward.z);
+            if (horizNormal.lengthSq() < 1e-4) horizNormal.set(0, 0, 1);
+            horizNormal.normalize();
+            dragPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(horizNormal, objHit.worldPoint);
+          }
           this.directObjectDrag = {
             target: resolved.target,
             obj: resolved.obj,
@@ -3674,10 +4399,12 @@ export class StudioEngine {
             startObjPos: resolved.obj.position.clone(),
             startHitPoint: objHit.worldPoint.clone(),
             dragPlane,
+            isHorizontalPlane,
             groupMemberStarts: resolved.groupMemberStarts,
             active: false,
           };
           this.orbitControls.enabled = false;
+          this.transformControls.enabled = false;
           try {
             this.renderer.domElement.setPointerCapture(e.pointerId);
           } catch {
@@ -3778,10 +4505,51 @@ export class StudioEngine {
       }
     }
 
+    if (this.directScaleNodeDrag) {
+      const drag = this.directScaleNodeDrag;
+      this.directScaleNodeDrag = null;
+      this.orbitControls.enabled = this.viewMode === 'editor';
+      this.transformControls.enabled = true;
+      try {
+        if (this.renderer.domElement.hasPointerCapture(e.pointerId)) {
+          this.renderer.domElement.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // Ignore capture release errors
+      }
+      if (drag.active) {
+        if (drag.target.kind === 'body-part') {
+          const { instanceId, nodeId, nodeName } = drag.target;
+          const adapter = this.adapters.get(instanceId);
+          const deltaRot =
+            adapter && 'getNodeDeltaRotation' in adapter && typeof adapter.getNodeDeltaRotation === 'function'
+              ? adapter.getNodeDeltaRotation(nodeId, drag.obj.rotation)
+              : { x: drag.obj.rotation.x, y: drag.obj.rotation.y, z: drag.obj.rotation.z };
+          const deltaPos =
+            adapter && 'getNodeDeltaPosition' in adapter && typeof adapter.getNodeDeltaPosition === 'function'
+              ? adapter.getNodeDeltaPosition(nodeId, drag.obj.position)
+              : { x: 0, y: 0, z: 0 };
+          const deltaScale =
+            adapter && 'getNodeDeltaScale' in adapter && typeof adapter.getNodeDeltaScale === 'function'
+              ? adapter.getNodeDeltaScale(nodeId, drag.obj.scale)
+              : { x: drag.obj.scale.x, y: drag.obj.scale.y, z: drag.obj.scale.z };
+          this.callbacks.onNodeTransformCommit(instanceId, nodeId, nodeName, deltaRot, deltaPos, deltaScale);
+        } else {
+          this.commitObjectDragTransform(drag.target, drag.obj);
+        }
+        this.updateSelectionBoxesOnly();
+        this.updateScaleHandleVisual();
+      }
+      this.emitLiveSize(false);
+      this.requestRender();
+      return;
+    }
+
     if (this.directObjectDrag) {
       const drag = this.directObjectDrag;
       this.directObjectDrag = null;
       this.orbitControls.enabled = this.viewMode === 'editor';
+      this.transformControls.enabled = true;
       try {
         if (this.renderer.domElement.hasPointerCapture(e.pointerId)) {
           this.renderer.domElement.releasePointerCapture(e.pointerId);
@@ -3800,6 +4568,8 @@ export class StudioEngine {
         this.callbacks.onSelectTarget(drag.target, additive);
         this.commitObjectDragTransform(drag.target, drag.obj);
         this.updateSelectionBoxesOnly();
+        this.updateScaleHandleVisual();
+        this.emitLiveSize(false);
         this.requestRender();
         return;
       }
@@ -4051,6 +4821,8 @@ export class StudioEngine {
         this.syncEditorOrthoCamera(true);
       }
       this.rigVisualizer.updateScales(this.getActiveEditorCamera());
+      this.updateScaleHandleVisual();
+      this.emitCameraOrientation();
       this.renderFrame();
       const done = () => {
         this.renderBusy = false;
@@ -4068,6 +4840,7 @@ export class StudioEngine {
     if (this.disposed) return;
     if (this.viewMode === 'editor' && this.currentSelection.kind !== 'none' && (this.isPlaying || this.transformControls.dragging)) {
       this.updateSelectionBoxesOnly();
+      this.updateScaleHandleVisual();
     }
     const activeSceneCam =
       this.activeCameraProjection === 'orthographic' ? this.orthoSceneCamera : this.sceneCamera;
@@ -4078,15 +4851,18 @@ export class StudioEngine {
   captureThumbnailDataUrl(): string | undefined {
     try {
       const wasEditor = this.viewMode === 'editor';
+      const wasScaleHandleVisible = this.scaleHandleGroup.visible;
       if (wasEditor) {
         this.clearHoverEmissivesOnly();
         this.clearSelectionHighlight();
         this.selectionBoxesGroup.visible = false;
+        this.scaleHandleGroup.visible = false;
       }
       this.renderFrame();
       const url = this.renderer.domElement.toDataURL('image/jpeg', 0.65);
       if (wasEditor) {
         this.selectionBoxesGroup.visible = true;
+        this.scaleHandleGroup.visible = wasScaleHandleVisible;
         this.refreshSelectionVisuals();
       }
       return url;
@@ -4144,6 +4920,16 @@ export class StudioEngine {
     this.floorMesh.geometry.dispose();
     (this.floorMesh.material as THREE.Material).dispose();
     this.gridHelper.dispose();
+    for (const grp of [this.wallsGroup, this.cloudsGroup, this.scaleHandleGroup]) {
+      grp.traverse((o) => {
+        const m = o as THREE.Mesh | THREE.Line;
+        if (m.geometry) m.geometry.dispose();
+        if (m.material) {
+          const mats = Array.isArray(m.material) ? m.material : [m.material];
+          mats.forEach((mt) => mt.dispose());
+        }
+      });
+    }
     this.renderer.dispose();
     this.marqueeOverlay.remove();
     dom.remove();

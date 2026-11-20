@@ -66,4 +66,13 @@ export interface ICharacterAdapter {
   syncNodeGroups?(groups: CharacterNodeGroup[]): void;
   applyNodeMaterialOverrides?(overrides: Record<string, NodeMaterialOverride>): void;
   getNodeMaterialInfo?(nodeId: string): NodeMaterialOverride | null;
+  setIncludeStageProps?(include: boolean): void;
+  setPlayNativeLoop?(play: boolean): void;
+  sampleTimelineSequence?(
+    durationSec: number,
+    sampleFps?: number,
+  ): {
+    times: number[];
+    nodeDeltas: Record<string, { pos: Vec3; rot: Vec3; scale: Vec3 }[]>;
+  };
 }

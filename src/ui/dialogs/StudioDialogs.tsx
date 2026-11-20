@@ -43,7 +43,7 @@ async function renderCharacterPreviewThumbnail(
     let adapter: HtmlThreeAdapter | null = null;
 
     if (htmlSource) {
-      adapter = new HtmlThreeAdapter('preview_temp', 'preview_asset', htmlSource, false);
+      adapter = new HtmlThreeAdapter('preview_temp', 'preview_asset', htmlSource, true);
       await adapter.load();
       obj = adapter.rootGroup;
     } else if (glbBuffer) {
@@ -180,17 +180,24 @@ export function ImportAssetDialog({ open, onClose, onImportFile }: ImportAssetDi
           <div className="space-y-1.5 rounded border border-[#2a2e36] bg-[#14161a] p-3">
             <div className="flex items-center justify-between font-semibold text-[#e6e8ec]">
               <span>Detected: {htmlPreview.suggestedName}</span>
-              {htmlPreview.sdkDetected && (
-                <span className="rounded bg-[#1a2c27] px-1.5 py-0.5 text-[10px] text-[#4ade80]">
-                  STAGECRAFT_SDK
-                </span>
-              )}
+              <div className="flex items-center gap-1">
+                {htmlPreview.isFullScene && (
+                  <span className="rounded bg-[#2b211a] px-1.5 py-0.5 text-[10px] text-[#e8702a]">
+                    Full 3D Scene / Video
+                  </span>
+                )}
+                {htmlPreview.sdkDetected && (
+                  <span className="rounded bg-[#1a2c27] px-1.5 py-0.5 text-[10px] text-[#4ade80]">
+                    STAGECRAFT_SDK
+                  </span>
+                )}
+              </div>
             </div>
             <div className="text-[#98a0ad]">
               Mode:{' '}
               <span className="text-[#e8702a]">
                 {htmlPreview.recommendedMode === 'native-three-extraction'
-                  ? 'Mode A · Native Three.js Extraction'
+                  ? 'Mode A · Full Three.js Scene Extraction'
                   : 'Mode B · Isolated HTML Sandbox'}
               </span>
             </div>

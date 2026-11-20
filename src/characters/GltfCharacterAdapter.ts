@@ -105,6 +105,7 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
       if (isMesh) {
         obj.castShadow = true;
         obj.receiveShadow = true;
+        obj.frustumCulled = false;
       }
       obj.userData.characterInstanceId = this.instanceId;
       obj.userData.rigNodeId = nodeId;

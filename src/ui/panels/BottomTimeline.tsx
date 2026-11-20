@@ -39,7 +39,7 @@ import type {
   Vec3Keyframe,
 } from '../../core/types';
 import { formatTimecode } from '../../utils/timeUtils';
-import { ContextMenu, type ContextMenuItem, IconButton, StudioButton } from '../components/Primitives';
+import { ContextMenu, type ContextMenuItem, CustomSelect, IconButton, StudioButton } from '../components/Primitives';
 import { GraphEditor } from './GraphEditor';
 
 export interface KeyframeRef {
@@ -598,22 +598,24 @@ export function BottomTimeline({
                 </IconButton>
               )}
               {onSetKeyframeEasing && (
-                <select
-                  aria-label="Set selected keyframes easing"
-                  defaultValue=""
-                  onChange={(e) => {
-                    if (!e.target.value) return;
-                    onSetKeyframeEasing(selectedKeys, e.target.value as EasingType);
-                    e.target.value = '';
-                  }}
-                  className="h-5 rounded border border-[#3d3428] bg-[#16181c] px-1 text-[10px] text-[#e6e8ec]"
-                >
-                  <option value="">Ease...</option>
-                  <option value="smooth">Smooth</option>
-                  <option value="linear">Linear</option>
-                  <option value="step">Step</option>
-                  <option value="bezier">Bezier</option>
-                </select>
+                <div className="w-20">
+                  <CustomSelect
+                    ariaLabel="Set selected keyframes easing"
+                    size="xs"
+                    value=""
+                    placeholder="Ease..."
+                    options={[
+                      { value: 'smooth', label: 'Smooth' },
+                      { value: 'linear', label: 'Linear' },
+                      { value: 'step', label: 'Step' },
+                      { value: 'bezier', label: 'Bezier' },
+                    ]}
+                    onChange={(val) => {
+                      if (!val) return;
+                      onSetKeyframeEasing(selectedKeys, val as EasingType);
+                    }}
+                  />
+                </div>
               )}
               <IconButton
                 label="Delete Selected Keys"
@@ -679,30 +681,34 @@ export function BottomTimeline({
             </div>
           )}
 
-          <select
-            aria-label="Timeline FPS"
-            data-studio-note="Project timeline frame rate (FPS)"
-            value={fps}
-            onChange={(e) => onChangeFps(Number(e.target.value))}
-            className="h-6 rounded border border-[#2e333d] bg-[#14161a] px-1 text-[10px] text-[#e6e8ec]"
-          >
-            <option value={24}>24fps</option>
-            <option value={30}>30fps</option>
-            <option value={60}>60fps</option>
-          </select>
+          <div className="w-16" data-studio-note="Project timeline frame rate (FPS)">
+            <CustomSelect
+              ariaLabel="Timeline FPS"
+              size="xs"
+              value={String(fps)}
+              options={[
+                { value: '24', label: '24fps' },
+                { value: '30', label: '30fps' },
+                { value: '60', label: '60fps' },
+              ]}
+              onChange={(val) => onChangeFps(Number(val))}
+            />
+          </div>
 
-          <select
-            aria-label="Playback speed"
-            data-studio-note="Preview playback speed multiplier"
-            value={playbackSpeed}
-            onChange={(e) => onChangePlaybackSpeed(Number(e.target.value))}
-            className="h-6 rounded border border-[#2e333d] bg-[#14161a] px-1 text-[10px] text-[#e6e8ec]"
-          >
-            <option value={0.5}>0.5x</option>
-            <option value={1}>1.0x</option>
-            <option value={1.5}>1.5x</option>
-            <option value={2}>2.0x</option>
-          </select>
+          <div className="w-14" data-studio-note="Preview playback speed multiplier">
+            <CustomSelect
+              ariaLabel="Playback speed"
+              size="xs"
+              value={String(playbackSpeed)}
+              options={[
+                { value: '0.5', label: '0.5x' },
+                { value: '1', label: '1.0x' },
+                { value: '1.5', label: '1.5x' },
+                { value: '2', label: '2.0x' },
+              ]}
+              onChange={(val) => onChangePlaybackSpeed(Number(val))}
+            />
+          </div>
 
           {collapseState === 'expanded' && timelineView === 'tracks' && (
             <>

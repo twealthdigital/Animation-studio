@@ -3,7 +3,10 @@ import {
   Bone,
   Camera,
   ChevronRight,
+  Cloud,
   Copy,
+  Eye,
+  EyeOff,
   Group,
   Key,
   Layers,
@@ -20,6 +23,7 @@ import {
   Shapes,
   SlidersHorizontal,
   Smile,
+  Square,
   Trash2,
   Ungroup,
   Unlock,
@@ -34,6 +38,7 @@ import type {
   EasingType,
   EnvironmentPresetId,
   FacialState,
+  FloorShapeKind,
   IkChainType,
   MotionPathCurveType,
   MotionPathData,
@@ -48,11 +53,14 @@ import type {
   ScenePropData,
   SceneTransitionType,
   SelectionTarget,
+  StageEnvironmentConfig,
+  StageWallConfig,
+  StageWallSide,
   StudioMode,
   Transform3D,
   Vec3,
 } from '../../core/types';
-import { createDefaultMotionPath } from '../../core/types';
+import { createDefaultMotionPath, createDefaultStageConfig } from '../../core/types';
 import type { CharacterCapabilities } from '../../characters/CharacterAdapter';
 import { buildRigCompatibilityReport } from '../../animation/RigMapper';
 import { type AnimationSuggestion } from '../../animation/MotionPresets';
@@ -121,6 +129,7 @@ interface RightInspectorProps {
   onBreakApartProp?: (propId: string) => void;
   onDetachPropAttachment?: (propId: string) => void;
   onDeleteProp?: (propId: string) => void;
+  onBakeHtmlMotion?: (instanceId: string) => void;
   onUpdateCharacterMeta: (instanceId: string, patch: Partial<CharacterInstanceData>) => void;
   onUpdateCharacterTransform: (instanceId: string, transform: Transform3D) => void;
   onKeyCharacterTransform: (instanceId: string, easing: EasingType) => void;
@@ -186,6 +195,11 @@ interface RightInspectorProps {
   onUpdateActionClip: (instanceId: string, clipId: string, patch: Partial<ActionClip>) => void;
   onDeleteActionClip: (instanceId: string, clipId: string) => void;
   onUpdateSceneProps: (patch: Partial<SceneData>) => void;
+  onUpdateStageConfig?: (patch: Partial<StageEnvironmentConfig>) => void;
+  onAddStageWall?: (side: StageWallSide) => void;
+  onAddRoomWalls?: () => void;
+  onUpdateStageWall?: (wallId: string, patch: Partial<StageWallConfig>) => void;
+  onRemoveStageWall?: (wallId: string) => void;
 }
 
 const EASING_OPTIONS: { value: EasingType; label: string }[] = [
@@ -255,6 +269,7 @@ export function RightInspector({
   onBreakApartProp,
   onDetachPropAttachment,
   onDeleteProp,
+  onBakeHtmlMotion,
   onUpdateCharacterMeta,
   onUpdateCharacterTransform,
   onKeyCharacterTransform,
@@ -304,6 +319,11 @@ export function RightInspector({
   onUpdateActionClip,
   onDeleteActionClip,
   onUpdateSceneProps,
+  onUpdateStageConfig,
+  onAddStageWall,
+  onAddRoomWalls,
+  onUpdateStageWall,
+  onRemoveStageWall,
 }: RightInspectorProps) {
   const [easing, setEasing] = useState<EasingType>('smooth');
   const [selectedActionId, setSelectedActionId] = useState<string>('');
@@ -596,7 +616,7 @@ export function RightInspector({
               <Lock className="h-3.5 w-3.5" aria-hidden="true" />
             </IconButton>
           </div>
-          <div className="flex items-center justify-between pt-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
             <label className="flex items-center gap-2 text-xs text-[#e6e8ec]">
               <input
                 type="checkbox"
@@ -616,10 +636,37 @@ export function RightInspector({
                   }
                   className="accent-[#e8702a]"
                 />
-                <span>HTML Backdrop</span>
+                <span>Whole Scene &amp; Lights</span>
               </label>
             )}
           </div>
+          {selectedCharacterCaps?.importMode === 'native-three-extraction' && (
+            <div className="space-y-1.5 rounded border border-[#2a2e36] bg-[#14161a] p-2">
+              <label className="flex items-center justify-between gap-2 text-[11px] text-[#e6e8ec]">
+                <span>Play Coded HTML Animation</span>
+                <input
+                  type="checkbox"
+                  checked={char.playNativeLoop !== false}
+                  onChange={(e) =>
+                    onUpdateCharacterMeta(char.id, { playNativeLoop: e.target.checked })
+                  }
+                  className="accent-[#e8702a]"
+                />
+              </label>
+              {onBakeHtmlMotion && (
+                <StudioButton
+                  size="xs"
+                  variant="primary"
+                  className="w-full"
+                  note="Convert every coded movement in this HTML video into editable Timeline keyframes"
+                  onClick={() => onBakeHtmlMotion(char.id)}
+                >
+                  <Key className="h-3 w-3" aria-hidden="true" />
+                  <span>Bake HTML Motion to Keyframes</span>
+                </StudioButton>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Transform & Keyframing */}
@@ -816,6 +863,40 @@ export function RightInspector({
                 </StudioButton>
               )}
             </div>
+            {onUpdateNodeMaterial && (
+              <div className="space-y-1.5 rounded border border-[#2a2e36] bg-[#14161a] p-2">
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-[#98a0ad]">
+                    <Palette className="h-3 w-3 text-[#e8702a]" aria-hidden="true" />
+                    <span>Character Color Tint</span>
+                  </span>
+                  {char.nodeMaterialOverrides?.['node_0'] && onResetNodeMaterial && (
+                    <button
+                      type="button"
+                      onClick={() => onResetNodeMaterial(char.id, 'node_0')}
+                      className="text-[10px] text-[#f59e0b] hover:underline"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] text-[#98a0ad]">Recolor whole character</span>
+                  <input
+                    type="color"
+                    aria-label="Whole character color"
+                    value={char.nodeMaterialOverrides?.['node_0']?.color ?? '#60a5fa'}
+                    onChange={(e) =>
+                      onUpdateNodeMaterial(char.id, 'node_0', {
+                        ...(char.nodeMaterialOverrides?.['node_0'] ?? {}),
+                        color: e.target.value,
+                      })
+                    }
+                    className="h-6 w-12 cursor-pointer rounded border border-[#2e333d] bg-[#191b1f] p-0.5"
+                  />
+                </div>
+              </div>
+            )}
             <div className="flex flex-wrap gap-1 pt-0.5">
               {Array.from(
                 new Set(selectedCharRigNodes.flatMap((n) => n.materials ?? [])),
@@ -1715,64 +1796,348 @@ export function RightInspector({
     </div>
   );
 
-  const renderSceneInspector = () => (
-    <div className="space-y-4">
-      <div className="border-b border-[#2a2e36] pb-2 font-semibold text-[#e6e8ec]">
-        Scene Settings &amp; Environment
+  const renderSceneInspector = () => {
+    const stage = activeScene.stageConfig ?? createDefaultStageConfig();
+    const patchStage = (patch: Partial<StageEnvironmentConfig>) => {
+      if (onUpdateStageConfig) {
+        onUpdateStageConfig(patch);
+      } else {
+        onUpdateSceneProps({ stageConfig: { ...stage, ...patch } });
+      }
+    };
+
+    return (
+      <div className="space-y-4">
+        <div className="border-b border-[#2a2e36] pb-2 font-semibold text-[#e6e8ec]">
+          Scene, Stage Floor &amp; Environment
+        </div>
+
+        <label className="block">
+          <span className="text-[11px] text-[#98a0ad]">Scene Name</span>
+          <input
+            type="text"
+            value={activeScene.name}
+            onChange={(e) => onUpdateSceneProps({ name: e.target.value })}
+            className="mt-1 h-7 w-full rounded border border-[#2e333d] bg-[#14161a] px-2 text-xs text-[#e6e8ec]"
+          />
+        </label>
+
+        <NumericInput
+          label="Dur"
+          min={1}
+          max={600}
+          step={1}
+          decimals={1}
+          value={activeScene.duration}
+          onChange={(duration) => onUpdateSceneProps({ duration })}
+        />
+
+        <CustomSelect
+          label="Environment Lighting Preset"
+          value={activeScene.environmentPreset ?? 'studio-dark'}
+          options={ENVIRONMENT_PRESETS.map((p) => ({ value: p.id, label: p.label }))}
+          onChange={(id) => onApplyEnvironmentPreset(id as EnvironmentPresetId)}
+        />
+
+        {/* Floor Canvas Shape, Sides, Size & Colors */}
+        <div className="space-y-2.5 rounded border border-[#2a2e36] bg-[#14161a] p-2.5">
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5 text-[11px] font-semibold text-[#e6e8ec]">
+              <Square className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
+              <span>Stage Floor Canvas</span>
+            </span>
+            <StudioButton
+              size="xs"
+              variant={!stage.floorLockEnabled ? 'selected' : 'default'}
+              onClick={() => patchStage({ floorLockEnabled: !stage.floorLockEnabled })}
+              note="Lock objects above floor or unlock to move objects beneath the floor"
+            >
+              {stage.floorLockEnabled ? (
+                <Lock className="h-3 w-3 text-[#4ade80]" aria-hidden="true" />
+              ) : (
+                <Unlock className="h-3 w-3 text-[#f59e0b]" aria-hidden="true" />
+              )}
+              <span>{stage.floorLockEnabled ? 'Locked' : 'Under-Floor Open'}</span>
+            </StudioButton>
+          </div>
+
+          <CustomSelect
+            label="Floor Shape"
+            value={stage.floorShape}
+            options={[
+              { value: 'square', label: 'Square (Default)' },
+              { value: 'rectangle', label: 'Rectangle Stage' },
+              { value: 'polygon', label: 'Custom Polygon (N Sides)' },
+              { value: 'circle', label: 'Circle' },
+            ]}
+            onChange={(val) => {
+              const shape = val as FloorShapeKind;
+              patchStage({
+                floorShape: shape,
+                floorSides: shape === 'square' ? 4 : shape === 'circle' ? 64 : Math.max(3, stage.floorSides),
+              });
+            }}
+          />
+
+          {/* Number of Sides (works directly — changing sides switches cleanly to polygon if needed) */}
+          <div className="space-y-1.5">
+            <StudioSlider
+              label="Number of Sides"
+              value={stage.floorSides}
+              min={3}
+              max={64}
+              step={1}
+              onChange={(sides) =>
+                patchStage({
+                  floorSides: Math.round(sides),
+                  floorShape: Math.round(sides) === 4 && stage.floorShape === 'square' ? 'square' : 'polygon',
+                })
+              }
+            />
+            <div className="grid grid-cols-6 gap-1">
+              {[3, 4, 5, 6, 8, 12].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() =>
+                    patchStage({
+                      floorSides: n,
+                      floorShape: n === 4 ? 'square' : 'polygon',
+                    })
+                  }
+                  className={`rounded border py-0.5 text-[10px] font-mono-code ${
+                    stage.floorSides === n && (stage.floorShape === 'polygon' || (n === 4 && stage.floorShape === 'square'))
+                      ? 'border-[#e8702a] bg-[#2e221b] text-[#f7be97] font-semibold'
+                      : 'border-[#2a2e36] bg-[#191b1f] text-[#98a0ad] hover:text-[#e6e8ec]'
+                  }`}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <StudioSlider
+            label="Floor Size (m)"
+            value={stage.floorSize}
+            min={8}
+            max={80}
+            step={2}
+            onChange={(floorSize) => patchStage({ floorSize })}
+          />
+
+          <div className="grid grid-cols-2 gap-2 pt-0.5">
+            <label className="flex items-center justify-between rounded border border-[#252932] bg-[#181a1f] px-2 py-1 text-[11px]">
+              <span className="text-[#98a0ad]">Floor</span>
+              <input
+                type="color"
+                aria-label="Floor color"
+                value={stage.floorColor}
+                onChange={(e) => patchStage({ floorColor: e.target.value })}
+                className="h-5 w-8 cursor-pointer rounded border border-[#2e333d] bg-[#14161a]"
+              />
+            </label>
+            <label className="flex items-center justify-between rounded border border-[#252932] bg-[#181a1f] px-2 py-1 text-[11px]">
+              <span className="text-[#98a0ad]">Sky</span>
+              <input
+                type="color"
+                aria-label="Backdrop sky color"
+                value={activeScene.backgroundColor}
+                onChange={(e) => onUpdateSceneProps({ backgroundColor: e.target.value })}
+                className="h-5 w-8 cursor-pointer rounded border border-[#2e333d] bg-[#14161a]"
+              />
+            </label>
+            <label className="flex items-center justify-between rounded border border-[#252932] bg-[#181a1f] px-2 py-1 text-[11px]">
+              <span className="text-[#98a0ad]">Grid Main</span>
+              <input
+                type="color"
+                aria-label="Grid main color"
+                value={stage.gridColor}
+                onChange={(e) => patchStage({ gridColor: e.target.value })}
+                className="h-5 w-8 cursor-pointer rounded border border-[#2e333d] bg-[#14161a]"
+              />
+            </label>
+            <label className="flex items-center justify-between rounded border border-[#252932] bg-[#181a1f] px-2 py-1 text-[11px]">
+              <span className="text-[#98a0ad]">Grid Sub</span>
+              <input
+                type="color"
+                aria-label="Grid secondary color"
+                value={stage.gridSecondaryColor}
+                onChange={(e) => patchStage({ gridSecondaryColor: e.target.value })}
+                className="h-5 w-8 cursor-pointer rounded border border-[#2e333d] bg-[#14161a]"
+              />
+            </label>
+          </div>
+
+          <label className="flex items-center gap-2 text-xs text-[#e6e8ec]">
+            <input
+              type="checkbox"
+              checked={activeScene.showGrid}
+              onChange={(e) => onUpdateSceneProps({ showGrid: e.target.checked })}
+              className="accent-[#e8702a]"
+            />
+            <span>Show studio floor grid</span>
+          </label>
+        </div>
+
+        {/* Sky Clouds Controls (Colorable & Adjustable) */}
+        <div className="space-y-2 rounded border border-[#2a2e36] bg-[#14161a] p-2.5">
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5 text-[11px] font-semibold text-[#e6e8ec]">
+              <Cloud className="h-3.5 w-3.5 text-[#7dd3fc]" aria-hidden="true" />
+              <span>Sky Clouds</span>
+            </span>
+            <label className="flex items-center gap-1.5 text-[11px] text-[#cbd5e1]">
+              <input
+                type="checkbox"
+                checked={stage.showClouds}
+                onChange={(e) => patchStage({ showClouds: e.target.checked })}
+                className="accent-[#e8702a]"
+              />
+              <span>Visible</span>
+            </label>
+          </div>
+
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="text-[#98a0ad]">Cloud Color</span>
+            <div className="flex items-center gap-1.5">
+              <span className="font-mono-code text-[10px] text-[#cbd5e1]">{stage.cloudColor}</span>
+              <input
+                type="color"
+                aria-label="Cloud color"
+                value={stage.cloudColor}
+                onChange={(e) => patchStage({ cloudColor: e.target.value })}
+                className="h-6 w-10 cursor-pointer rounded border border-[#2e333d] bg-[#191b1f] p-0.5"
+              />
+            </div>
+          </div>
+
+          <StudioSlider
+            label="Cloud Opacity"
+            value={stage.cloudOpacity}
+            min={0.05}
+            max={1}
+            step={0.05}
+            onChange={(cloudOpacity) => patchStage({ cloudOpacity })}
+          />
+        </div>
+
+        {/* Studio Walls Builder */}
+        <div className="space-y-2 rounded border border-[#2a2e36] bg-[#14161a] p-2.5">
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5 text-[11px] font-semibold text-[#e6e8ec]">
+              <Layers className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
+              <span>Studio Walls ({stage.walls.length})</span>
+            </span>
+            {onAddRoomWalls && (
+              <StudioButton size="xs" variant="primary" onClick={onAddRoomWalls}>
+                + 3-Wall Room
+              </StudioButton>
+            )}
+          </div>
+
+          {onAddStageWall && (
+            <div className="grid grid-cols-4 gap-1">
+              {(['back', 'left', 'right', 'front'] as StageWallSide[]).map((side) => (
+                <StudioButton
+                  key={side}
+                  size="xs"
+                  onClick={() => onAddStageWall(side)}
+                  className="capitalize"
+                >
+                  + {side}
+                </StudioButton>
+              ))}
+            </div>
+          )}
+
+          {stage.walls.length === 0 ? (
+            <p className="text-[10px] text-[#6b7280]">
+              Add Back, Left, Right, or Front studio walls and customize each wall&apos;s color, height &amp; width.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {stage.walls.map((wall) => (
+                <div
+                  key={wall.id}
+                  className="space-y-1.5 rounded border border-[#252932] bg-[#181a1f] p-2"
+                >
+                  <div className="flex items-center justify-between gap-1.5">
+                    <span className="truncate text-[11px] font-semibold text-[#e6e8ec]">
+                      {wall.name}
+                    </span>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <input
+                        type="color"
+                        aria-label={`${wall.name} color`}
+                        value={wall.color}
+                        onChange={(e) => onUpdateStageWall?.(wall.id, { color: e.target.value })}
+                        className="h-5 w-7 cursor-pointer rounded border border-[#2e333d] bg-[#14161a]"
+                      />
+                      <IconButton
+                        label={wall.visible ? 'Hide wall' : 'Show wall'}
+                        onClick={() => onUpdateStageWall?.(wall.id, { visible: !wall.visible })}
+                      >
+                        {wall.visible ? (
+                          <Eye className="h-3 w-3" aria-hidden="true" />
+                        ) : (
+                          <EyeOff className="h-3 w-3 text-[#6b7280]" aria-hidden="true" />
+                        )}
+                      </IconButton>
+                      <IconButton
+                        label={`Remove ${wall.name}`}
+                        onClick={() => onRemoveStageWall?.(wall.id)}
+                      >
+                        <Trash2 className="h-3 w-3 text-[#f87171]" aria-hidden="true" />
+                      </IconButton>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <NumericInput
+                      label="W"
+                      min={1}
+                      max={80}
+                      step={1}
+                      decimals={1}
+                      value={wall.width}
+                      onChange={(width) => onUpdateStageWall?.(wall.id, { width })}
+                    />
+                    <NumericInput
+                      label="H"
+                      min={1}
+                      max={30}
+                      step={0.5}
+                      decimals={1}
+                      value={wall.height}
+                      onChange={(height) => onUpdateStageWall?.(wall.id, { height })}
+                    />
+                  </div>
+                  <StudioSlider
+                    label="Opacity"
+                    value={wall.opacity}
+                    min={0.1}
+                    max={1}
+                    step={0.05}
+                    onChange={(opacity) => onUpdateStageWall?.(wall.id, { opacity })}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <CustomSelect
+          label="Scene Transition"
+          value={activeScene.transition}
+          options={[
+            { value: 'cut', label: 'Cut (Instant)' },
+            { value: 'fade', label: 'Fade to Black' },
+          ]}
+          onChange={(transition) => onUpdateSceneProps({ transition: transition as SceneTransitionType })}
+        />
       </div>
-      <label className="block">
-        <span className="text-[11px] text-[#98a0ad]">Scene Name</span>
-        <input
-          type="text"
-          value={activeScene.name}
-          onChange={(e) => onUpdateSceneProps({ name: e.target.value })}
-          className="mt-1 h-7 w-full rounded border border-[#2e333d] bg-[#14161a] px-2 text-xs text-[#e6e8ec]"
-        />
-      </label>
-      <NumericInput
-        label="Dur"
-        min={1}
-        max={600}
-        step={1}
-        decimals={1}
-        value={activeScene.duration}
-        onChange={(duration) => onUpdateSceneProps({ duration })}
-      />
-      <CustomSelect
-        label="Environment Lighting Preset"
-        value={activeScene.environmentPreset ?? 'studio-dark'}
-        options={ENVIRONMENT_PRESETS.map((p) => ({ value: p.id, label: p.label }))}
-        onChange={(id) => onApplyEnvironmentPreset(id as EnvironmentPresetId)}
-      />
-      <label className="flex items-center justify-between text-xs">
-        <span className="text-[#98a0ad]">Backdrop Color</span>
-        <input
-          type="color"
-          value={activeScene.backgroundColor}
-          onChange={(e) => onUpdateSceneProps({ backgroundColor: e.target.value })}
-          className="h-7 w-14 cursor-pointer rounded border border-[#2e333d] bg-[#14161a] p-0.5"
-        />
-      </label>
-      <label className="flex items-center gap-2 text-xs text-[#e6e8ec]">
-        <input
-          type="checkbox"
-          checked={activeScene.showGrid}
-          onChange={(e) => onUpdateSceneProps({ showGrid: e.target.checked })}
-          className="accent-[#e8702a]"
-        />
-        <span>Show studio floor grid</span>
-      </label>
-      <CustomSelect
-        label="Scene Transition"
-        value={activeScene.transition}
-        options={[
-          { value: 'cut', label: 'Cut (Instant)' },
-          { value: 'fade', label: 'Fade to Black' },
-        ]}
-        onChange={(transition) => onUpdateSceneProps({ transition: transition as SceneTransitionType })}
-      />
-    </div>
-  );
+    );
+  };
 
   const renderGroupInspector = (grp: SceneGroupData) => {
     const t = evaluatedGroupTransform ?? grp.transform;

@@ -6,6 +6,7 @@ export interface HtmlCharacterAnalysis {
   usesThreeJs: boolean;
   threeVersion: string | null;
   recommendedMode: CharacterImportMode;
+  isFullScene: boolean;
   globalApiHandle: string | null;
   sdkDetected: boolean;
   externalDependencies: string[];
@@ -27,19 +28,23 @@ function formatActionLabel(id: string): string {
 }
 
 /**
- * Inspects raw HTML source from a 3D character file (e.g., Globe, Host, or SDK-compliant
- * custom characters) without executing arbitrary scripts, extracting dependencies, rig
- * hints, facial controls, exposed API, moods, actions, and recommended import mode.
+ * Inspects raw HTML source from a 3D character or full animated Three.js scene/video HTML file
+ * without executing arbitrary scripts, extracting dependencies, rig hints, moods, actions,
+ * and whether it represents a full multi-object animated scene.
  */
-export function analyzeHtmlCharacter(htmlSource: string, fallbackName = 'Imported Character'): HtmlCharacterAnalysis {
+export function analyzeHtmlCharacter(htmlSource: string, fallbackName = 'Imported Scene'): HtmlCharacterAnalysis {
   const warnings: string[] = [];
 
   const titleMatch = htmlSource.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleMatch ? titleMatch[1].trim() : '';
   const suggestedName = title || fallbackName.replace(/\.html?$/i, '');
 
-  const threeScriptMatch = htmlSource.match(/three(?:\.min)?\.js|from\s+['"]three['"]|new\s+THREE\./i);
-  const usesThreeJs = Boolean(threeScriptMatch);
+  const usesThreeImport =
+    /from\s+['"][^'"]*three[^'"]*['"]/i.test(htmlSource) ||
+    /three(?:\.min|\.module)?\.js/i.test(htmlSource) ||
+    /new\s+THREE\./i.test(htmlSource) ||
+    /"three"\s*:/i.test(htmlSource);
+  const usesThreeJs = Boolean(usesThreeImport);
   const versionMatch = htmlSource.match(/three\.js\/r(\d+)|three@(\d+\.\d+\.\d+)/i);
   const threeVersion = versionMatch
     ? versionMatch[1]
@@ -47,7 +52,7 @@ export function analyzeHtmlCharacter(htmlSource: string, fallbackName = 'Importe
       : versionMatch[2]
     : null;
 
-  // External script/asset dependencies
+  // External script/asset dependencies (ignore importmap & known Three.js CDN scripts handled natively)
   const externalDependencies: string[] = [];
   for (const m of htmlSource.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)) {
     externalDependencies.push(m[1]);
@@ -68,9 +73,9 @@ export function analyzeHtmlCharacter(htmlSource: string, fallbackName = 'Importe
   const groupMatches = [...htmlSource.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+THREE\.Group\s*\(/g)];
   const detectedGroupNames = [...new Set(groupMatches.map((m) => m[1]))];
 
-  const backdropCandidates = ['slat', 'back', 'floor', 'shadow', 'boom', 'mic', 'ring'];
+  const backdropCandidates = ['slat', 'back', 'floor', 'shadow', 'boom', 'mic', 'ring', 'ground', 'sky', 'sun', 'wall', 'room'];
   const detectedBackdropHints = backdropCandidates.filter((token) =>
-    new RegExp(`\\b${token}[A-Za-z0-9_]*\\b`).test(htmlSource),
+    new RegExp(`\\b${token}[A-Za-z0-9_]*\\b`, 'i').test(htmlSource),
   );
 
   // Rig & facial hints
@@ -119,20 +124,40 @@ export function analyzeHtmlCharacter(htmlSource: string, fallbackName = 'Importe
     defaultDurationSec: loopTokens.includes(id) ? 2.0 : 1.0,
   }));
 
-  const hasWebGLRenderer = /THREE\.WebGLRenderer/.test(htmlSource);
-  const hasExternalModule = /<script[^>]+type=["']module["'][^>]+src=/.test(htmlSource);
+  const hasInlineScript = /<script\b(?![^>]*\bsrc\s*=)[^>]*>[\s\S]*?<\/script>/i.test(htmlSource);
+  const hasWebGLRenderer = /WebGLRenderer/.test(htmlSource);
+  const hasExternalModuleSrcOnly =
+    /<script[^>]+type=["']module["'][^>]+src=/i.test(htmlSource) && !hasInlineScript;
+  const nonThreeExternalLibs = externalDependencies.filter(
+    (dep) => !/three|importmap|orbitcontrols|roomenvironment|roundedbox/i.test(dep),
+  );
+
+  // Full-scene / coded HTML video detection (multiple scene adds, lights, animation loop, camera choreography)
+  const sceneAddMatches = htmlSource.match(/\bscene\.add\s*\(/g) ?? [];
+  const hasAnimationLoop =
+    /requestAnimationFrame|setAnimationLoop/.test(htmlSource);
+  const isFullScene =
+    !sdkDetected &&
+    !globalApiHandle &&
+    (sceneAddMatches.length >= 2 || (hasAnimationLoop && detectedBackdropHints.length >= 2));
+
   const recommendedMode: CharacterImportMode =
-    usesThreeJs && hasWebGLRenderer && !hasExternalModule
+    usesThreeJs && hasInlineScript && !hasExternalModuleSrcOnly && (hasWebGLRenderer || /new\s+(?:THREE\.)?Scene\s*\(/.test(htmlSource))
       ? 'native-three-extraction'
       : 'isolated-iframe';
 
   if (!usesThreeJs) {
-    warnings.push('No Three.js runtime detected; import will use Isolated HTML Sandbox mode with limited spatial controls.');
-  } else if (hasExternalModule) {
-    warnings.push('External ES module dependency detected; Isolated HTML Sandbox mode recommended unless bundled inline.');
+    warnings.push('No Three.js runtime detected; import will use Isolated HTML Sandbox mode.');
+  } else if (hasExternalModuleSrcOnly) {
+    warnings.push('External ES module src script detected; Isolated HTML Sandbox mode recommended unless bundled inline.');
+  } else if (nonThreeExternalLibs.length > 0) {
+    warnings.push(`External dependency referenced (${nonThreeExternalLibs.join(', ')}); non-Three globals may be stubbed.`);
   }
-  if (!globalApiHandle && !sdkDetected) {
-    warnings.push('No global API (window.<name> or window.STAGECRAFT_SDK) detected; hierarchy extraction and transforms still apply.');
+
+  if (isFullScene && recommendedMode === 'native-three-extraction') {
+    warnings.push('Full coded 3D scene detected — all objects, lights & animation will play together and can be baked to Timeline keyframes for editing.');
+  } else if (!globalApiHandle && !sdkDetected) {
+    warnings.push('All 3D parts & procedural movements will be extracted for interactive clicking, recoloring & keyframing.');
   }
 
   return {
@@ -141,6 +166,7 @@ export function analyzeHtmlCharacter(htmlSource: string, fallbackName = 'Importe
     usesThreeJs,
     threeVersion,
     recommendedMode,
+    isFullScene,
     globalApiHandle,
     sdkDetected,
     externalDependencies,

@@ -1,9 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Bot, Pause, Play, RotateCcw } from 'lucide-react';
 import type {
   ActionClip,
+  AiBridgeCommand,
+  AiBridgeLogEntry,
   AssetRecord,
   AudioClipData,
   AxisConstraint,
+  CameraOrientationState,
   CameraPose,
   CharacterInstanceData,
   EasingType,
@@ -13,9 +17,11 @@ import type {
   GizmoMode,
   GizmoSpace,
   HoverTargetInfo,
+  LiveSizeInfo,
   MotionPathData,
   MotionPathPoint,
   MultiSelectedNodeRef,
+  NodeKeyframeTrack,
   NodeMaterialOverride,
   PanelCollapseState,
   ProjectData,
@@ -29,7 +35,11 @@ import type {
   ScenePropData,
   SelectionFilter,
   SelectionTarget,
+  SizeUnit,
   SnapSettings,
+  StageEnvironmentConfig,
+  StageWallConfig,
+  StageWallSide,
   StudioMode,
   TabPrediction,
   Transform3D,
@@ -39,6 +49,7 @@ import type {
 } from '../core/types';
 import {
   createDefaultMotionPath,
+  createDefaultStageConfig,
   createDefaultTransform,
 } from '../core/types';
 import { migrateProjectData } from '../core/migrations';
@@ -89,6 +100,11 @@ import {
   saveAsset as dbSaveAsset,
   saveProject as dbSaveProject,
 } from '../storage/StudioRepository';
+import {
+  buildAiSceneSnapshot,
+  executeSingleAiCommand,
+  extractAiCommandsFromText,
+} from '../engine/AiBridgeExecutor';
 import { TopToolbar } from '../ui/panels/TopToolbar';
 import { LeftAssetPanel, type LeftPanelTab } from '../ui/panels/LeftAssetPanel';
 import { CenterViewport } from '../ui/panels/CenterViewport';
@@ -101,6 +117,7 @@ import {
   ProjectManagerDialog,
   UserGuideDialog,
 } from '../ui/dialogs/StudioDialogs';
+import { AiBridgeDrawer } from '../ui/dialogs/AiBridgeDrawer';
 import { CommandPalette, type PaletteAction } from '../ui/dialogs/CommandPalette';
 import { ConfirmDialog, type ContextMenuItem, StudioTooltipHost } from '../ui/components/Primitives';
 
@@ -312,6 +329,14 @@ export function StudioWorkspace() {
   });
   const [selectionFilter, setSelectionFilter] = useState<SelectionFilter>('all');
   const [showRigOverlay, setShowRigOverlay] = useState<boolean>(true);
+  const [liveSizeInfo, setLiveSizeInfo] = useState<LiveSizeInfo | null>(null);
+  const [sizeUnit, setSizeUnit] = useState<SizeUnit>('px');
+  const [cameraOrientation, setCameraOrientation] = useState<CameraOrientationState>({
+    forward: { x: -0.48, y: -0.22, z: -0.85 },
+    right: { x: 0.87, y: 0, z: -0.49 },
+    up: { x: -0.11, y: 0.97, z: -0.19 },
+    viewLabel: '3D View',
+  });
 
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [storageReady, setStorageReady] = useState<boolean>(false);
@@ -340,6 +365,16 @@ export function StudioWorkspace() {
   const [exportOpen, setExportOpen] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [aiBridgeOpen, setAiBridgeOpen] = useState(false);
+  const [aiAccessEnabled, setAiAccessEnabled] = useState(false);
+  const [aiToken, setAiToken] = useState('');
+  const [aiConnectedStudios, setAiConnectedStudios] = useState(0);
+  const [aiPaused, setAiPaused] = useState(false);
+  const [aiStepDelayMs, setAiStepDelayMs] = useState(350);
+  const [aiAutoHighlight, setAiAutoHighlight] = useState(true);
+  const [aiLogs, setAiLogs] = useState<AiBridgeLogEntry[]>([]);
+  const [aiQueueLength, setAiQueueLength] = useState(0);
+  const [aiBatchUndoStack, setAiBatchUndoStack] = useState<SceneData[]>([]);
   const [dialogueTargetCharId, setDialogueTargetCharId] = useState<string | null>(null);
   const [confirmState, setConfirmState] = useState<{
     title: string;
@@ -665,6 +700,7 @@ export function StudioWorkspace() {
 
         if (adapter instanceof HtmlThreeAdapter) {
           adapter.setIncludeStageProps(char.includeStageProps);
+          adapter.setPlayNativeLoop(char.playNativeLoop !== false);
           adapter.applyTimelineState(
             new Set(charEval.activeActions.map((a) => a.id)),
             charEval.activeActions,
@@ -676,7 +712,7 @@ export function StudioWorkspace() {
             adapter.applyNodeMaterialOverrides(char.nodeMaterialOverrides ?? {});
           });
           adapter.applyFacialState(facialWithAudio);
-          adapter.update(dt);
+          adapter.update(dt, time);
         } else if (adapter instanceof GltfCharacterAdapter) {
           const firstClip = charEval.activeActions[0];
           adapter.evaluateClipAt(
@@ -1844,6 +1880,12 @@ export function StudioWorkspace() {
       onHoverChanged: (hover) => {
         setHoverInfo(hover);
       },
+      onLiveSizeChange: (info) => {
+        setLiveSizeInfo(info);
+      },
+      onCameraOrientationChange: (ori) => {
+        setCameraOrientation(ori);
+      },
       onContextMenuRequest: (clientX, clientY, target) => {
         setViewportContextMenu({
           x: clientX,
@@ -2170,10 +2212,11 @@ export function StudioWorkspace() {
     if (!engine) return;
 
     const envSpec = ENVIRONMENT_PRESETS.find((e) => e.id === displayedScene.environmentPreset);
-    engine.setSceneAppearance(
+    const activeStage = displayedScene.stageConfig ?? createDefaultStageConfig(envSpec?.floorColor);
+    engine.setStageConfig(
+      activeStage,
       displayedScene.backgroundColor,
       displayedScene.showGrid,
-      envSpec?.floorColor,
     );
 
     const activeIds = new Set(displayedScene.characters.map((c) => c.id));
@@ -2792,6 +2835,7 @@ export function StudioWorkspace() {
               analysis.recommendedMode === 'isolated-iframe'
                 ? 'isolated-iframe'
                 : 'native-three-extraction',
+            isFullScene: analysis.isFullScene,
             globalApiHandle: analysis.globalApiHandle,
             sdkDetected: analysis.sdkDetected,
             externalDependencies: analysis.externalDependencies,
@@ -2879,12 +2923,16 @@ export function StudioWorkspace() {
     [importAssetFile],
   );
 
-  // Add Character Instance to Scene
+  // Add Character / Full HTML Scene Instance to Scene
   const handleAddCharacterToScene = useCallback(
     (asset: AssetRecord) => {
       const count = activeScene.characters.length;
+      const isWholeHtmlScene =
+        asset.kind === 'character-html' &&
+        (Boolean(asset.htmlAnalysis?.isFullScene) ||
+          (!asset.htmlAnalysis?.sdkDetected && !asset.htmlAnalysis?.globalApiHandle));
       const offsetX =
-        count === 0
+        count === 0 || isWholeHtmlScene
           ? 0
           : count === 1
             ? -2.8
@@ -2896,7 +2944,8 @@ export function StudioWorkspace() {
         assetId: asset.id,
         name: `${asset.name}${count > 0 ? ` ${count + 1}` : ''}`,
         visible: true,
-        includeStageProps: false,
+        includeStageProps: isWholeHtmlScene,
+        playNativeLoop: true,
         transform: createDefaultTransform(offsetX, 0, 0),
         pivot: { x: 0, y: 0, z: 0 },
         lockedProperties: { transform: false, keys: false },
@@ -2934,6 +2983,372 @@ export function StudioWorkspace() {
     },
     [activeScene.characters.length, commitSceneMutation],
   );
+
+  // Bake coded HTML procedural movements into editable Timeline keyframes
+  const handleBakeHtmlMotion = useCallback(
+    (instanceId: string) => {
+      const adapter = engineRef.current?.getAdapter(instanceId);
+      const char = sceneRef.current.characters.find((c) => c.id === instanceId);
+      if (!char || !adapter || !('sampleTimelineSequence' in adapter) || typeof adapter.sampleTimelineSequence !== 'function') {
+        setNoticeMessage('This item does not have a bakeable HTML Three.js animation loop.');
+        return;
+      }
+
+      const duration = Math.max(1, sceneRef.current.duration);
+      const { times, nodeDeltas } = adapter.sampleTimelineSequence(duration, 10);
+      const nodes = rigNodesRef.current[instanceId] ?? [];
+      const nameByNode = new Map(nodes.map((n) => [n.nodeId, n.name]));
+
+      const isCloseVec = (a: Vec3, b: Vec3, eps = 0.002) =>
+        Math.abs(a.x - b.x) < eps && Math.abs(a.y - b.y) < eps && Math.abs(a.z - b.z) < eps;
+
+      const bakedTracks: NodeKeyframeTrack[] = [];
+      for (const [nodeId, frames] of Object.entries(nodeDeltas)) {
+        if (frames.length === 0) continue;
+        const first = frames[0];
+        let posMoved = false;
+        let rotMoved = false;
+        let scaleMoved = false;
+        for (const f of frames) {
+          if (!isCloseVec(f.pos, { x: 0, y: 0, z: 0 })) posMoved = true;
+          if (!isCloseVec(f.rot, { x: 0, y: 0, z: 0 })) rotMoved = true;
+          if (!isCloseVec(f.scale, { x: 1, y: 1, z: 1 })) scaleMoved = true;
+        }
+        if (!posMoved && !rotMoved && !scaleMoved) continue;
+
+        const posKfs: Vec3Keyframe[] = [];
+        const rotKfs: Vec3Keyframe[] = [];
+        const scaleKfs: Vec3Keyframe[] = [];
+
+        frames.forEach((f, idx) => {
+          const isEdge = idx === 0 || idx === frames.length - 1;
+          const t = times[idx];
+          if (posMoved && (isEdge || !isCloseVec(f.pos, frames[idx - 1].pos, 0.004))) {
+            posKfs.push({ id: createId('kf'), time: t, value: f.pos, easing: 'linear' });
+          }
+          if (rotMoved && (isEdge || !isCloseVec(f.rot, frames[idx - 1].rot, 0.004))) {
+            rotKfs.push({ id: createId('kf'), time: t, value: f.rot, easing: 'linear' });
+          }
+          if (scaleMoved && (isEdge || !isCloseVec(f.scale, frames[idx - 1].scale, 0.004))) {
+            scaleKfs.push({ id: createId('kf'), time: t, value: f.scale, easing: 'linear' });
+          }
+        });
+
+        bakedTracks.push({
+          nodeId,
+          nodeName: nameByNode.get(nodeId) ?? nodeId,
+          positionKeyframes: posKfs,
+          rotationKeyframes: rotKfs,
+          scaleKeyframes: scaleKfs,
+        });
+        void first;
+      }
+
+      if (bakedTracks.length === 0) {
+        setNoticeMessage('No moving parts detected during the scene duration — you can still click any part and keyframe it directly!');
+        return;
+      }
+
+      commitSceneMutation(`Bake ${char.name} HTML Motion to Timeline`, (s) => ({
+        ...s,
+        characters: s.characters.map((c) => {
+          if (c.id !== instanceId) return c;
+          const bakedIds = new Set(bakedTracks.map((b) => b.nodeId));
+          const preserved = (c.nodeTracks ?? []).filter((nt) => !bakedIds.has(nt.nodeId));
+          return {
+            ...c,
+            playNativeLoop: false,
+            nodeTracks: [...preserved, ...bakedTracks],
+          };
+        }),
+      }));
+      setNoticeMessage(
+        `Baked ${bakedTracks.length} animated HTML object(s) onto the Timeline! Click any part to move, recolor, or edit its keyframes.`,
+      );
+    },
+    [commitSceneMutation],
+  );
+
+  // ---------- AI Live Bridge & Watch Mode ----------
+  const aiPausedRef = useRef(aiPaused);
+  const aiStepDelayRef = useRef(aiStepDelayMs);
+  const aiAutoHighlightRef = useRef(aiAutoHighlight);
+  aiPausedRef.current = aiPaused;
+  aiStepDelayRef.current = aiStepDelayMs;
+  aiAutoHighlightRef.current = aiAutoHighlight;
+
+  interface QueuedAiBatch {
+    batchId: string;
+    source: string;
+    commands: AiBridgeCommand[];
+  }
+  const aiQueueRef = useRef<QueuedAiBatch[]>([]);
+  const aiProcessingRef = useRef(false);
+
+  const aiSnapshot = useMemo(
+    () =>
+      buildAiSceneSnapshot(
+        activeProject,
+        activeScene,
+        currentTime,
+        isPlaying,
+        selection,
+        rigNodesByInstance,
+      ),
+    [activeProject, activeScene, currentTime, isPlaying, selection, rigNodesByInstance],
+  );
+
+  const runAiQueue = useCallback(async () => {
+    if (aiProcessingRef.current) return;
+    aiProcessingRef.current = true;
+    try {
+      while (aiQueueRef.current.length > 0) {
+        if (aiPausedRef.current) {
+          await new Promise((r) => setTimeout(r, 120));
+          continue;
+        }
+        const batch = aiQueueRef.current.shift()!;
+        setAiQueueLength(aiQueueRef.current.length + batch.commands.length);
+
+        const beforeBatchScene = cloneScene(sceneRef.current);
+        setAiBatchUndoStack((prev) => [beforeBatchScene, ...prev].slice(0, 15));
+
+        const results: { op: string; ok: boolean; summary: string }[] = [];
+        for (let i = 0; i < batch.commands.length; i++) {
+          while (aiPausedRef.current) {
+            await new Promise((r) => setTimeout(r, 120));
+          }
+          const cmd = batch.commands[i];
+          setAiQueueLength(
+            aiQueueRef.current.reduce((acc, b) => acc + b.commands.length, 0) + (batch.commands.length - i),
+          );
+
+          const logId = createId('ailog');
+          setAiLogs((prev) => [
+            {
+              id: logId,
+              timestamp: Date.now(),
+              source: batch.source,
+              summary: `Running ${cmd.op}...`,
+              status: 'running',
+            },
+            ...prev.slice(0, 59),
+          ]);
+
+          const res = executeSingleAiCommand(
+            {
+              scene: sceneRef.current,
+              currentTime: timeRef.current,
+              rigNodesByInstance: rigNodesRef.current,
+              updateScene: (mutator, desc) => commitSceneMutation(desc, mutator),
+              setSelection: (t) => setSelection(t),
+              setTime: (t) => handleSeek(t),
+              startPlayback: () => {
+                if (!isPlayingRef.current) handleTogglePlay();
+              },
+              stopPlayback: () => {
+                if (isPlayingRef.current) handleTogglePlay();
+              },
+              setCameraPose: (pose) => {
+                commitSceneMutation('AI Camera Pose', (s) => ({
+                  ...s,
+                  camera: { ...s.camera, pose },
+                  cameras: (s.cameras ?? []).map((cam, idx) =>
+                    cam.id === s.activeCameraId || (!s.activeCameraId && idx === 0)
+                      ? { ...cam, pose }
+                      : cam,
+                  ),
+                }));
+              },
+              detachNode: (instId, nid, nname) => handleDetachBodyPart(instId, nid, nname),
+              ungroupCharacter: (instId) => handleBreakApartCharacter(instId),
+              bakeHtmlMotion: (instId) => handleBakeHtmlMotion(instId),
+              addStageWall: (side, opts) => {
+                commitSceneMutation(`AI Add ${side} Wall`, (s) => {
+                  const cur = s.stageConfig ?? createDefaultStageConfig();
+                  const half = Math.max(4, (cur.floorSize || 28) * 0.5);
+                  const span = Math.max(8, cur.floorSize || 28);
+                  const wall: StageWallConfig = {
+                    id: createId('wall'),
+                    name: `${side.charAt(0).toUpperCase() + side.slice(1)} Wall`,
+                    side,
+                    color: opts?.color ?? '#2b303c',
+                    width: span,
+                    height: opts?.height ?? 9,
+                    thickness: 0.3,
+                    position:
+                      side === 'back'
+                        ? { x: 0, y: 0, z: -half }
+                        : side === 'front'
+                          ? { x: 0, y: 0, z: half }
+                          : side === 'left'
+                            ? { x: -half, y: 0, z: 0 }
+                            : side === 'right'
+                              ? { x: half, y: 0, z: 0 }
+                              : { x: 0, y: 0, z: -half * 0.5 },
+                    rotationY: side === 'left' || side === 'right' ? Math.PI / 2 : 0,
+                    opacity: 1,
+                    visible: true,
+                  };
+                  return { ...s, stageConfig: { ...cur, walls: [...cur.walls, wall] } };
+                });
+              },
+            },
+            cmd,
+            aiAutoHighlightRef.current,
+          );
+
+          results.push({ op: cmd.op, ok: res.ok, summary: res.summary });
+          setAiLogs((prev) =>
+            prev.map((entry) =>
+              entry.id === logId
+                ? {
+                    ...entry,
+                    summary: res.summary,
+                    status: res.ok ? 'applied' : 'error',
+                    timestamp: Date.now(),
+                  }
+                : entry,
+            ),
+          );
+
+          if (aiStepDelayRef.current > 0) {
+            await new Promise((r) => setTimeout(r, aiStepDelayRef.current));
+          } else {
+            await new Promise((r) => setTimeout(r, 16));
+          }
+        }
+
+        const latestSnapshot = buildAiSceneSnapshot(
+          projectRef.current,
+          sceneRef.current,
+          timeRef.current,
+          isPlayingRef.current,
+          selectionRef.current,
+          rigNodesRef.current,
+        );
+        void fetch('/api/ai/ack', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            batchId: batch.batchId,
+            ok: results.every((r) => r.ok),
+            results,
+            state: latestSnapshot,
+          }),
+        }).catch(() => {});
+      }
+    } finally {
+      setAiQueueLength(0);
+      aiProcessingRef.current = false;
+    }
+  }, [
+    commitSceneMutation,
+    handleBakeHtmlMotion,
+    handleBreakApartCharacter,
+    handleDetachBodyPart,
+    handleSeek,
+    handleTogglePlay,
+  ]);
+
+  const enqueueAiBatch = useCallback(
+    (commands: AiBridgeCommand[], source = 'External AI', batchId = createId('localbatch')) => {
+      if (commands.length === 0) return;
+      aiQueueRef.current.push({ batchId, source, commands });
+      setAiQueueLength((prev) => prev + commands.length);
+      void runAiQueue();
+    },
+    [runAiQueue],
+  );
+
+  // Connect to Express SSE /api/ai/stream & fetch initial AI config
+  useEffect(() => {
+    let active = true;
+    fetch('/api/ai/config')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!active || !data) return;
+        setAiAccessEnabled(Boolean(data.enabled));
+        if (typeof data.token === 'string') setAiToken(data.token);
+        if (typeof data.connectedStudios === 'number') setAiConnectedStudios(data.connectedStudios);
+      })
+      .catch(() => {});
+
+    const es = new EventSource('/api/ai/stream');
+    es.addEventListener('ai:connected', (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data) as { enabled?: boolean; connectedStudios?: number };
+        if (typeof d.enabled === 'boolean') setAiAccessEnabled(d.enabled);
+        if (typeof d.connectedStudios === 'number') setAiConnectedStudios(d.connectedStudios);
+      } catch {
+        // Ignore parse issue
+      }
+    });
+    es.addEventListener('ai:config', (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data) as { enabled?: boolean; connectedStudios?: number };
+        if (typeof d.enabled === 'boolean') setAiAccessEnabled(d.enabled);
+        if (typeof d.connectedStudios === 'number') setAiConnectedStudios(d.connectedStudios);
+      } catch {
+        // Ignore parse issue
+      }
+    });
+    es.addEventListener('ai:command', (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          batchId?: string;
+          source?: string;
+          commands?: AiBridgeCommand[];
+        };
+        if (Array.isArray(d.commands) && d.commands.length > 0) {
+          enqueueAiBatch(d.commands, d.source ?? 'External AI', d.batchId ?? createId('batch'));
+        }
+      } catch {
+        // Ignore malformed command payload
+      }
+    });
+
+    return () => {
+      active = false;
+      es.close();
+    };
+  }, [enqueueAiBatch]);
+
+  // Keep server AI snapshot synced while Live Access or drawer is active
+  useEffect(() => {
+    if (!aiAccessEnabled && !aiBridgeOpen) return;
+    const t = window.setTimeout(() => {
+      void fetch('/api/ai/sync-state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(aiSnapshot),
+      }).catch(() => {});
+    }, 280);
+    return () => window.clearTimeout(t);
+  }, [aiAccessEnabled, aiBridgeOpen, aiSnapshot]);
+
+  // Expose browser-level window.STAGECRAFT_AI for computer-use / browser agents
+  useEffect(() => {
+    const win = window as unknown as Record<string, unknown>;
+    win.STAGECRAFT_AI = {
+      getState: () =>
+        buildAiSceneSnapshot(
+          projectRef.current,
+          sceneRef.current,
+          timeRef.current,
+          isPlayingRef.current,
+          selectionRef.current,
+          rigNodesRef.current,
+        ),
+      runCommands: (commands: AiBridgeCommand[], source = 'Browser AI Agent') => {
+        enqueueAiBatch(commands, source);
+        return { ok: true, queued: commands.length };
+      },
+    };
+    return () => {
+      delete win.STAGECRAFT_AI;
+    };
+  }, [enqueueAiBatch]);
 
   // Preview action briefly even when paused
   const handlePreviewCharacterAction = useCallback(
@@ -3398,12 +3813,56 @@ export function StudioWorkspace() {
         onOpenExport={() => setExportOpen(true)}
         onOpenGuide={() => setGuideOpen(true)}
         onOpenCommandPalette={() => setCommandPaletteOpen(true)}
+        onOpenAiBridge={() => setAiBridgeOpen((v) => !v)}
+        aiAccessEnabled={aiAccessEnabled}
+        aiQueueCount={aiQueueLength}
         viewMode={viewMode}
         onToggleViewMode={(mode) => {
           setViewMode(mode);
           engineRef.current?.setViewMode(mode);
         }}
       />
+
+      {(aiQueueLength > 0 || aiPaused) && (
+        <div
+          role="status"
+          className="flex items-center justify-between border-b border-[#3a2c22] bg-[#211a15] px-4 py-1 text-xs text-[#f7be97]"
+        >
+          <div className="flex items-center gap-2">
+            <Bot className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
+            <span className="font-medium">
+              {aiPaused
+                ? `AI Watch Mode Paused (${aiQueueLength} step${aiQueueLength === 1 ? '' : 's'} waiting)`
+                : `AI Editing Live — ${aiLogs[0]?.summary ?? 'Applying step...'}`}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setAiPaused((p) => !p)}
+              className="flex items-center gap-1 rounded border border-[#4a382b] bg-[#191411] px-2 py-0.5 text-[11px] hover:border-[#e8702a]"
+            >
+              {aiPaused ? <Play className="h-3 w-3" /> : <Pause className="h-3 w-3" />}
+              <span>{aiPaused ? 'Resume' : 'Pause'}</span>
+            </button>
+            {aiBatchUndoStack.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  const snap = aiBatchUndoStack[0];
+                  if (!snap) return;
+                  setAiBatchUndoStack((prev) => prev.slice(1));
+                  commitSceneMutation('Undo AI Batch', () => cloneScene(snap));
+                }}
+                className="flex items-center gap-1 rounded border border-[#4a382b] bg-[#191411] px-2 py-0.5 text-[11px] hover:border-[#e8702a]"
+              >
+                <RotateCcw className="h-3 w-3" />
+                <span>Undo AI</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {noticeMessage && (
         <div
@@ -3748,9 +4207,13 @@ export function StudioWorkspace() {
           snapSettings={snapSettings}
           selectionFilter={selectionFilter}
           showRigOverlay={showRigOverlay}
+          floorLockEnabled={(activeScene.stageConfig ?? createDefaultStageConfig()).floorLockEnabled}
           multiSelectedCount={multiSelectedIds.length}
           multiSelectedNodeCount={multiSelectedNodes.length}
           hoverInfo={hoverInfo}
+          liveSizeInfo={liveSizeInfo}
+          sizeUnit={sizeUnit}
+          cameraOrientation={cameraOrientation}
           poseModeInstanceId={poseModeInstanceId}
           poseModeCharName={poseModeCharName}
           editorProjection={editorProjection}
@@ -3772,6 +4235,15 @@ export function StudioWorkspace() {
             setSnapSettings(next);
             engineRef.current?.setSnapSettings(next);
           }}
+          onToggleFloorLock={() => {
+            commitSceneMutation('Toggle Floor Lock', (s) => {
+              const cur = s.stageConfig ?? createDefaultStageConfig();
+              return {
+                ...s,
+                stageConfig: { ...cur, floorLockEnabled: !cur.floorLockEnabled },
+              };
+            });
+          }}
           onChangeSelectionFilter={(f) => {
             setSelectionFilter(f);
             engineRef.current?.setSelectionFilter(f);
@@ -3780,6 +4252,10 @@ export function StudioWorkspace() {
             const next = !showRigOverlay;
             setShowRigOverlay(next);
             engineRef.current?.setShowRigOverlay(next);
+          }}
+          onChangeSizeUnit={(u) => setSizeUnit(u)}
+          onApplyTargetSize={(val, unit) => {
+            engineRef.current?.applyTargetSizeToSelection(val, unit);
           }}
           onAlignMultiSelection={handleAlignMultiSelection}
           onGroupSelection={handleGroupSelection}
@@ -3914,6 +4390,7 @@ export function StudioWorkspace() {
           onBreakApartProp={handleBreakApartProp}
           onDetachPropAttachment={handleDetachPropAttachment}
           onDeleteProp={handleDeleteProp}
+          onBakeHtmlMotion={handleBakeHtmlMotion}
           onUpdateCharacterMeta={(instanceId, patch) =>
             commitSceneMutation(
               'Update Character Property',
@@ -4514,12 +4991,19 @@ export function StudioWorkspace() {
           onApplyEnvironmentPreset={(presetId: EnvironmentPresetId) => {
             const env = ENVIRONMENT_PRESETS.find((e) => e.id === presetId);
             if (!env) return;
-            commitSceneMutation(`Apply Environment: ${env.label}`, (s) => ({
-              ...s,
-              environmentPreset: presetId,
-              backgroundColor: env.backgroundColor,
-              lights: JSON.parse(JSON.stringify(env.lights)),
-            }));
+            commitSceneMutation(`Apply Environment: ${env.label}`, (s) => {
+              const curStage = s.stageConfig ?? createDefaultStageConfig(env.floorColor);
+              return {
+                ...s,
+                environmentPreset: presetId,
+                backgroundColor: env.backgroundColor,
+                stageConfig: {
+                  ...curStage,
+                  floorColor: env.floorColor,
+                },
+                lights: JSON.parse(JSON.stringify(env.lights)),
+              };
+            });
           }}
           onUpdateAudioClip={(clipId, patch) =>
             commitSceneMutation(
@@ -4571,6 +5055,115 @@ export function StudioWorkspace() {
               (s) => ({ ...s, ...patch }),
               'sceneprops',
             )
+          }
+          onUpdateStageConfig={(patch: Partial<StageEnvironmentConfig>) =>
+            commitSceneMutation(
+              'Update Stage Floor & Environment',
+              (s) => {
+                const cur = s.stageConfig ?? createDefaultStageConfig();
+                return {
+                  ...s,
+                  stageConfig: { ...cur, ...patch },
+                };
+              },
+              'stagecfg',
+            )
+          }
+          onAddStageWall={(side: StageWallSide) =>
+            commitSceneMutation(`Add ${side} Wall`, (s) => {
+              const cur = s.stageConfig ?? createDefaultStageConfig();
+              const half = Math.max(4, (cur.floorSize || 28) * 0.5);
+              const span = Math.max(8, cur.floorSize || 28);
+              const wall: StageWallConfig = {
+                id: createId('wall'),
+                name: `${side.charAt(0).toUpperCase() + side.slice(1)} Wall`,
+                side,
+                color: '#2b303c',
+                width: span,
+                height: 9,
+                thickness: 0.3,
+                position:
+                  side === 'back'
+                    ? { x: 0, y: 0, z: -half }
+                    : side === 'front'
+                      ? { x: 0, y: 0, z: half }
+                      : side === 'left'
+                        ? { x: -half, y: 0, z: 0 }
+                        : side === 'right'
+                          ? { x: half, y: 0, z: 0 }
+                          : { x: 0, y: 0, z: -half * 0.5 },
+                rotationY: side === 'left' || side === 'right' ? Math.PI / 2 : 0,
+                opacity: 1,
+                visible: true,
+              };
+              return {
+                ...s,
+                stageConfig: { ...cur, walls: [...cur.walls, wall] },
+              };
+            })
+          }
+          onAddRoomWalls={() =>
+            commitSceneMutation('Add 3-Wall Studio Room', (s) => {
+              const cur = s.stageConfig ?? createDefaultStageConfig();
+              const half = Math.max(4, (cur.floorSize || 28) * 0.5);
+              const span = Math.max(8, cur.floorSize || 28);
+              const existingSides = new Set(cur.walls.map((w) => w.side));
+              const newWalls: StageWallConfig[] = [];
+              const specs: Array<{ side: StageWallSide; name: string; pos: Vec3; rotY: number; color: string }> = [
+                { side: 'back', name: 'Back Wall', pos: { x: 0, y: 0, z: -half }, rotY: 0, color: '#2b303c' },
+                { side: 'left', name: 'Left Wall', pos: { x: -half, y: 0, z: 0 }, rotY: Math.PI / 2, color: '#262b36' },
+                { side: 'right', name: 'Right Wall', pos: { x: half, y: 0, z: 0 }, rotY: Math.PI / 2, color: '#262b36' },
+              ];
+              for (const sp of specs) {
+                if (!existingSides.has(sp.side)) {
+                  newWalls.push({
+                    id: createId('wall'),
+                    name: sp.name,
+                    side: sp.side,
+                    color: sp.color,
+                    width: span,
+                    height: 9,
+                    thickness: 0.3,
+                    position: sp.pos,
+                    rotationY: sp.rotY,
+                    opacity: 1,
+                    visible: true,
+                  });
+                }
+              }
+              return {
+                ...s,
+                stageConfig: { ...cur, walls: [...cur.walls, ...newWalls] },
+              };
+            })
+          }
+          onUpdateStageWall={(wallId: string, patch: Partial<StageWallConfig>) =>
+            commitSceneMutation(
+              'Update Stage Wall',
+              (s) => {
+                const cur = s.stageConfig ?? createDefaultStageConfig();
+                return {
+                  ...s,
+                  stageConfig: {
+                    ...cur,
+                    walls: cur.walls.map((w) => (w.id === wallId ? { ...w, ...patch } : w)),
+                  },
+                };
+              },
+              `wall:${wallId}`,
+            )
+          }
+          onRemoveStageWall={(wallId: string) =>
+            commitSceneMutation('Remove Stage Wall', (s) => {
+              const cur = s.stageConfig ?? createDefaultStageConfig();
+              return {
+                ...s,
+                stageConfig: {
+                  ...cur,
+                  walls: cur.walls.filter((w) => w.id !== wallId),
+                },
+              };
+            })
           }
         />
       </div>
@@ -5022,6 +5615,60 @@ export function StudioWorkspace() {
       />
 
       <UserGuideDialog open={guideOpen} onClose={() => setGuideOpen(false)} />
+
+      <AiBridgeDrawer
+        open={aiBridgeOpen}
+        onClose={() => setAiBridgeOpen(false)}
+        enabled={aiAccessEnabled}
+        token={aiToken}
+        connectedStudios={aiConnectedStudios}
+        paused={aiPaused}
+        stepDelayMs={aiStepDelayMs}
+        autoHighlight={aiAutoHighlight}
+        queueLength={aiQueueLength}
+        logs={aiLogs}
+        snapshot={aiSnapshot}
+        canUndoAiBatch={aiBatchUndoStack.length > 0}
+        onToggleEnabled={(next) => {
+          setAiAccessEnabled(next);
+          void fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: next }),
+          })
+            .then((r) => r.json())
+            .then((d) => {
+              if (typeof d.token === 'string') setAiToken(d.token);
+            })
+            .catch(() => {});
+        }}
+        onRegenerateToken={() => {
+          void fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ regenerateToken: true }),
+          })
+            .then((r) => r.json())
+            .then((d) => {
+              if (typeof d.token === 'string') setAiToken(d.token);
+            })
+            .catch(() => {});
+        }}
+        onTogglePaused={() => setAiPaused((p) => !p)}
+        onChangeStepDelay={setAiStepDelayMs}
+        onToggleAutoHighlight={setAiAutoHighlight}
+        onUndoLastAiBatch={() => {
+          const snap = aiBatchUndoStack[0];
+          if (!snap) return;
+          setAiBatchUndoStack((prev) => prev.slice(1));
+          commitSceneMutation('Undo AI Batch', () => cloneScene(snap));
+        }}
+        onClearLogs={() => setAiLogs([])}
+        onRunManualJson={(raw) => {
+          const { commands, source } = extractAiCommandsFromText(raw);
+          enqueueAiBatch(commands, source ?? 'Pasted AI JSON');
+        }}
+      />
 
       <ConfirmDialog
         open={confirmState !== null}

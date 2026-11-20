@@ -238,6 +238,7 @@ export interface CharacterInstanceData {
   name: string;
   visible: boolean;
   includeStageProps: boolean;
+  playNativeLoop?: boolean;
   transform: Transform3D;
   pivot?: Vec3;
   lockedProperties?: { transform?: boolean; keys?: boolean };
@@ -388,6 +389,78 @@ export interface SceneGroupData {
   scaleKeyframes: Vec3Keyframe[];
 }
 
+export type FloorShapeKind = 'square' | 'rectangle' | 'circle' | 'polygon';
+
+export type StageWallSide = 'back' | 'left' | 'right' | 'front' | 'custom';
+
+export type SizeUnit = '%' | 'px' | 'm' | 'cm' | 'ft';
+
+export interface StageWallConfig {
+  id: string;
+  name: string;
+  side: StageWallSide;
+  color: string;
+  width: number;
+  height: number;
+  thickness: number;
+  position: Vec3;
+  rotationY: number;
+  opacity: number;
+  visible: boolean;
+}
+
+export interface StageEnvironmentConfig {
+  floorShape: FloorShapeKind;
+  floorSides: number; // 3..64
+  floorSize: number; // stage width/diameter in world meters
+  floorColor: string;
+  floorRoughness: number;
+  gridColor: string;
+  gridSecondaryColor: string;
+  showClouds: boolean;
+  cloudColor: string;
+  cloudOpacity: number;
+  floorLockEnabled: boolean; // true = prevent objects from going below floor y=0; false = allow moving under floor
+  walls: StageWallConfig[];
+}
+
+export interface LiveSizeInfo {
+  label: string;
+  scaleFactor: number; // uniform scale multiplier (1 = 100%)
+  widthM: number;
+  heightM: number;
+  depthM: number;
+  activeDragging?: boolean;
+}
+
+export interface CameraOrientationState {
+  /** Camera forward vector in world space */
+  forward: Vec3;
+  /** Camera right vector in world space */
+  right: Vec3;
+  /** Camera up vector in world space */
+  up: Vec3;
+  /** Human-readable current canonical orientation (e.g. "Front", "Right", "Top", "3D View") */
+  viewLabel: string;
+}
+
+export function createDefaultStageConfig(floorColor = '#1b1e24'): StageEnvironmentConfig {
+  return {
+    floorShape: 'square',
+    floorSides: 4,
+    floorSize: 28,
+    floorColor,
+    floorRoughness: 0.88,
+    gridColor: '#3a404d',
+    gridSecondaryColor: '#262a33',
+    showClouds: true,
+    cloudColor: '#cbd5e1',
+    cloudOpacity: 0.42,
+    floorLockEnabled: true,
+    walls: [],
+  };
+}
+
 export interface SceneData {
   id: string;
   name: string;
@@ -396,6 +469,7 @@ export interface SceneData {
   showGrid: boolean;
   transition: SceneTransitionType;
   environmentPreset?: EnvironmentPresetId;
+  stageConfig?: StageEnvironmentConfig;
   workArea?: { enabled: boolean; start: number; end: number };
   thumbnailDataUrl?: string;
   camera: SceneCameraData;
@@ -424,6 +498,7 @@ export interface AssetRecord {
     usesThreeJs: boolean;
     threeVersion: string | null;
     recommendedMode: 'native-three-extraction' | 'isolated-iframe';
+    isFullScene?: boolean;
     globalApiHandle: string | null;
     sdkDetected?: boolean;
     externalDependencies?: string[];
@@ -631,3 +706,117 @@ export function createDefaultFacialState(): FacialState {
     customMorphs: {},
   };
 }
+
+export interface AiBridgeCommand {
+  op:
+    | 'select'
+    | 'clear_selection'
+    | 'move'
+    | 'rotate'
+    | 'scale'
+    | 'set_color'
+    | 'pose_part'
+    | 'reset_part'
+    | 'detach_part'
+    | 'ungroup_all'
+    | 'add_keyframe'
+    | 'add_prop'
+    | 'delete_target'
+    | 'add_wall'
+    | 'remove_wall'
+    | 'update_stage'
+    | 'update_light'
+    | 'set_camera_pose'
+    | 'set_time'
+    | 'play'
+    | 'pause'
+    | 'bake_html_motion'
+    | 'rename_scene';
+  targetId?: string;
+  targetKind?: 'character' | 'body-part' | 'prop' | 'light' | 'camera' | 'none';
+  characterId?: string;
+  nodeId?: string;
+  nodeName?: string;
+  id?: string;
+  position?: Partial<Vec3>;
+  rotationDeg?: Partial<Vec3>;
+  rotationRad?: Partial<Vec3>;
+  scale?: Partial<Vec3> | number;
+  relative?: boolean;
+  color?: string;
+  emissive?: string;
+  roughness?: number;
+  metalness?: number;
+  opacity?: number;
+  time?: number;
+  easing?: EasingType;
+  kind?: PropGeometryKind;
+  name?: string;
+  side?: StageWallSide;
+  height?: number;
+  wallId?: string;
+  floorShape?: FloorShapeKind;
+  floorSides?: number;
+  floorSize?: number;
+  floorColor?: string;
+  gridColor?: string;
+  showClouds?: boolean;
+  cloudColor?: string;
+  cloudOpacity?: number;
+  floorLockEnabled?: boolean;
+  backgroundColor?: string;
+  lightId?: string;
+  intensity?: number;
+  target?: Partial<Vec3>;
+  fov?: number;
+  speed?: number;
+}
+
+export interface AiBridgeLogEntry {
+  id: string;
+  timestamp: number;
+  source: string;
+  summary: string;
+  status: 'pending' | 'running' | 'applied' | 'error';
+  detail?: string;
+}
+
+export interface AiBridgeStateSnapshot {
+  projectName: string;
+  sceneId: string;
+  sceneName: string;
+  duration: number;
+  currentTime: number;
+  isPlaying: boolean;
+  backgroundColor: string;
+  stageConfig: StageEnvironmentConfig;
+  camera: CameraPose;
+  selection: SelectionTarget;
+  characters: {
+    id: string;
+    name: string;
+    visible: boolean;
+    includeStageProps: boolean;
+    playNativeLoop: boolean;
+    transform: Transform3D;
+    keyframeCount: number;
+    nodes: { nodeId: string; name: string; type: string; slot?: string }[];
+  }[];
+  props: {
+    id: string;
+    name: string;
+    kind: PropGeometryKind;
+    color: string;
+    visible: boolean;
+    transform: Transform3D;
+  }[];
+  lights: {
+    id: string;
+    name: string;
+    kind: SceneLightKind;
+    color: string;
+    intensity: number;
+    position: Vec3;
+  }[];
+}
+

@@ -9,7 +9,7 @@ import type {
   ScenePropData,
   Vec3,
 } from '../core/types';
-import { createDefaultCameraPose, createDefaultMotionPath, createDefaultTransform } from '../core/types';
+import { createDefaultCameraPose, createDefaultMotionPath, createDefaultStageConfig, createDefaultTransform } from '../core/types';
 import { createId } from '../utils/ids';
 
 export interface EnvironmentPresetSpec {
@@ -305,6 +305,7 @@ export function buildSceneFromTemplate(templateId: SceneTemplateId, name: string
       showGrid: true,
       transition: 'fade',
       environmentPreset: 'sunset-stage',
+      stageConfig: createDefaultStageConfig(env.floorColor),
       workArea: { enabled: false, start: 0, end: 12 },
       camera: { pose: computeCameraFramingPreset('wide'), keyframes: [] },
       cameras: [
@@ -333,6 +334,11 @@ export function buildSceneFromTemplate(templateId: SceneTemplateId, name: string
       showGrid: true,
       transition: 'cut',
       environmentPreset: 'daylight-cyclorama',
+      stageConfig: {
+        ...createDefaultStageConfig(env.floorColor),
+        showClouds: true,
+        cloudColor: '#f1f5f9',
+      },
       workArea: { enabled: false, start: 0, end: 12 },
       camera: { pose: computeCameraFramingPreset('establishing'), keyframes: [] },
       cameras: [{ id: 'cam_main', name: 'Establishing Cam', projection: 'perspective', pose: computeCameraFramingPreset('establishing'), keyframes: [] }],
@@ -358,6 +364,7 @@ export function buildSceneFromTemplate(templateId: SceneTemplateId, name: string
       showGrid: false,
       transition: 'fade',
       environmentPreset: 'neon-night',
+      stageConfig: createDefaultStageConfig(env.floorColor),
       workArea: { enabled: false, start: 0, end: 10 },
       camera: { pose: computeCameraFramingPreset('medium'), keyframes: [] },
       cameras: [{ id: 'cam_main', name: 'Hero Cam', projection: 'perspective', pose: computeCameraFramingPreset('medium'), keyframes: [] }],
@@ -379,6 +386,7 @@ export function buildSceneFromTemplate(templateId: SceneTemplateId, name: string
     showGrid: true,
     transition: 'cut',
     environmentPreset: 'studio-dark',
+    stageConfig: createDefaultStageConfig(defEnv.floorColor),
     workArea: { enabled: false, start: 0, end: 10 },
     camera: { pose: basePose, keyframes: [] },
     cameras: [{ id: 'cam_main', name: 'Main Camera', projection: 'perspective', pose: basePose, keyframes: [] }],

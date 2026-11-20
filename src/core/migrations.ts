@@ -9,7 +9,12 @@ import type {
   Transform3D,
   Vec3,
 } from './types';
-import { createDefaultCameraPose, createDefaultFacialState, createDefaultMotionPath } from './types';
+import {
+  createDefaultCameraPose,
+  createDefaultFacialState,
+  createDefaultMotionPath,
+  createDefaultStageConfig,
+} from './types';
 
 function ensureVec3(v: Partial<Vec3> | undefined, fallback: Vec3): Vec3 {
   return {
@@ -153,6 +158,13 @@ export function migrateProjectData(raw: ProjectData): ProjectData {
       showGrid: sc.showGrid !== false,
       transition: sc.transition ?? 'cut',
       environmentPreset: sc.environmentPreset ?? 'studio-dark',
+      stageConfig: sc.stageConfig
+        ? {
+            ...createDefaultStageConfig(sc.stageConfig.floorColor),
+            ...sc.stageConfig,
+            walls: Array.isArray(sc.stageConfig.walls) ? sc.stageConfig.walls : [],
+          }
+        : createDefaultStageConfig(),
       workArea: sc.workArea ?? { enabled: false, start: 0, end: sc.duration || 10 },
       camera: sc.camera ?? {
         pose: cameras[0].pose,
@@ -192,6 +204,7 @@ export function migrateProjectData(raw: ProjectData): ProjectData {
         : [],
       characters: (sc.characters ?? []).map((ch) => ({
         ...ch,
+        playNativeLoop: ch.playNativeLoop !== false,
         transform: ensureTransform(ch.transform),
         pivot: ensureVec3(ch.pivot, { x: 0, y: 0, z: 0 }),
         lockedProperties: ch.lockedProperties ?? { transform: false, keys: false },

@@ -661,20 +661,17 @@ export function SmartPresetsAndAssistantSection({
           {seqSteps.map((stepId, idx) => (
             <div key={idx} className="flex items-center gap-1.5">
               <span className="w-4 text-[10px] text-[#6b7280]">{idx + 1}.</span>
-              <select
-                aria-label={`Sequence step ${idx + 1}`}
-                value={stepId}
-                onChange={(e) =>
-                  setSeqSteps((prev) => prev.map((v, i) => (i === idx ? e.target.value : v)))
-                }
-                className="h-6 flex-1 rounded border border-[#2e333d] bg-[#14161a] px-1.5 text-[11px] text-[#e6e8ec]"
-              >
-                {MOTION_PRESETS.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label}
-                  </option>
-                ))}
-              </select>
+              <div className="flex-1 min-w-0">
+                <CustomSelect
+                  ariaLabel={`Sequence step ${idx + 1}`}
+                  size="xs"
+                  value={stepId}
+                  options={MOTION_PRESETS.map((p) => ({ value: p.id, label: p.label }))}
+                  onChange={(val) =>
+                    setSeqSteps((prev) => prev.map((v, i) => (i === idx ? val : v)))
+                  }
+                />
+              </div>
               <IconButton
                 label="Remove step"
                 disabled={seqSteps.length <= 1}

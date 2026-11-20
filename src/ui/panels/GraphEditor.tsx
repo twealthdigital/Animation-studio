@@ -294,18 +294,15 @@ export function GraphEditor({
       <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-[#2a2e36] bg-[#181a1f] px-3 overflow-x-auto">
         <div className="flex items-center gap-2 min-w-0 shrink-0">
           {channels.length > 0 ? (
-            <select
-              aria-label="Graph editor property channel"
-              value={activeChannel?.id ?? ''}
-              onChange={(e) => setSelectedChannelId(e.target.value)}
-              className="h-6 max-w-[240px] rounded border border-[#2e333d] bg-[#14161a] px-2 text-[11px] text-[#e6e8ec] focus:border-[#e8702a] focus:outline-none"
-            >
-              {channels.map((ch) => (
-                <option key={ch.id} value={ch.id}>
-                  {ch.label}
-                </option>
-              ))}
-            </select>
+            <div className="w-52 max-w-[240px]">
+              <CustomSelect
+                ariaLabel="Graph editor property channel"
+                size="xs"
+                value={activeChannel?.id ?? ''}
+                options={channels.map((ch) => ({ value: ch.id, label: ch.label }))}
+                onChange={(val) => setSelectedChannelId(val)}
+              />
+            </div>
           ) : (
             <span className="text-[11px] text-[#6b7280]">Add a character to inspect property curves</span>
           )}

@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Check, ChevronDown, X } from 'lucide-react';
 
 interface TooltipState {
@@ -219,6 +220,10 @@ interface CustomSelectProps<T extends string> {
   disabled?: boolean;
   ariaLabel?: string;
   note?: string;
+  size?: 'xs' | 'sm';
+  placeholder?: string;
+  className?: string;
+  prefixIcon?: React.ReactNode;
 }
 
 export function CustomSelect<T extends string>({
@@ -229,34 +234,85 @@ export function CustomSelect<T extends string>({
   disabled = false,
   ariaLabel,
   note,
+  size = 'sm',
+  placeholder,
+  className = '',
+  prefixIcon,
 }: CustomSelectProps<T>) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState<{
+    left: number;
+    top: number;
+    minWidth: number;
+    openUpward: boolean;
+  } | null>(null);
+
+  const recomputePosition = () => {
+    const btn = triggerRef.current;
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
+    const estMenuHeight = Math.min(220, Math.max(44, options.length * 28 + 10));
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const openUpward = spaceBelow < estMenuHeight + 12 && rect.top > spaceBelow;
+    const minWidth = Math.max(rect.width, size === 'xs' ? 112 : 140);
+    const left = Math.min(Math.max(6, rect.left), Math.max(6, window.innerWidth - minWidth - 8));
+    setMenuPos({
+      left,
+      top: openUpward ? rect.top - 4 : rect.bottom + 4,
+      minWidth,
+      openUpward,
+    });
+  };
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    recomputePosition();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, options.length]);
 
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (e: PointerEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        rootRef.current &&
+        !rootRef.current.contains(target) &&
+        (!menuRef.current || !menuRef.current.contains(target))
+      ) {
         setOpen(false);
       }
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setOpen(false);
     };
-    window.addEventListener('pointerdown', onPointerDown);
+    const onScrollOrResize = () => recomputePosition();
+    window.addEventListener('pointerdown', onPointerDown, true);
     window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('resize', onScrollOrResize);
+    window.addEventListener('scroll', onScrollOrResize, true);
     return () => {
-      window.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointerdown', onPointerDown, true);
       window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', onScrollOrResize);
+      window.removeEventListener('scroll', onScrollOrResize, true);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   const current = options.find((o) => o.value === value);
+  const triggerSizeClass =
+    size === 'xs'
+      ? 'h-6 px-1.5 text-[11px] gap-1'
+      : 'h-7 px-2 text-xs gap-2';
 
   return (
-    <div ref={rootRef} className="relative">
+    <div ref={rootRef} className={`relative ${className}`}>
       {label && <div className="mb-1 text-[11px] text-[#98a0ad]">{label}</div>}
       <button
+        ref={triggerRef}
         type="button"
         disabled={disabled}
         aria-haspopup="listbox"
@@ -264,39 +320,60 @@ export function CustomSelect<T extends string>({
         aria-label={ariaLabel ?? label ?? 'Select option'}
         data-studio-note={note || undefined}
         onClick={() => setOpen((v) => !v)}
-        className="flex h-7 w-full items-center justify-between gap-2 rounded border border-[#2e333d] bg-[#14161a] px-2 text-xs text-[#e6e8ec] hover:border-[#464d5b] disabled:opacity-45"
+        className={`flex w-full items-center justify-between rounded border bg-[#14161a] text-[#e6e8ec] transition-colors disabled:opacity-45 whitespace-nowrap ${triggerSizeClass} ${
+          open ? 'border-[#e8702a]' : 'border-[#2e333d] hover:border-[#464d5b]'
+        }`}
       >
-        <span className="truncate">{current?.label ?? value}</span>
-        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[#6b7280]" aria-hidden="true" />
+        <span className="flex min-w-0 items-center gap-1.5 truncate">
+          {prefixIcon && <span className="shrink-0 text-[#98a0ad]">{prefixIcon}</span>}
+          <span className="truncate">{current?.label ?? placeholder ?? value}</span>
+        </span>
+        <ChevronDown
+          className={`h-3 w-3 shrink-0 text-[#6b7280] transition-transform ${open ? 'rotate-180 text-[#e8702a]' : ''}`}
+          aria-hidden="true"
+        />
       </button>
-      {open && (
-        <div
-          role="listbox"
-          className="absolute left-0 right-0 z-50 mt-1 max-h-52 overflow-y-auto rounded border border-[#383e49] bg-[#1e2127] py-1 shadow-xl"
-        >
-          {options.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              role="option"
-              aria-selected={opt.value === value}
-              disabled={opt.disabled}
-              onClick={() => {
-                onChange(opt.value);
-                setOpen(false);
-              }}
-              className={`flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs transition-colors disabled:opacity-40 ${
-                opt.value === value
-                  ? 'bg-[#2e221b] text-[#f5a16a] font-medium'
-                  : 'text-[#e6e8ec] hover:bg-[#262a33]'
-              }`}
-            >
-              <span className="truncate">{opt.label}</span>
-              {opt.value === value && <Check className="h-3 w-3 shrink-0" aria-hidden="true" />}
-            </button>
-          ))}
-        </div>
-      )}
+      {open &&
+        menuPos &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            ref={menuRef}
+            role="listbox"
+            style={{
+              position: 'fixed',
+              left: menuPos.left,
+              top: menuPos.top,
+              minWidth: menuPos.minWidth,
+              transform: menuPos.openUpward ? 'translateY(-100%)' : undefined,
+              zIndex: 9999,
+            }}
+            className="max-h-56 overflow-y-auto rounded border border-[#3a404c] bg-[#1a1d23] py-1 shadow-2xl"
+          >
+            {options.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                role="option"
+                aria-selected={opt.value === value}
+                disabled={opt.disabled}
+                onClick={() => {
+                  onChange(opt.value);
+                  setOpen(false);
+                }}
+                className={`flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-xs transition-colors disabled:opacity-40 whitespace-nowrap ${
+                  opt.value === value
+                    ? 'bg-[#2e221b] text-[#f5a16a] font-medium'
+                    : 'text-[#e6e8ec] hover:bg-[#262a33]'
+                }`}
+              >
+                <span className="truncate">{opt.label}</span>
+                {opt.value === value && <Check className="h-3 w-3 shrink-0 text-[#e8702a]" aria-hidden="true" />}
+              </button>
+            ))}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

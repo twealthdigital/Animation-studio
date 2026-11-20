@@ -1,4 +1,7 @@
 import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import type {
   CharacterNodeGroup,
   FacialState,
@@ -22,9 +25,12 @@ interface VirtualDomElement {
   id: string;
   tagName: string;
   value: string;
+  innerHTML: string;
   textContent: string;
   clientWidth: number;
   clientHeight: number;
+  width: number;
+  height: number;
   style: Record<string, string>;
   dataset: Record<string, string>;
   children: VirtualDomElement[];
@@ -35,9 +41,11 @@ interface VirtualDomElement {
     contains: (c: string) => boolean;
   };
   appendChild: (child: unknown) => unknown;
+  removeChild: (child: unknown) => unknown;
   addEventListener: (type: string, fn: unknown, opts?: unknown) => void;
   removeEventListener: (type: string, fn: unknown) => void;
   setPointerCapture: (id: number) => void;
+  setAttribute: (k: string, v: string) => void;
   getBoundingClientRect: () => { left: number; top: number; width: number; height: number };
 }
 
@@ -47,9 +55,12 @@ function createVirtualElement(id: string, tagName = 'div'): VirtualDomElement {
     id,
     tagName,
     value: '',
+    innerHTML: '',
     textContent: '',
-    clientWidth: 640,
-    clientHeight: 480,
+    clientWidth: 960,
+    clientHeight: 540,
+    width: 960,
+    height: 540,
     style: {},
     dataset: {},
     children: [],
@@ -77,11 +88,16 @@ function createVirtualElement(id: string, tagName = 'div'): VirtualDomElement {
       }
       return child;
     },
+    removeChild(child) {
+      el.children = el.children.filter((c) => c !== child);
+      return child;
+    },
     addEventListener() {},
     removeEventListener() {},
     setPointerCapture() {},
+    setAttribute() {},
     getBoundingClientRect() {
-      return { left: 0, top: 0, width: 640, height: 480 };
+      return { left: 0, top: 0, width: 960, height: 540 };
     },
   };
   return el;
@@ -94,10 +110,74 @@ function extractInlineScripts(html: string): string[] {
   while ((match = regex.exec(html)) !== null) {
     const attrs = match[1] ?? '';
     if (/\bsrc\s*=/i.test(attrs)) continue;
+    if (/type\s*=\s*["']importmap["']/i.test(attrs)) continue;
+    if (/type\s*=\s*["']application\/(?:json|ld\+json)["']/i.test(attrs)) continue;
     const body = match[2]?.trim();
     if (body) scripts.push(body);
   }
   return scripts;
+}
+
+/**
+ * Rewrites ES Module Three.js HTML script syntax (import * as THREE, named imports from three/addons,
+ * export default/const) so modern AI-generated Three.js HTML scenes run inside our sandboxed shim.
+ */
+function preprocessHtmlScript(code: string): string {
+  let out = code;
+
+  // Rewrite `import * as IDENT from '...';`
+  out = out.replace(
+    /^\s*import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]\s*;?/gm,
+    (_m, ident: string, spec: string) => {
+      if (spec.includes('three')) {
+        return ident === 'THREE' ? '' : `const ${ident} = THREE;`;
+      }
+      return `const ${ident} = __MOD_ADDONS__;`;
+    },
+  );
+
+  // Rewrite `import IDENT from '...';`
+  out = out.replace(
+    /^\s*import\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]\s*;?/gm,
+    (_m, ident: string, spec: string) => {
+      if (spec.includes('three') && ident !== 'THREE') {
+        return `const ${ident} = THREE;`;
+      }
+      return '';
+    },
+  );
+
+  // Rewrite `import { A, B as C } from '...';`
+  out = out.replace(
+    /^\s*import\s+\{([\s\S]*?)\}\s+from\s+['"]([^'"]+)['"]\s*;?/gm,
+    (_m, list: string, spec: string) => {
+      const entries = list
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const decls: string[] = [];
+      for (const entry of entries) {
+        const asMatch = entry.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
+        const orig = asMatch ? asMatch[1] : entry;
+        const alias = asMatch ? asMatch[2] : entry;
+        if (spec === 'three' || /\/three(?:\.module)?(?:\.min)?\.js$/i.test(spec)) {
+          decls.push(`const ${alias} = THREE.${orig};`);
+        } else {
+          decls.push(`const ${alias} = __MOD_ADDONS__.${orig} ?? THREE.${orig};`);
+        }
+      }
+      return decls.join(' ');
+    },
+  );
+
+  // Strip side-effect CSS/JS module imports
+  out = out.replace(/^\s*import\s+['"][^'"]+['"]\s*;?/gm, '');
+
+  // Strip ES exports
+  out = out.replace(/^\s*export\s+default\s+/gm, '');
+  out = out.replace(/^\s*export\s+(?=(?:const|let|var|function|class)\b)/gm, '');
+
+  return out;
 }
 
 function countDescendantMeshes(obj: THREE.Object3D): number {
@@ -146,9 +226,9 @@ interface SdkDescriptor {
 }
 
 /**
- * Mode A Adapter: Extracts a Three.js HTML character's 3D Object3D hierarchy,
- * dynamic CanvasTextures, procedural animations, named & unnamed procedural limb nodes,
- * and public/SDK APIs directly into the Studio's master Three.js scene.
+ * Mode A Adapter: Extracts a Three.js HTML character OR full AI-coded 3D HTML video/scene's
+ * complete Object3D hierarchy, lights, CanvasTextures, procedural animations, named & unnamed
+ * limbs/props, and public/SDK APIs directly into Stagecraft's master Three.js scene.
  */
 export class HtmlThreeAdapter implements ICharacterAdapter {
   readonly instanceId: string;
@@ -165,6 +245,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
   private frameCallback: ((nowMs: number) => void) | null = null;
   private virtualTimeMs = 0;
   private paused = false;
+  private playNativeLoop = true;
   private currentMood = 'neutral';
   private moodNeedsSettle = false;
   private currentTalking = false;
@@ -220,9 +301,9 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
 
   async load(): Promise<void> {
     if (this.loaded) return;
-    const scripts = extractInlineScripts(this.htmlSource);
-    if (scripts.length === 0) {
-      throw new Error('No inline character initialization script found in HTML file.');
+    const rawScripts = extractInlineScripts(this.htmlSource);
+    if (rawScripts.length === 0) {
+      throw new Error('No inline Three.js script found in HTML file.');
     }
 
     const createdScenes: THREE.Scene[] = [];
@@ -239,27 +320,37 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       return el;
     };
 
+    const virtualBody = createVirtualElement('body', 'body');
     const virtualDocument = {
+      body: virtualBody,
+      documentElement: virtualBody,
       createElement(tag: string) {
         if (tag.toLowerCase() === 'canvas') {
-          return document.createElement('canvas');
+          const c = document.createElement('canvas');
+          c.width = 960;
+          c.height = 540;
+          return c;
         }
         return createVirtualElement('', tag);
       },
       getElementById(id: string) {
         return getOrCreateEl(id);
       },
-      querySelector() {
+      querySelector(sel: string) {
+        if (sel === 'body') return virtualBody;
+        if (sel.startsWith('#')) return getOrCreateEl(sel.slice(1));
         return null;
       },
       querySelectorAll() {
         return [];
       },
+      addEventListener() {},
+      removeEventListener() {},
     };
 
     const virtualWindow: Record<string, unknown> = {
-      innerWidth: 640,
-      innerHeight: 480,
+      innerWidth: 960,
+      innerHeight: 540,
       devicePixelRatio: 1,
       addEventListener() {},
       removeEventListener() {},
@@ -292,24 +383,112 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       }
     }
 
+    const getVirtualNow = () => this.virtualTimeMs;
+
+    class ShimmedClock {
+      autoStart: boolean;
+      startTime = 0;
+      oldTime = 0;
+      elapsedTime = 0;
+      running = false;
+      constructor(autoStart = true) {
+        this.autoStart = autoStart;
+      }
+      start() {
+        this.startTime = getVirtualNow();
+        this.oldTime = this.startTime;
+        this.elapsedTime = 0;
+        this.running = true;
+      }
+      stop() {
+        this.getElapsedTime();
+        this.running = false;
+        this.autoStart = false;
+      }
+      getElapsedTime(): number {
+        this.getDelta();
+        return this.elapsedTime;
+      }
+      getDelta(): number {
+        let diff = 0;
+        if (this.autoStart && !this.running) {
+          this.start();
+          return 0;
+        }
+        if (this.running) {
+          const newTime = getVirtualNow();
+          diff = (newTime - this.oldTime) / 1000;
+          // Guard large timeline seeks so incremental HTML scripts don't explode
+          if (diff < 0 || diff > 0.25) diff = 1 / 60;
+          this.oldTime = newTime;
+          this.elapsedTime = newTime / 1000;
+        }
+        return diff;
+      }
+    }
+
+    class ShimmedOrbitControls {
+      target = new THREE.Vector3();
+      enableDamping = false;
+      dampingFactor = 0.05;
+      autoRotate = false;
+      autoRotateSpeed = 2;
+      enableZoom = true;
+      enablePan = true;
+      minDistance = 0;
+      maxDistance = Infinity;
+      maxPolarAngle = Math.PI;
+      update() {}
+      dispose() {}
+      addEventListener() {}
+      removeEventListener() {}
+    }
+
     class ShimmedWebGLRenderer {
       domElement: HTMLCanvasElement;
+      shadowMap = { enabled: false, type: THREE.PCFSoftShadowMap };
+      toneMapping = THREE.ACESFilmicToneMapping;
+      toneMappingExposure = 1;
+      outputColorSpace = THREE.SRGBColorSpace;
       constructor() {
         this.domElement = document.createElement('canvas');
       }
       setPixelRatio() {}
       setSize() {}
+      setClearColor() {}
       render(scene: THREE.Scene) {
         renderedScene = scene;
       }
+      setAnimationLoop(cb: ((nowMs: number) => void) | null) {
+        frameHolder.cb = cb;
+      }
+      dispose() {}
+    }
+
+    class ShimmedPMREMGenerator {
+      fromScene() {
+        return { texture: null, dispose() {} };
+      }
+      compileEquirectangularShader() {}
       dispose() {}
     }
 
     const shimmedThree = {
       ...THREE,
       Scene: ShimmedScene,
+      Clock: ShimmedClock,
       CanvasTexture: ShimmedCanvasTexture,
       WebGLRenderer: ShimmedWebGLRenderer,
+      PMREMGenerator: ShimmedPMREMGenerator,
+      OrbitControls: ShimmedOrbitControls,
+      RoundedBoxGeometry,
+      RoomEnvironment,
+    };
+
+    const addonModuleBag: Record<string, unknown> = {
+      OrbitControls: ShimmedOrbitControls,
+      RoundedBoxGeometry,
+      RoomEnvironment,
     };
 
     const virtualPerformance = {
@@ -321,9 +500,13 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       return 1;
     };
 
-    const combinedCode = scripts.join('\n;\n');
+    const combinedCode = rawScripts.map((s) => preprocessHtmlScript(s)).join('\n;\n');
     const runner = new Function(
       'THREE',
+      '__MOD_ADDONS__',
+      'OrbitControls',
+      'RoundedBoxGeometry',
+      'RoomEnvironment',
       'window',
       'document',
       'performance',
@@ -332,11 +515,17 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       'addEventListener',
       'removeEventListener',
       'devicePixelRatio',
+      'setInterval',
+      'clearInterval',
       combinedCode,
     );
 
     runner(
       shimmedThree,
+      addonModuleBag,
+      ShimmedOrbitControls ?? OrbitControls,
+      RoundedBoxGeometry,
+      RoomEnvironment,
       virtualWindow,
       virtualDocument,
       virtualPerformance,
@@ -345,14 +534,19 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       () => {},
       () => {},
       1,
+      () => 0,
+      () => {},
     );
 
     this.frameCallback = frameHolder.cb;
     if (this.frameCallback) {
-      this.frameCallback(0);
+      try {
+        this.frameCallback(0);
+      } catch {
+        // Ignore non-fatal first-tick errors
+      }
     }
 
-    // Check explicit STAGECRAFT_SDK first
     if (virtualWindow.STAGECRAFT_SDK && typeof virtualWindow.STAGECRAFT_SDK === 'object') {
       this.sdk = virtualWindow.STAGECRAFT_SDK as SdkDescriptor;
     }
@@ -375,28 +569,41 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       }
     }
 
+    const sceneLightsGroup = new THREE.Group();
+    sceneLightsGroup.name = 'HTML Scene Lights';
+    sceneLightsGroup.userData.__isHtmlSceneLights = true;
+
     if (!primaryGroup) {
       const fallback = new THREE.Group();
+      fallback.name = 'HTML Scene Root';
       for (const child of [...targetScene.children]) {
-        if (!(child as THREE.Light).isLight && !(child as THREE.Camera).isCamera) {
+        if ((child as THREE.Light).isLight) {
+          sceneLightsGroup.add(child);
+        } else if (!(child as THREE.Camera).isCamera) {
           fallback.add(child);
         }
       }
       primaryGroup = fallback;
     } else {
       for (const child of [...targetScene.children]) {
-        if (
-          child !== primaryGroup &&
-          !(child as THREE.Light).isLight &&
-          !(child as THREE.Camera).isCamera
-        ) {
+        if (child === primaryGroup) continue;
+        if ((child as THREE.Light).isLight) {
+          sceneLightsGroup.add(child);
+        } else if (!(child as THREE.Camera).isCamera) {
           this.stagePropsGroup.add(child);
         }
       }
     }
 
+    if (sceneLightsGroup.children.length > 0) {
+      this.stagePropsGroup.add(sceneLightsGroup);
+    }
+
     this.characterGroup = primaryGroup;
+    this.groundWrapper.name = 'HTMLGroundWrapper';
+    this.groundWrapper.userData.characterInstanceId = this.instanceId;
     this.groundWrapper.add(primaryGroup);
+    this.stagePropsGroup.name = 'HTMLStageScene';
     this.stagePropsGroup.visible = this.includeStageProps;
     this.stagePropsGroup.userData.__isStagePropsGroup = true;
     this.groundWrapper.add(this.stagePropsGroup);
@@ -422,7 +629,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       }
     }
 
-    // Run initial procedural frame once so rest transforms reflect the character's true neutral pose
+    // Run initial procedural frame once so rest transforms reflect true neutral pose
     if (this.frameCallback) {
       try {
         this.frameCallback(0);
@@ -431,13 +638,13 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       }
     }
 
-    // Build semantic RigNodeInfo hierarchy (named groups, bones, AND unnamed procedural limbs)
-    this.discoverRigHierarchy(primaryGroup);
+    // Build complete RigNodeInfo hierarchy across primary character AND all full-scene props/objects
+    this.discoverRigHierarchy(primaryGroup, this.stagePropsGroup);
 
-    // Ground character flush at y=0 if its rest bounds extend below zero
+    // Ground flush at y=0 if rest bounds extend slightly below zero (skip if already multi-object full floor scene)
     this.groundWrapper.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(this.characterGroup);
-    if (Number.isFinite(box.min.y) && box.min.y < -0.05) {
+    if (Number.isFinite(box.min.y) && box.min.y < -0.05 && box.min.y > -4) {
       this.groundWrapper.position.y = -box.min.y;
     }
 
@@ -477,10 +684,11 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
   }
 
   /**
-   * Walks the extracted Three.js hierarchy to index all bones/groups/parts,
-   * inferring semantic humanoid labels even when procedural HTML scripts create unnamed Groups.
+   * Walks primary root AND stagePropsGroup to index every bone, group, prop, mesh, and
+   * procedural limb so every single object in an imported HTML character or full scene is
+   * clickable, recolorable, movable, detachable, and keyframe-animatable.
    */
-  private discoverRigHierarchy(root: THREE.Object3D): void {
+  private discoverRigHierarchy(root: THREE.Object3D, extraStageGroup?: THREE.Object3D): void {
     this.baseRigNodes = [];
     this.rigNodes = [];
     this.nodeObjectMap.clear();
@@ -492,7 +700,6 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     this.lastMaterialSig = '';
     this.morphMeshes = [];
 
-    // Reverse lookup for explicit SDK node bindings
     const sdkSlotByObj = new Map<THREE.Object3D, HumanoidSlot>();
     if (this.sdk?.nodes) {
       for (const [slot, obj] of Object.entries(this.sdk.nodes)) {
@@ -514,7 +721,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
 
     const describeSlot = (slot?: HumanoidSlot, name?: string): string => {
       switch (slot) {
-        case 'root': return 'Root character container';
+        case 'root': return 'Root container';
         case 'hips': return 'Rotate pelvis & hip center';
         case 'chest': return 'Rotate upper torso & chest';
         case 'neck': return 'Rotate neck pivot';
@@ -593,7 +800,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
         return { name: 'Orbit Ring Spin', description: 'Spin satellite along orbital ring', isAuxiliary: true };
       }
 
-      if (obj === root) return { name: 'Character Root', slot: 'root', description: describeSlot('root') };
+      if (obj === root) return { name: 'Scene Primary Root', slot: 'root', description: describeSlot('root') };
 
       if (obj.parent === root) {
         if ((obj as THREE.Group).isGroup) {
@@ -621,7 +828,6 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
         }
 
         if (isMesh) {
-          // Host character torso/collar/neck/hips meshes vs Globe character shell/screen/pods
           if (Math.abs(px) < 0.15 && Math.abs(pz) < 0.15 && py >= -0.05 && py <= 0.45) {
             const isIco = geoType.includes('Icosahedron');
             return isIco
@@ -661,8 +867,8 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
         ? 'Bone'
         : isMesh
           ? shortGeo || 'Mesh'
-          : 'Part';
-      const fallbackName = parentName && isMesh && parentName !== 'Character Root'
+          : 'Object';
+      const fallbackName = parentName && isMesh && parentName !== 'Scene Primary Root'
         ? `${parentName} ${shortGeo || 'Part'} (${this.rigNodes.length})`
         : `${typeLabel} (${this.rigNodes.length})`;
       return {
@@ -680,7 +886,10 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       parentName: string | undefined,
       depth: number,
     ) => {
-      if (depth > 16) return; // deep penetration across every sub-component
+      if (depth > 16) return;
+      if ((obj as THREE.Light).isLight || (obj as THREE.Camera).isCamera) return;
+      if (obj.userData.__isHtmlSceneLights) return;
+
       const isMesh = Boolean((obj as THREE.Mesh).isMesh);
       const isBone = Boolean((obj as THREE.Bone).isBone);
       const isGroup = Boolean((obj as THREE.Group).isGroup) || obj.children.length > 0;
@@ -703,6 +912,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       if (isMesh) {
         obj.castShadow = true;
         obj.receiveShadow = true;
+        obj.frustumCulled = false;
       }
 
       const childIds: string[] = [];
@@ -748,6 +958,20 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     };
 
     visit(root, 'node_0', null, undefined, undefined, 0);
+
+    // Index all extra objects in stagePropsGroup so every object in a full HTML scene is individually editable
+    if (extraStageGroup) {
+      const rootNode = this.rigNodes.find((n) => n.nodeId === 'node_0');
+      extraStageGroup.children.forEach((child, idx) => {
+        if ((child as THREE.Light).isLight || child.userData.__isHtmlSceneLights) return;
+        const stagePath = `stage_${idx}`;
+        visit(child, stagePath, 'node_0', undefined, 'Scene Prop', 1);
+        if (rootNode && this.nodeObjectMap.has(stagePath)) {
+          rootNode.childIds.push(stagePath);
+        }
+      });
+    }
+
     this.baseRigNodes = this.rigNodes.map((n) => ({ ...n, childIds: [...n.childIds] }));
   }
 
@@ -809,7 +1033,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     this.lastGroupsSig = sig;
     this.rigNodes = reconcileCharacterNodeGroups({
       instanceId: this.instanceId,
-      rootContainer: this.characterGroup,
+      rootContainer: this.groundWrapper,
       baseRigNodes: this.baseRigNodes,
       nodeObjectMap: this.nodeObjectMap,
       nodeBaseTransform: this.nodeBaseTransform,
@@ -829,7 +1053,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     if (sig === this.lastMaterialSig || !this.characterGroup) return;
     this.lastMaterialSig = sig;
     applyCharacterNodeMaterialOverrides(
-      this.characterGroup,
+      this.groundWrapper,
       this.nodeObjectMap,
       overrides,
       this.baseMaterialSnapshots,
@@ -867,7 +1091,6 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       ...Object.keys(nextScales),
     ]);
 
-    // Snap any previously overridden nodes back to their rest transform so smoothed HTML loops don't leave ghost poses on Undo/Reset
     for (const prevId of this.previouslyOverriddenNodes) {
       if (!nextActive.has(prevId)) {
         const obj = this.nodeObjectMap.get(prevId);
@@ -893,7 +1116,6 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       this.sdk.setExpression(facial);
       return;
     }
-    // Apply to any morph target meshes if present
     for (const mesh of this.morphMeshes) {
       const dict = mesh.morphTargetDictionary;
       const infl = mesh.morphTargetInfluences;
@@ -913,11 +1135,20 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       }
     }
 
-    // Procedural mood fallback if explicit facial sliders express strong emotion
     if (facial.smile > 0.65) this.setMood('happy');
     else if (facial.surprise > 0.65) this.setMood('surprised');
     else if (facial.anger > 0.65) this.setMood('angry');
     else if (facial.sadness > 0.65) this.setMood('sad');
+  }
+
+  private restoreBaseTransforms(): void {
+    for (const [nodeId, base] of this.nodeBaseTransform.entries()) {
+      const obj = this.nodeObjectMap.get(nodeId);
+      if (!obj) continue;
+      obj.position.copy(base.pos);
+      obj.rotation.copy(base.rot);
+      obj.scale.copy(base.scale);
+    }
   }
 
   private applyPendingNodeTransforms(): void {
@@ -944,6 +1175,77 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
   setIncludeStageProps(include: boolean): void {
     this.includeStageProps = include;
     this.stagePropsGroup.visible = include;
+  }
+
+  setPlayNativeLoop(play: boolean): void {
+    this.playNativeLoop = play;
+    if (!play) {
+      this.restoreBaseTransforms();
+      this.applyPendingNodeTransforms();
+    }
+  }
+
+  /**
+   * Samples the uploaded HTML file's procedural animation chronologically from 0..durationSec
+   * so every animated node/mesh/group can be baked into editable Timeline keyframes.
+   */
+  sampleTimelineSequence(
+    durationSec: number,
+    sampleFps = 10,
+  ): {
+    times: number[];
+    nodeDeltas: Record<string, { pos: Vec3; rot: Vec3; scale: Vec3 }[]>;
+  } {
+    const times: number[] = [];
+    const nodeDeltas: Record<string, { pos: Vec3; rot: Vec3; scale: Vec3 }[]> = {};
+    if (!this.loaded || !this.frameCallback) {
+      return { times, nodeDeltas };
+    }
+
+    const prevTimeMs = this.virtualTimeMs;
+    const savedTransforms = new Map<string, { pos: THREE.Vector3; rot: THREE.Euler; scale: THREE.Vector3 }>();
+    for (const [nid, obj] of this.nodeObjectMap.entries()) {
+      savedTransforms.set(nid, {
+        pos: obj.position.clone(),
+        rot: obj.rotation.clone(),
+        scale: obj.scale.clone(),
+      });
+      nodeDeltas[nid] = [];
+    }
+
+    const step = 1 / Math.max(2, sampleFps);
+    const totalSteps = Math.max(2, Math.round(durationSec / step));
+    this.restoreBaseTransforms();
+
+    for (let i = 0; i <= totalSteps; i++) {
+      const t = Math.min(durationSec, Number((i * step).toFixed(3)));
+      times.push(t);
+      this.virtualTimeMs = t * 1000;
+      try {
+        this.frameCallback(this.virtualTimeMs);
+      } catch {
+        // Ignore non-fatal frame errors during baking
+      }
+      for (const [nid, obj] of this.nodeObjectMap.entries()) {
+        nodeDeltas[nid].push({
+          pos: this.getNodeDeltaPosition(nid, obj.position),
+          rot: this.getNodeDeltaRotation(nid, obj.rotation),
+          scale: this.getNodeDeltaScale(nid, obj.scale),
+        });
+      }
+    }
+
+    // Restore prior state cleanly
+    this.virtualTimeMs = prevTimeMs;
+    for (const [nid, snap] of savedTransforms.entries()) {
+      const obj = this.nodeObjectMap.get(nid);
+      if (!obj) continue;
+      obj.position.copy(snap.pos);
+      obj.rotation.copy(snap.rot);
+      obj.scale.copy(snap.scale);
+    }
+
+    return { times, nodeDeltas };
   }
 
   setTransform(transform: Transform3D): void {
@@ -1058,14 +1360,33 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     }
     this.setMood('neutral');
     this.setTalking(false);
-    if (this.frameCallback) {
-      this.frameCallback(this.virtualTimeMs);
+    if (this.frameCallback && this.playNativeLoop) {
+      try {
+        this.frameCallback(this.virtualTimeMs);
+      } catch {
+        // Ignore reset error
+      }
+    } else {
+      this.restoreBaseTransforms();
     }
     this.applyPendingNodeTransforms();
   }
 
   update(deltaSeconds: number, _timelineSeconds = 0): void {
-    if (!this.loaded || !this.frameCallback) return;
+    if (!this.loaded) return;
+
+    if (!this.playNativeLoop || !this.frameCallback) {
+      this.restoreBaseTransforms();
+      this.applyPendingNodeTransforms();
+      if (this.lastHiddenNodeIds.length > 0 || this.lastDetachedNodeIds.length > 0 || this.hiddenGroupIds.size > 0) {
+        this.setNodeVisibilityOverrides(this.lastHiddenNodeIds, this.lastDetachedNodeIds);
+      }
+      if (this.pendingFacial) {
+        this.applyFacialState(this.pendingFacial);
+      }
+      return;
+    }
+
     if (deltaSeconds <= 0 && this.moodNeedsSettle) {
       for (let i = 0; i < 24; i++) {
         this.frameCallback(this.virtualTimeMs);
@@ -1080,9 +1401,13 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     if (!this.paused) {
       this.virtualTimeMs += Math.max(0, deltaSeconds) * 1000;
     }
-    // 1. Run character's native procedural frame
-    this.frameCallback(this.virtualTimeMs);
-    // 2. Apply user body-part keyframes / IK / preset overrides AFTER native frame so they always stick!
+    // 1. Run HTML scene / character native procedural frame
+    try {
+      this.frameCallback(this.virtualTimeMs);
+    } catch {
+      // Prevent runtime error from crashing studio tick
+    }
+    // 2. Apply user body-part / object keyframes, IK & preset overrides AFTER native frame
     this.applyPendingNodeTransforms();
     if (this.lastHiddenNodeIds.length > 0 || this.lastDetachedNodeIds.length > 0 || this.hiddenGroupIds.size > 0) {
       this.setNodeVisibilityOverrides(this.lastHiddenNodeIds, this.lastDetachedNodeIds);

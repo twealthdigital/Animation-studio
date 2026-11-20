@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   BookOpen,
+  Bot,
   Camera,
   ChevronDown,
   Command,
@@ -18,7 +20,7 @@ import {
 } from 'lucide-react';
 import type { SaveStatus, StudioMode, WorkspaceLayoutId } from '../../core/types';
 import type { CameraViewMode } from '../../engine/StudioEngine';
-import { IconButton, StudioButton } from '../components/Primitives';
+import { CustomSelect, IconButton, StudioButton } from '../components/Primitives';
 
 interface TopToolbarProps {
   projectName: string;
@@ -40,6 +42,9 @@ interface TopToolbarProps {
   onOpenExport: () => void;
   onOpenGuide: () => void;
   onOpenCommandPalette: () => void;
+  onOpenAiBridge: () => void;
+  aiAccessEnabled: boolean;
+  aiQueueCount: number;
   viewMode: CameraViewMode;
   onToggleViewMode: (mode: CameraViewMode) => void;
 }
@@ -81,13 +86,18 @@ export function TopToolbar({
   onOpenExport,
   onOpenGuide,
   onOpenCommandPalette,
+  onOpenAiBridge,
+  aiAccessEnabled,
+  aiQueueCount,
   viewMode,
   onToggleViewMode,
 }: TopToolbarProps) {
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(projectName);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState<{ top: number; right: number }>({ top: 44, right: 12 });
   const menuRef = useRef<HTMLDivElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setNameDraft(projectName);
@@ -95,13 +105,37 @@ export function TopToolbar({
 
   useEffect(() => {
     if (!menuOpen) return;
+    const updatePos = () => {
+      const rect = menuRef.current?.getBoundingClientRect();
+      if (rect) {
+        setMenuPos({
+          top: Math.round(rect.bottom + 6),
+          right: Math.max(8, Math.round(window.innerWidth - rect.right)),
+        });
+      }
+    };
+    updatePos();
     const onDown = (e: PointerEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        menuRef.current &&
+        !menuRef.current.contains(target) &&
+        (!dropdownRef.current || !dropdownRef.current.contains(target))
+      ) {
         setMenuOpen(false);
       }
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuOpen(false);
+    };
     window.addEventListener('pointerdown', onDown);
-    return () => window.removeEventListener('pointerdown', onDown);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('resize', updatePos);
+    return () => {
+      window.removeEventListener('pointerdown', onDown);
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', updatePos);
+    };
   }, [menuOpen]);
 
   const commitName = () => {
@@ -207,21 +241,16 @@ export function TopToolbar({
         {/* Workspace Layout Preset */}
         <div
           data-studio-note="Switch studio panel & tab layout preset"
-          className="flex items-center gap-1 rounded border border-[#2a2e36] bg-[#14161a] px-1.5 h-7"
+          className="w-32 shrink-0"
         >
-          <LayoutGrid className="h-3 w-3 text-[#98a0ad]" aria-hidden="true" />
-          <select
-            aria-label="Workspace layout preset"
+          <CustomSelect
+            ariaLabel="Workspace layout preset"
+            size="xs"
+            prefixIcon={<LayoutGrid className="h-3 w-3 text-[#98a0ad]" aria-hidden="true" />}
             value={workspaceLayout}
-            onChange={(e) => onChangeWorkspaceLayout(e.target.value as WorkspaceLayoutId)}
-            className="bg-transparent text-[11px] text-[#e6e8ec] focus:outline-none"
-          >
-            {WORKSPACE_LAYOUTS.map((l) => (
-              <option key={l.id} value={l.id} className="bg-[#191b1f] text-[#e6e8ec]">
-                {l.label}
-              </option>
-            ))}
-          </select>
+            options={WORKSPACE_LAYOUTS.map((l) => ({ value: l.id, label: l.label }))}
+            onChange={(val) => onChangeWorkspaceLayout(val as WorkspaceLayoutId)}
+          />
         </div>
 
         <div className="h-4 w-px bg-[#2a2e36]" aria-hidden="true" />
@@ -297,6 +326,19 @@ export function TopToolbar({
           <span>Import</span>
         </StudioButton>
 
+        <StudioButton
+          note="Allow external AIs to edit the stage live while you watch"
+          onClick={onOpenAiBridge}
+          className={
+            aiAccessEnabled
+              ? 'border-[#166534] bg-[#14532d]/30 text-[#4ade80]'
+              : undefined
+          }
+        >
+          <Bot className="h-3.5 w-3.5" aria-hidden="true" />
+          <span>{aiQueueCount > 0 ? `AI Editing (${aiQueueCount})` : aiAccessEnabled ? 'AI Live ON' : 'AI Access'}</span>
+        </StudioButton>
+
         <StudioButton variant="primary" note="Render & download cartoon video" onClick={onOpenExport}>
           <span>Export</span>
         </StudioButton>
@@ -310,34 +352,39 @@ export function TopToolbar({
             <span>More</span>
             <ChevronDown className="h-3 w-3" aria-hidden="true" />
           </StudioButton>
-          {menuOpen && (
-            <div
-              role="menu"
-              className="absolute right-0 z-50 mt-1 w-52 rounded border border-[#383e49] bg-[#1e2127] py-1 shadow-xl"
-            >
-              <a
-                href="/downloads/stagecraft-3d-studio.zip"
-                download="stagecraft-3d-studio.zip"
-                onClick={() => setMenuOpen(false)}
-                className="flex w-full items-center gap-2 px-3 py-2 text-xs text-[#e6e8ec] hover:bg-[#262a33]"
+          {menuOpen &&
+            typeof document !== 'undefined' &&
+            createPortal(
+              <div
+                ref={dropdownRef}
+                role="menu"
+                style={{ top: menuPos.top, right: menuPos.right }}
+                className="fixed z-[9999] w-52 rounded border border-[#383e49] bg-[#1e2127] py-1 shadow-2xl"
               >
-                <Download className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
-                <span>Download Studio (.zip)</span>
-              </a>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setMenuOpen(false);
-                  onOpenGuide();
-                }}
-                className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-[#e6e8ec] hover:bg-[#262a33]"
-              >
-                <BookOpen className="h-3.5 w-3.5 text-[#98a0ad]" aria-hidden="true" />
-                <span>Shortcuts &amp; Studio Guide</span>
-              </button>
-            </div>
-          )}
+                <a
+                  href="/downloads/stagecraft-3d-studio.zip"
+                  download="stagecraft-3d-studio.zip"
+                  onClick={() => setMenuOpen(false)}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-xs text-[#e6e8ec] hover:bg-[#262a33]"
+                >
+                  <Download className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
+                  <span>Download Studio (.zip)</span>
+                </a>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onOpenGuide();
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-[#e6e8ec] hover:bg-[#262a33]"
+                >
+                  <BookOpen className="h-3.5 w-3.5 text-[#98a0ad]" aria-hidden="true" />
+                  <span>Shortcuts &amp; Studio Guide</span>
+                </button>
+              </div>,
+              document.body,
+            )}
         </div>
       </div>
     </header>
