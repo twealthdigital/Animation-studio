@@ -709,6 +709,7 @@ export function createDefaultFacialState(): FacialState {
 
 export interface AiBridgeCommand {
   op:
+    | 'create_session'
     | 'select'
     | 'clear_selection'
     | 'move'
@@ -732,6 +733,9 @@ export interface AiBridgeCommand {
     | 'pause'
     | 'bake_html_motion'
     | 'rename_scene';
+  sessionId?: string;
+  sceneId?: string;
+  sceneName?: string;
   targetId?: string;
   targetKind?: 'character' | 'body-part' | 'prop' | 'light' | 'camera' | 'none';
   characterId?: string;
@@ -772,16 +776,29 @@ export interface AiBridgeCommand {
   speed?: number;
 }
 
+export interface AiSessionSummary {
+  sessionId: string;
+  label: string;
+  sceneId: string;
+  sceneName: string;
+  createdAt: number;
+  lastActivityAt: number;
+  batchCount: number;
+}
+
 export interface AiBridgeLogEntry {
   id: string;
   timestamp: number;
   source: string;
+  sessionId?: string;
+  sceneName?: string;
   summary: string;
   status: 'pending' | 'running' | 'applied' | 'error';
   detail?: string;
 }
 
 export interface AiBridgeStateSnapshot {
+  sessionId?: string;
   projectName: string;
   sceneId: string;
   sceneName: string;
@@ -819,4 +836,5 @@ export interface AiBridgeStateSnapshot {
     position: Vec3;
   }[];
 }
+
 

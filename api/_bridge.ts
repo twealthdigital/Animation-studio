@@ -1,12 +1,28 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import type { Express, Request, Response } from 'express';
 
 export interface PendingBatch {
   batchId: string;
+  sessionId: string;
+  sceneId: string;
+  sceneName: string;
   source: string;
   commands: unknown[];
   createdAt: number;
   status: string;
+}
+
+export interface AiSessionRecord {
+  sessionId: string;
+  label: string;
+  sceneId: string;
+  sceneName: string;
+  createdAt: number;
+  lastActivityAt: number;
+  batchCount: number;
+  state: Record<string, unknown> | null;
 }
 
 interface PendingAckWaiter {
@@ -14,9 +30,19 @@ interface PendingAckWaiter {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface StoredCloudProject {
+  syncCode: string;
+  projectName: string;
+  updatedAt: number;
+  project: Record<string, unknown>;
+  assets: unknown[];
+}
+
 interface BridgeMemoryStore {
   enabled: boolean;
   token: string;
+  sessionCounter: number;
+  sessions: Record<string, AiSessionRecord>;
   lastState: Record<string, unknown> | null;
   lastStateUpdatedAt: number;
   sseClients: Set<Response>;
@@ -24,7 +50,11 @@ interface BridgeMemoryStore {
   pendingBatches: PendingBatch[];
   history: PendingBatch[];
   ackResults: Map<string, Record<string, unknown>>;
+  cloudProjects: Record<string, StoredCloudProject>;
 }
+
+const DATA_DIR = path.join(process.cwd(), '.stagecraft-data');
+const BRIDGE_DISK_FILE = path.join(DATA_DIR, 'bridge-store.json');
 
 function createToken(): string {
   const envTok = process.env.STAGECRAFT_TOKEN?.trim();
@@ -38,6 +68,8 @@ function getStore(): BridgeMemoryStore {
     g.__stagecraftAiStore = {
       enabled: Boolean(process.env.STAGECRAFT_TOKEN?.trim()),
       token: createToken(),
+      sessionCounter: 0,
+      sessions: {},
       lastState: null,
       lastStateUpdatedAt: 0,
       sseClients: new Set<Response>(),
@@ -45,6 +77,7 @@ function getStore(): BridgeMemoryStore {
       pendingBatches: [],
       history: [],
       ackResults: new Map<string, Record<string, unknown>>(),
+      cloudProjects: {},
     };
   }
   return g.__stagecraftAiStore;
@@ -81,40 +114,159 @@ async function kvCommand(args: unknown[]): Promise<unknown> {
 interface PersistedSnapshot {
   enabled: boolean;
   token: string;
+  sessionCounter: number;
+  sessions: Record<string, AiSessionRecord>;
   lastState: Record<string, unknown> | null;
   lastStateUpdatedAt: number;
   pendingBatches: PendingBatch[];
 }
 
+function pruneOldSessions(store: BridgeMemoryStore): void {
+  const keys = Object.keys(store.sessions);
+  if (keys.length <= 24) return;
+  keys
+    .sort((a, b) => store.sessions[a].lastActivityAt - store.sessions[b].lastActivityAt)
+    .slice(0, keys.length - 24)
+    .forEach((k) => {
+      delete store.sessions[k];
+    });
+}
+
 async function loadPersistedBridge(): Promise<BridgeMemoryStore> {
   const store = getStore();
-  if (!getKvConfig()) return store;
-  const raw = await kvCommand(['GET', 'stagecraft:ai:bridge']);
-  if (typeof raw === 'string' && raw) {
+  let raw: string | null = null;
+
+  if (getKvConfig()) {
+    const kvRaw = await kvCommand(['GET', 'stagecraft:ai:bridge']);
+    if (typeof kvRaw === 'string' && kvRaw) raw = kvRaw;
+  } else {
+    try {
+      raw = await fs.readFile(BRIDGE_DISK_FILE, 'utf8');
+    } catch {
+      // Read-only / missing local file is expected on serverless
+    }
+  }
+
+  if (raw) {
     try {
       const parsed = JSON.parse(raw) as Partial<PersistedSnapshot>;
       if (typeof parsed.enabled === 'boolean') store.enabled = parsed.enabled;
-      if (typeof parsed.token === 'string' && parsed.token) store.token = parsed.token;
+      if (typeof parsed.token === 'string' && parsed.token && !process.env.STAGECRAFT_TOKEN?.trim()) {
+        store.token = parsed.token;
+      }
+      if (typeof parsed.sessionCounter === 'number' && parsed.sessionCounter > store.sessionCounter) {
+        store.sessionCounter = parsed.sessionCounter;
+      }
+      if (parsed.sessions && typeof parsed.sessions === 'object') {
+        for (const [sid, srec] of Object.entries(parsed.sessions)) {
+          if (!store.sessions[sid] || srec.lastActivityAt >= store.sessions[sid].lastActivityAt) {
+            store.sessions[sid] = srec;
+          }
+        }
+      }
       if (parsed.lastState && typeof parsed.lastState === 'object') store.lastState = parsed.lastState;
       if (typeof parsed.lastStateUpdatedAt === 'number') store.lastStateUpdatedAt = parsed.lastStateUpdatedAt;
-      if (Array.isArray(parsed.pendingBatches)) store.pendingBatches = parsed.pendingBatches;
+      if (Array.isArray(parsed.pendingBatches) && parsed.pendingBatches.length > 0) {
+        const known = new Set(store.pendingBatches.map((b) => b.batchId));
+        for (const pb of parsed.pendingBatches) {
+          if (!known.has(pb.batchId)) store.pendingBatches.push(pb);
+        }
+      }
     } catch {
-      // Ignore corrupt KV data
+      // Ignore corrupt snapshot
     }
   }
   return store;
 }
 
 async function savePersistedBridge(store: BridgeMemoryStore): Promise<void> {
-  if (!getKvConfig()) return;
+  pruneOldSessions(store);
   const payload: PersistedSnapshot = {
     enabled: store.enabled,
     token: store.token,
+    sessionCounter: store.sessionCounter,
+    sessions: store.sessions,
     lastState: store.lastState,
     lastStateUpdatedAt: store.lastStateUpdatedAt,
-    pendingBatches: store.pendingBatches.slice(-25),
+    pendingBatches: store.pendingBatches.slice(-30),
   };
-  await kvCommand(['SET', 'stagecraft:ai:bridge', JSON.stringify(payload), 'EX', 86400]);
+  const serialized = JSON.stringify(payload);
+  if (getKvConfig()) {
+    await kvCommand(['SET', 'stagecraft:ai:bridge', serialized, 'EX', 86400]);
+  } else {
+    try {
+      await fs.mkdir(DATA_DIR, { recursive: true });
+      await fs.writeFile(BRIDGE_DISK_FILE, serialized, 'utf8');
+    } catch {
+      // Ignore on read-only serverless filesystems
+    }
+  }
+}
+
+function buildStarterSessionState(
+  sessionId: string,
+  sceneId: string,
+  sceneName: string,
+  baseState: Record<string, unknown> | null,
+): Record<string, unknown> {
+  return {
+    sessionId,
+    projectName: typeof baseState?.projectName === 'string' ? baseState.projectName : 'Stagecraft Project',
+    sceneId,
+    sceneName,
+    duration: 10,
+    currentTime: 0,
+    isPlaying: false,
+    backgroundColor: '#17191f',
+    stageConfig: {
+      floorShape: 'square',
+      floorSides: 4,
+      floorSize: 28,
+      floorColor: '#1b1e24',
+      floorRoughness: 0.88,
+      gridColor: '#3a404d',
+      gridSecondaryColor: '#262a33',
+      showClouds: true,
+      cloudColor: '#cbd5e1',
+      cloudOpacity: 0.42,
+      floorLockEnabled: true,
+      walls: [],
+    },
+    camera: {
+      position: { x: 0, y: 3.2, z: 11.5 },
+      target: { x: 0, y: 1.4, z: 0 },
+      fov: 40,
+    },
+    selection: { kind: 'none' },
+    characters: [],
+    props: [],
+    lights: [
+      {
+        id: 'light_hemi_default',
+        name: 'Ambient Hemisphere',
+        kind: 'ambient',
+        color: '#cbe2ff',
+        intensity: 0.75,
+        position: { x: 0, y: 8, z: 0 },
+      },
+      {
+        id: 'light_key_default',
+        name: 'Key Directional',
+        kind: 'directional',
+        color: '#ffe6cc',
+        intensity: 1.45,
+        position: { x: 5, y: 9, z: 7 },
+      },
+      {
+        id: 'light_rim_default',
+        name: 'Rim Directional',
+        kind: 'directional',
+        color: '#8bb8ff',
+        intensity: 0.65,
+        position: { x: -6, y: 4, z: -6 },
+      },
+    ],
+  };
 }
 
 function broadcastSse(store: BridgeMemoryStore, eventName: string, data: unknown): void {
@@ -126,6 +278,79 @@ function broadcastSse(store: BridgeMemoryStore, eventName: string, data: unknown
       store.sseClients.delete(res);
     }
   }
+}
+
+function createFreshAiSession(
+  store: BridgeMemoryStore,
+  requestedLabel?: string,
+  requestedSessionId?: string,
+): { session: AiSessionRecord; createdBatch: PendingBatch } {
+  store.sessionCounter += 1;
+  const num = store.sessionCounter;
+  const sessionId =
+    requestedSessionId && requestedSessionId.trim()
+      ? requestedSessionId.trim()
+      : `sc_sess_${crypto.randomBytes(6).toString('hex')}`;
+  const cleanLabel = requestedLabel?.trim()
+    ? `${requestedLabel.trim()} #${num}`
+    : `Claude Session #${num}`;
+  const sceneId = `scene_ai_${crypto.randomBytes(4).toString('hex')}`;
+  const sceneName = cleanLabel;
+  const now = Date.now();
+
+  const session: AiSessionRecord = {
+    sessionId,
+    label: cleanLabel,
+    sceneId,
+    sceneName,
+    createdAt: now,
+    lastActivityAt: now,
+    batchCount: 0,
+    state: buildStarterSessionState(sessionId, sceneId, sceneName, store.lastState),
+  };
+
+  store.sessions[sessionId] = session;
+
+  // Queue immediate scene creation in Stagecraft Studio so UI creates the isolated scene ASAP
+  const createdBatch: PendingBatch = {
+    batchId: `aibatch_${now}_${crypto.randomBytes(3).toString('hex')}`,
+    sessionId,
+    sceneId,
+    sceneName,
+    source: cleanLabel,
+    commands: [
+      {
+        op: 'create_session',
+        sessionId,
+        sceneId,
+        sceneName,
+      },
+    ],
+    createdAt: now,
+    status: 'queued',
+  };
+  store.pendingBatches.push(createdBatch);
+  if (store.pendingBatches.length > 50) store.pendingBatches = store.pendingBatches.slice(-50);
+  broadcastSse(store, 'ai:command', {
+    ...createdBatch,
+    dispatchedAt: now,
+  });
+
+  return { session, createdBatch };
+}
+
+function listSessionSummaries(store: BridgeMemoryStore) {
+  return Object.values(store.sessions)
+    .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
+    .map((s) => ({
+      sessionId: s.sessionId,
+      label: s.label,
+      sceneId: s.sceneId,
+      sceneName: s.sceneName,
+      createdAt: s.createdAt,
+      lastActivityAt: s.lastActivityAt,
+      batchCount: s.batchCount,
+    }));
 }
 
 function extractRequestAuth(req: Request): { token: string; key: string } {
@@ -150,12 +375,10 @@ function isAuthorized(store: BridgeMemoryStore, req: Request, res: Response): bo
   const envConnectorKey = process.env.CONNECTOR_KEY?.trim();
   const envStageToken = process.env.STAGECRAFT_TOKEN?.trim();
 
-  // If user configured CONNECTOR_KEY env var on Vercel and passed ?key=...
   if (envConnectorKey && key && key === envConnectorKey) {
     return true;
   }
 
-  // If user configured STAGECRAFT_TOKEN env var and passed Bearer or ?token=...
   if (envStageToken && token && token === envStageToken) {
     return true;
   }
@@ -180,6 +403,7 @@ function isAuthorized(store: BridgeMemoryStore, req: Request, res: Response): bo
 
 export const COMMAND_SCHEMA_SUMMARY = {
   commands: [
+    { op: 'create_session', sceneName: 'optional string', note: 'Starts a new isolated scene session immediately.' },
     { op: 'select', targetKind: 'character|body-part|prop|light|camera|none', id: 'string', nodeId: 'optional string' },
     { op: 'move', targetId: 'string', nodeId: 'optional string', position: { x: 0, y: 0, z: 0 }, relative: false },
     { op: 'rotate', targetId: 'string', nodeId: 'optional string', rotationDeg: { x: 0, y: 0, z: 0 }, relative: false },
@@ -206,39 +430,52 @@ export const COMMAND_SCHEMA_SUMMARY = {
 
 async function dispatchCommandsToStudio(
   store: BridgeMemoryStore,
+  session: AiSessionRecord,
   commands: unknown[],
   source: string,
   waitForAck: boolean,
 ): Promise<Record<string, unknown>> {
-  const batchId = `aibatch_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+  const now = Date.now();
+  const batchId = `aibatch_${now}_${crypto.randomBytes(3).toString('hex')}`;
+  session.lastActivityAt = now;
+  session.batchCount += 1;
+
   const batch: PendingBatch = {
     batchId,
+    sessionId: session.sessionId,
+    sceneId: session.sceneId,
+    sceneName: session.sceneName,
     source,
     commands,
-    createdAt: Date.now(),
+    createdAt: now,
     status: 'queued',
   };
 
   store.pendingBatches.push(batch);
-  if (store.pendingBatches.length > 40) {
-    store.pendingBatches = store.pendingBatches.slice(-40);
+  if (store.pendingBatches.length > 50) {
+    store.pendingBatches = store.pendingBatches.slice(-50);
   }
   store.history.unshift(batch);
-  if (store.history.length > 50) store.history.length = 50;
+  if (store.history.length > 60) store.history.length = 60;
 
   await savePersistedBridge(store);
-  broadcastSse(store, 'ai:command', { batchId, source, commands, dispatchedAt: Date.now() });
+  broadcastSse(store, 'ai:command', {
+    ...batch,
+    dispatchedAt: now,
+  });
 
   if (!waitForAck) {
     return {
       ok: true,
+      sessionId: session.sessionId,
+      sceneId: session.sceneId,
+      sceneName: session.sceneName,
       batchId,
       queued: commands.length,
-      note: 'Dispatched to Stagecraft 3D Watch Mode queue.',
+      note: 'Dispatched to your isolated Stagecraft 3D Watch Mode session.',
     };
   }
 
-  // Wait up to 3.5s for active browser viewport to ack (via in-memory waiter or KV ack polling)
   return new Promise((resolve) => {
     const kv = getKvConfig();
     let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -252,10 +489,13 @@ async function dispatchCommandsToStudio(
       cleanup();
       resolve({
         ok: true,
+        sessionId: session.sessionId,
+        sceneId: session.sceneId,
+        sceneName: session.sceneName,
         batchId,
         queued: commands.length,
-        note: 'Commands queued for live execution in the open Stagecraft 3D tab.',
-        state: store.lastState,
+        note: 'Commands queued for live execution in your isolated Stagecraft 3D session.',
+        state: session.state ?? store.lastState,
       });
     }, 3500);
 
@@ -286,6 +526,27 @@ async function dispatchCommandsToStudio(
   });
 }
 
+function resolveOrCreateSession(
+  store: BridgeMemoryStore,
+  req: Request,
+  explicitSessionId?: string,
+  clientLabel?: string,
+): { session: AiSessionRecord; createdNew: boolean } {
+  const headerSess =
+    typeof req.headers['mcp-session-id'] === 'string' ? req.headers['mcp-session-id'].trim() : '';
+  const querySess = typeof req.query.session === 'string' ? req.query.session.trim() : '';
+  const candidateId = explicitSessionId?.trim() || headerSess || querySess;
+
+  if (candidateId && store.sessions[candidateId]) {
+    const existing = store.sessions[candidateId];
+    existing.lastActivityAt = Date.now();
+    return { session: existing, createdNew: false };
+  }
+
+  const { session } = createFreshAiSession(store, clientLabel, candidateId || undefined);
+  return { session, createdNew: true };
+}
+
 async function handleMcpPost(req: Request, res: Response): Promise<void> {
   const store = await loadPersistedBridge();
   if (!isAuthorized(store, req, res)) return;
@@ -298,23 +559,41 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
   };
   const id = rpc.id ?? null;
 
-  const sessionId =
-    (typeof req.headers['mcp-session-id'] === 'string' && req.headers['mcp-session-id']) ||
-    `sc_sess_${crypto.randomBytes(8).toString('hex')}`;
-  res.setHeader('Mcp-Session-Id', sessionId);
-
   if (rpc.method === 'initialize') {
+    // Always create a brand-new isolated session on initialize (unless caller explicitly pinned ?session=)
+    const clientInfo = (rpc.params?.clientInfo ?? {}) as { name?: string };
+    const clientLabel = typeof clientInfo.name === 'string' && clientInfo.name.trim()
+      ? clientInfo.name.trim()
+      : 'Claude';
+    const pinnedQuerySess = typeof req.query.session === 'string' ? req.query.session.trim() : '';
+    const { session } = pinnedQuerySess && store.sessions[pinnedQuerySess]
+      ? { session: store.sessions[pinnedQuerySess] }
+      : createFreshAiSession(store, clientLabel, pinnedQuerySess || undefined);
+    session.lastActivityAt = Date.now();
+    await savePersistedBridge(store);
+
+    res.setHeader('Mcp-Session-Id', session.sessionId);
     res.json({
       jsonrpc: '2.0',
       id,
       result: {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'stagecraft-3d-live-bridge', version: '1.1.0' },
+        serverInfo: {
+          name: 'stagecraft-3d-live-bridge',
+          version: '1.2.0',
+        },
+        instructions: `Connected to your own isolated Stagecraft 3D session (${session.sessionId} -> scene "${session.sceneName}"). Multiple AIs can work simultaneously without interference. Call get_state first, then run_commands.`,
       },
     });
     return;
   }
+
+  const headerSess =
+    typeof req.headers['mcp-session-id'] === 'string' ? req.headers['mcp-session-id'].trim() : '';
+  const querySess = typeof req.query.session === 'string' ? req.query.session.trim() : '';
+  const activeSessionId = headerSess || querySess || `sc_sess_${crypto.randomBytes(6).toString('hex')}`;
+  res.setHeader('Mcp-Session-Id', activeSessionId);
 
   if (rpc.method === 'notifications/initialized' || rpc.method === 'ping') {
     if (id === null) {
@@ -330,16 +609,23 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
       {
         name: 'get_state',
         description:
-          'Read the current Stagecraft 3D scene: stage, camera, lights, characters, rig parts/nodes, props, and selection. Call this before issuing commands so real IDs are used.',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+          'Read THIS Claude session’s isolated Stagecraft 3D scene (auto-creates your own session & scene immediately if needed so other AIs never interfere). Call this before issuing commands so real IDs are used.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string', description: 'Optional explicit session ID (defaults to your MCP session).' },
+          },
+          additionalProperties: false,
+        },
       },
       {
         name: 'run_commands',
         description:
-          'Send live editing commands to Stagecraft 3D so the user watches every change animate in real time. Supports select, move, rotate, scale, set_color, pose_part, add_prop, add_wall, update_stage, update_light, add_keyframe, set_camera_pose, set_time, play, pause, bake_html_motion.',
+          'Send live editing commands exclusively to THIS session’s isolated Stagecraft 3D scene while the user watches in real time. Never blocks or interferes with other Claude sessions.',
         inputSchema: {
           type: 'object',
           properties: {
+            sessionId: { type: 'string', description: 'Optional explicit session ID.' },
             source: { type: 'string', description: 'Optional AI name shown in Watch Mode log.' },
             commands: {
               type: 'array',
@@ -350,6 +636,23 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
           required: ['commands'],
         },
       },
+      {
+        name: 'new_session',
+        description:
+          'Create a brand-new isolated Stagecraft 3D session & fresh scene immediately so you can work independently without colliding with any other Claude or scene.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Optional name for the new scene/session.' },
+          },
+          additionalProperties: false,
+        },
+      },
+      {
+        name: 'list_sessions',
+        description: 'List active isolated AI sessions in Stagecraft 3D.',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      },
     ];
     res.json({ jsonrpc: '2.0', id, result: { tools } });
     return;
@@ -359,7 +662,11 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
     const toolName = String(rpc.params?.name ?? '');
     const toolArgs = (rpc.params?.arguments ?? {}) as Record<string, unknown>;
 
-    if (toolName === 'get_state' || toolName === 'get_studio_state') {
+    if (toolName === 'new_session') {
+      const requestedName = typeof toolArgs.name === 'string' ? toolArgs.name.trim() : undefined;
+      const { session } = createFreshAiSession(store, requestedName);
+      await savePersistedBridge(store);
+      res.setHeader('Mcp-Session-Id', session.sessionId);
       res.json({
         jsonrpc: '2.0',
         id,
@@ -369,8 +676,66 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
               type: 'text',
               text: JSON.stringify(
                 {
+                  ok: true,
+                  sessionId: session.sessionId,
+                  sceneId: session.sceneId,
+                  sceneName: session.sceneName,
+                  state: session.state,
+                  note: 'New isolated Stagecraft session & scene created. You can work immediately without interfering with other sessions.',
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        },
+      });
+      return;
+    }
+
+    if (toolName === 'list_sessions') {
+      res.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  currentSessionId: activeSessionId,
+                  sessions: listSessionSummaries(store),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        },
+      });
+      return;
+    }
+
+    if (toolName === 'get_state' || toolName === 'get_studio_state') {
+      const argSessionId = typeof toolArgs.sessionId === 'string' ? toolArgs.sessionId : undefined;
+      const { session, createdNew } = resolveOrCreateSession(store, req, argSessionId, 'Claude');
+      if (createdNew) await savePersistedBridge(store);
+      res.setHeader('Mcp-Session-Id', session.sessionId);
+      res.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  sessionId: session.sessionId,
+                  sceneId: session.sceneId,
+                  sceneName: session.sceneName,
+                  isolatedSession: true,
                   studioConnected: store.sseClients.size > 0 || Date.now() - store.lastStateUpdatedAt < 15000,
-                  state: store.lastState,
+                  state: session.state ?? store.lastState,
                   commandSchema: COMMAND_SCHEMA_SUMMARY,
                 },
                 null,
@@ -384,9 +749,14 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
     }
 
     if (toolName === 'run_commands' || toolName === 'execute_studio_commands') {
+      const argSessionId = typeof toolArgs.sessionId === 'string' ? toolArgs.sessionId : undefined;
+      const { session } = resolveOrCreateSession(store, req, argSessionId, 'Claude');
+      res.setHeader('Mcp-Session-Id', session.sessionId);
       const commands = Array.isArray(toolArgs.commands) ? toolArgs.commands : [];
-      const source = typeof toolArgs.source === 'string' ? toolArgs.source : 'Claude / MCP AI';
-      const outcome = await dispatchCommandsToStudio(store, commands, source, true);
+      const source = typeof toolArgs.source === 'string' && toolArgs.source.trim()
+        ? toolArgs.source.trim()
+        : session.label;
+      const outcome = await dispatchCommandsToStudio(store, session, commands, source, true);
       res.json({
         jsonrpc: '2.0',
         id,
@@ -412,6 +782,49 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
   });
 }
 
+async function saveCloudProject(store: BridgeMemoryStore, payload: StoredCloudProject): Promise<'kv' | 'disk' | 'memory'> {
+  store.cloudProjects[payload.syncCode] = payload;
+  const serialized = JSON.stringify(payload);
+  if (getKvConfig()) {
+    await kvCommand(['SET', `stagecraft:project:${payload.syncCode}`, serialized, 'EX', 60 * 60 * 24 * 30]);
+    const listRaw = await kvCommand(['GET', 'stagecraft:projects:index']);
+    const list: { syncCode: string; projectName: string; updatedAt: number }[] =
+      typeof listRaw === 'string' && listRaw ? (JSON.parse(listRaw) as typeof list) : [];
+    const nextList = [
+      { syncCode: payload.syncCode, projectName: payload.projectName, updatedAt: payload.updatedAt },
+      ...list.filter((i) => i.syncCode !== payload.syncCode),
+    ].slice(0, 40);
+    await kvCommand(['SET', 'stagecraft:projects:index', JSON.stringify(nextList), 'EX', 60 * 60 * 24 * 30]);
+    return 'kv';
+  }
+  try {
+    const projDir = path.join(DATA_DIR, 'projects');
+    await fs.mkdir(projDir, { recursive: true });
+    await fs.writeFile(path.join(projDir, `${payload.syncCode}.json`), serialized, 'utf8');
+    return 'disk';
+  } catch {
+    return 'memory';
+  }
+}
+
+async function loadCloudProject(store: BridgeMemoryStore, syncCode: string): Promise<StoredCloudProject | null> {
+  const cleanCode = syncCode.replace(/[^a-zA-Z0-9_-]/g, '').toUpperCase();
+  if (!cleanCode) return null;
+  if (getKvConfig()) {
+    const raw = await kvCommand(['GET', `stagecraft:project:${cleanCode}`]);
+    if (typeof raw === 'string' && raw) {
+      return JSON.parse(raw) as StoredCloudProject;
+    }
+  }
+  try {
+    const raw = await fs.readFile(path.join(DATA_DIR, 'projects', `${cleanCode}.json`), 'utf8');
+    return JSON.parse(raw) as StoredCloudProject;
+  } catch {
+    // Fallback to memory
+  }
+  return store.cloudProjects[cleanCode] ?? null;
+}
+
 export function mountAiBridge(app: Express): void {
   // Permissive CORS for external AIs, Claude connectors, ChatGPT Actions, and browser callers
   app.use('/api', (req, res, next) => {
@@ -429,7 +842,7 @@ export function mountAiBridge(app: Express): void {
     next();
   });
 
-  // Studio UI reads config
+  // Studio UI reads config + active isolated AI sessions
   app.get('/api/ai/config', async (_req, res) => {
     const store = await loadPersistedBridge();
     res.json({
@@ -443,6 +856,7 @@ export function mountAiBridge(app: Express): void {
             ? 1
             : 0,
       hasKvPersistence: Boolean(getKvConfig()),
+      sessions: listSessionSummaries(store),
       recentBatches: store.history.slice(0, 15),
     });
   });
@@ -467,16 +881,34 @@ export function mountAiBridge(app: Express): void {
     broadcastSse(store, 'ai:config', {
       enabled: store.enabled,
       connectedStudios: store.sseClients.size,
+      sessions: listSessionSummaries(store),
     });
     res.json({
       ok: true,
       enabled: store.enabled,
       token: store.token,
       connectedStudios: store.sseClients.size,
+      sessions: listSessionSummaries(store),
     });
   });
 
-  // Studio SSE stream (works continuously on Node / server.ts; on Vercel, client also polls /api/ai/poll)
+  // Explicit REST endpoint to create a new isolated AI session ASAP
+  app.post('/api/ai/sessions', async (req, res) => {
+    const store = await loadPersistedBridge();
+    if (!isAuthorized(store, req, res)) return;
+    const body = (req.body ?? {}) as { name?: string; label?: string };
+    const { session } = createFreshAiSession(store, body.name ?? body.label);
+    await savePersistedBridge(store);
+    res.json({
+      ok: true,
+      sessionId: session.sessionId,
+      sceneId: session.sceneId,
+      sceneName: session.sceneName,
+      state: session.state,
+    });
+  });
+
+  // Studio SSE stream
   app.get('/api/ai/stream', async (req, res) => {
     const store = await loadPersistedBridge();
     res.setHeader('Content-Type', 'text/event-stream');
@@ -489,6 +921,7 @@ export function mountAiBridge(app: Express): void {
       `event: ai:connected\ndata: ${JSON.stringify({
         enabled: store.enabled,
         connectedStudios: store.sseClients.size,
+        sessions: listSessionSummaries(store),
       })}\n\n`,
     );
 
@@ -506,20 +939,38 @@ export function mountAiBridge(app: Express): void {
     });
   });
 
-  // Studio pushes live compact scene snapshot (and re-hydrates cold serverless lambdas if needed)
+  // Studio pushes live scene snapshot (active scene + per-session isolated scene snapshots)
   app.post('/api/ai/sync-state', async (req, res) => {
     const store = await loadPersistedBridge();
     const body = (req.body ?? {}) as {
       state?: Record<string, unknown>;
+      sessionSnapshots?: Record<string, Record<string, unknown>>;
       enabled?: boolean;
       token?: string;
     };
 
-    const nextState = body.state && typeof body.state === 'object' ? body.state : (body as Record<string, unknown>);
-    if (nextState && typeof nextState === 'object') {
+    const nextState = body.state && typeof body.state === 'object' ? body.state : null;
+    if (nextState) {
       store.lastState = nextState;
       store.lastStateUpdatedAt = Date.now();
+      const activeSceneId = typeof nextState.sceneId === 'string' ? nextState.sceneId : '';
+      for (const s of Object.values(store.sessions)) {
+        if (s.sceneId === activeSceneId) {
+          s.state = nextState;
+          if (typeof nextState.sceneName === 'string') s.sceneName = nextState.sceneName;
+        }
+      }
     }
+
+    if (body.sessionSnapshots && typeof body.sessionSnapshots === 'object') {
+      for (const [sid, snap] of Object.entries(body.sessionSnapshots)) {
+        if (store.sessions[sid] && snap && typeof snap === 'object') {
+          store.sessions[sid].state = snap;
+          if (typeof snap.sceneName === 'string') store.sessions[sid].sceneName = snap.sceneName;
+        }
+      }
+    }
+
     if (typeof body.enabled === 'boolean') {
       store.enabled = body.enabled;
     }
@@ -527,22 +978,43 @@ export function mountAiBridge(app: Express): void {
       store.token = body.token.trim();
     }
     await savePersistedBridge(store);
-    res.json({ ok: true, connectedStudios: Math.max(1, store.sseClients.size) });
+    res.json({
+      ok: true,
+      connectedStudios: Math.max(1, store.sseClients.size),
+      sessions: listSessionSummaries(store),
+    });
   });
 
-  // Studio serverless poll endpoint (fetches queued AI command batches cleanly without holding SSE open)
+  // Studio serverless poll endpoint (also re-hydrates cold containers with enabled/token)
   app.get('/api/ai/poll', async (req, res) => {
     const store = await loadPersistedBridge();
+    const qEnabled = req.query.enabled;
+    const qToken = typeof req.query.token === 'string' ? req.query.token.trim() : '';
+    let changed = false;
+
+    if (qEnabled === '1' && !store.enabled) {
+      store.enabled = true;
+      changed = true;
+    }
+    if (qToken && !process.env.STAGECRAFT_TOKEN?.trim() && store.token !== qToken) {
+      store.token = qToken;
+      changed = true;
+    }
+
     const afterMs = Number(req.query.after ?? 0) || 0;
     const batches = store.pendingBatches.filter((b) => b.createdAt > afterMs);
     if (batches.length > 0) {
       store.pendingBatches = store.pendingBatches.filter((b) => !batches.some((x) => x.batchId === b.batchId));
+      changed = true;
+    }
+    if (changed) {
       await savePersistedBridge(store);
     }
     res.json({
       ok: true,
       enabled: store.enabled,
       batches,
+      sessions: listSessionSummaries(store),
     });
   });
 
@@ -551,13 +1023,19 @@ export function mountAiBridge(app: Express): void {
     const store = await loadPersistedBridge();
     const body = (req.body ?? {}) as {
       batchId?: string;
+      sessionId?: string;
       ok?: boolean;
       results?: unknown[];
       error?: string;
       state?: Record<string, unknown>;
     };
     if (body.state && typeof body.state === 'object') {
-      store.lastState = body.state;
+      if (body.sessionId && store.sessions[body.sessionId]) {
+        store.sessions[body.sessionId].state = body.state;
+        store.sessions[body.sessionId].lastActivityAt = Date.now();
+      } else {
+        store.lastState = body.state;
+      }
       store.lastStateUpdatedAt = Date.now();
     }
     if (body.batchId) {
@@ -565,10 +1043,11 @@ export function mountAiBridge(app: Express): void {
       if (entry) entry.status = body.ok === false ? 'error' : 'completed';
       const ackPayload: Record<string, unknown> = {
         ok: body.ok !== false,
+        sessionId: body.sessionId,
         batchId: body.batchId,
         results: body.results ?? [],
         error: body.error,
-        state: store.lastState,
+        state: (body.sessionId && store.sessions[body.sessionId]?.state) || store.lastState,
       };
       store.ackResults.set(body.batchId, ackPayload);
       if (getKvConfig()) {
@@ -583,24 +1062,30 @@ export function mountAiBridge(app: Express): void {
     res.json({ ok: true });
   });
 
-  // External AI: Read live scene state
+  // External AI: Read live scene state (isolated per session if ?session= passed, or auto-creates new session)
   app.get('/api/ai/state', async (req, res) => {
     const store = await loadPersistedBridge();
     if (!isAuthorized(store, req, res)) return;
+    const { session, createdNew } = resolveOrCreateSession(store, req, undefined, 'HTTP AI');
+    if (createdNew) await savePersistedBridge(store);
     res.json({
       ok: true,
+      sessionId: session.sessionId,
+      sceneId: session.sceneId,
+      sceneName: session.sceneName,
       studioConnected: store.sseClients.size > 0 || Date.now() - store.lastStateUpdatedAt < 15000,
-      updatedAt: store.lastStateUpdatedAt,
-      state: store.lastState,
+      updatedAt: session.lastActivityAt,
+      state: session.state ?? store.lastState,
       commandSchema: COMMAND_SCHEMA_SUMMARY,
     });
   });
 
-  // External AI: Send live commands
+  // External AI: Send live commands (isolated per session)
   app.post('/api/ai/commands', async (req, res) => {
     const store = await loadPersistedBridge();
     if (!isAuthorized(store, req, res)) return;
     const body = (req.body ?? {}) as {
+      sessionId?: string;
       commands?: unknown[];
       source?: string;
       wait?: boolean;
@@ -610,14 +1095,77 @@ export function mountAiBridge(app: Express): void {
       res.status(400).json({ ok: false, error: 'Provide a non-empty "commands" array.' });
       return;
     }
+    const { session } = resolveOrCreateSession(
+      store,
+      req,
+      body.sessionId,
+      typeof body.source === 'string' && body.source.trim() ? body.source.trim() : 'External AI',
+    );
     const waitForAck = req.query.wait !== 'false' && body.wait !== false;
     const result = await dispatchCommandsToStudio(
       store,
+      session,
       commands,
-      typeof body.source === 'string' && body.source.trim() ? body.source.trim() : 'External AI',
+      typeof body.source === 'string' && body.source.trim() ? body.source.trim() : session.label,
       waitForAck,
     );
     res.json(result);
+  });
+
+  // Cross-Device Cloud Project Sync Endpoints
+  app.post('/api/projects/save', async (req, res) => {
+    const store = await loadPersistedBridge();
+    const body = (req.body ?? {}) as {
+      syncCode?: string;
+      project?: Record<string, unknown>;
+      assets?: unknown[];
+    };
+    if (!body.project || typeof body.project !== 'object') {
+      res.status(400).json({ ok: false, error: 'Missing project payload.' });
+      return;
+    }
+    const rawCode = typeof body.syncCode === 'string' ? body.syncCode.replace(/[^a-zA-Z0-9_-]/g, '').toUpperCase() : '';
+    const syncCode = rawCode || `SC-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const payload: StoredCloudProject = {
+      syncCode,
+      projectName: typeof body.project.name === 'string' ? body.project.name : 'Stagecraft Project',
+      updatedAt: Date.now(),
+      project: body.project,
+      assets: Array.isArray(body.assets) ? body.assets : [],
+    };
+    const persistedVia = await saveCloudProject(store, payload);
+    res.json({
+      ok: true,
+      syncCode,
+      projectName: payload.projectName,
+      updatedAt: payload.updatedAt,
+      persistedVia,
+    });
+  });
+
+  app.get('/api/projects', async (_req, res) => {
+    const store = await loadPersistedBridge();
+    if (getKvConfig()) {
+      const raw = await kvCommand(['GET', 'stagecraft:projects:index']);
+      if (typeof raw === 'string' && raw) {
+        res.json({ ok: true, persistedVia: 'kv', projects: JSON.parse(raw) });
+        return;
+      }
+    }
+    const list = Object.values(store.cloudProjects)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .map((p) => ({ syncCode: p.syncCode, projectName: p.projectName, updatedAt: p.updatedAt }));
+    res.json({ ok: true, persistedVia: getKvConfig() ? 'kv' : 'memory', projects: list });
+  });
+
+  app.get('/api/projects/:syncCode', async (req, res) => {
+    const store = await loadPersistedBridge();
+    const loaded = await loadCloudProject(store, String(req.params.syncCode ?? ''));
+    if (!loaded) {
+      res.status(404).json({ ok: false, error: 'No synced project found for that code.' });
+      return;
+    }
+    res.json({ ok: true, ...loaded });
   });
 
   // External AI: MCP endpoints (both /api/ai/mcp and /api/mcp for Claude custom connectors!)
@@ -639,7 +1187,12 @@ export function mountAiBridge(app: Express): void {
       res.end();
       return;
     }
-    res.json({ ok: true, name: 'stagecraft-3d-live-bridge', transport: 'streamable-http' });
+    res.json({
+      ok: true,
+      name: 'stagecraft-3d-live-bridge',
+      transport: 'streamable-http',
+      multiSession: true,
+    });
   };
   app.get('/api/ai/mcp', (req, res) => {
     void handleMcpGet(req, res);
@@ -664,9 +1217,9 @@ export function mountAiBridge(app: Express): void {
       openapi: '3.1.0',
       info: {
         title: 'Stagecraft 3D Live AI Bridge',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
-          'Allows any external AI assistant to inspect and edit the live 3D Stagecraft scene while the user watches in real time.',
+          'Allows multiple external AI assistants to create isolated sessions and edit Stagecraft 3D scenes in parallel without interfering with each other.',
       },
       servers: [{ url: baseUrl }],
       components: {
@@ -676,17 +1229,24 @@ export function mountAiBridge(app: Express): void {
       },
       security: [{ BearerAuth: [] }],
       paths: {
+        '/api/ai/sessions': {
+          post: {
+            operationId: 'createAiSession',
+            summary: 'Create a brand-new isolated AI scene session immediately',
+            responses: { '200': { description: 'Created isolated session and starter state' } },
+          },
+        },
         '/api/ai/state': {
           get: {
             operationId: 'getStudioState',
-            summary: 'Read the full live 3D scene state and command schema',
+            summary: 'Read the live 3D scene state for a session',
             responses: { '200': { description: 'Current studio snapshot' } },
           },
         },
         '/api/ai/commands': {
           post: {
             operationId: 'executeStudioCommands',
-            summary: 'Apply one or more live edits to Stagecraft 3D',
+            summary: 'Apply one or more live edits to an isolated Stagecraft 3D session',
             requestBody: {
               required: true,
               content: {
@@ -695,6 +1255,7 @@ export function mountAiBridge(app: Express): void {
                     type: 'object',
                     required: ['commands'],
                     properties: {
+                      sessionId: { type: 'string' },
                       source: { type: 'string' },
                       commands: { type: 'array', items: { type: 'object' } },
                     },

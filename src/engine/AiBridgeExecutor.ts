@@ -61,12 +61,14 @@ export function buildAiSceneSnapshot(
   isPlaying: boolean,
   selection: SelectionTarget,
   rigNodesByInstance: Record<string, RigNodeInfo[]>,
+  sessionId?: string,
 ): AiBridgeStateSnapshot {
   const evalSnap = evaluateSceneAtTime(scene, currentTime);
   const envSpec = ENVIRONMENT_PRESETS.find((e) => e.id === scene.environmentPreset);
   const stageConfig = scene.stageConfig ?? createDefaultStageConfig(envSpec?.floorColor);
 
   return {
+    ...(sessionId ? { sessionId } : {}),
     projectName: project.name,
     sceneId: scene.id,
     sceneName: scene.name,
@@ -190,6 +192,7 @@ export interface AiCommandExecutionContext {
   ungroupCharacter: (instanceId: string) => void;
   bakeHtmlMotion: (instanceId: string) => void;
   addStageWall: (side: StageWallSide, opts?: { color?: string; height?: number }) => void;
+  ensureSessionScene?: (sessionId: string, sceneId: string, sceneName: string) => void;
 }
 
 function resolveCharacterAndNode(
@@ -233,6 +236,16 @@ export function executeSingleAiCommand(
   const op = cmd.op;
 
   switch (op) {
+    case 'create_session': {
+      if (cmd.sessionId && cmd.sceneId) {
+        ctx.ensureSessionScene?.(cmd.sessionId, cmd.sceneId, cmd.sceneName ?? 'Claude Session');
+      }
+      return {
+        ok: true,
+        summary: `Started isolated session "${cmd.sceneName ?? cmd.sceneId ?? 'New Session'}"`,
+      };
+    }
+
     case 'clear_selection': {
       ctx.setSelection({ kind: 'none' });
       return { ok: true, summary: 'Cleared viewport selection' };

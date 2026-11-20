@@ -11,7 +11,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import type { AiBridgeLogEntry, AiBridgeStateSnapshot } from '../../core/types';
+import type { AiBridgeLogEntry, AiBridgeStateSnapshot, AiSessionSummary } from '../../core/types';
 import { buildUniversalAiPrompt } from '../../engine/AiBridgeExecutor';
 import { StudioButton, StudioSlider } from '../components/Primitives';
 
@@ -24,6 +24,9 @@ interface AiBridgeDrawerProps {
   paused: boolean;
   stepDelayMs: number;
   autoHighlight: boolean;
+  autoSwitchSession: boolean;
+  activeSceneId: string;
+  sessions: AiSessionSummary[];
   queueLength: number;
   logs: AiBridgeLogEntry[];
   snapshot: AiBridgeStateSnapshot;
@@ -33,6 +36,8 @@ interface AiBridgeDrawerProps {
   onTogglePaused: () => void;
   onChangeStepDelay: (ms: number) => void;
   onToggleAutoHighlight: (next: boolean) => void;
+  onToggleAutoSwitchSession: (next: boolean) => void;
+  onSelectSessionScene: (sceneId: string) => void;
   onUndoLastAiBatch: () => void;
   onClearLogs: () => void;
   onRunManualJson: (rawText: string) => void;
@@ -58,6 +63,9 @@ export function AiBridgeDrawer({
   paused,
   stepDelayMs,
   autoHighlight,
+  autoSwitchSession,
+  activeSceneId,
+  sessions,
   queueLength,
   logs,
   snapshot,
@@ -67,6 +75,8 @@ export function AiBridgeDrawer({
   onTogglePaused,
   onChangeStepDelay,
   onToggleAutoHighlight,
+  onToggleAutoSwitchSession,
+  onSelectSessionScene,
   onUndoLastAiBatch,
   onClearLogs,
   onRunManualJson,
@@ -210,6 +220,15 @@ export function AiBridgeDrawer({
             />
             <span>Auto-select &amp; highlight each part as the AI edits it</span>
           </label>
+          <label className="flex items-center gap-2 text-[11px] text-[#98a0ad]">
+            <input
+              type="checkbox"
+              checked={autoSwitchSession}
+              onChange={(e) => onToggleAutoSwitchSession(e.target.checked)}
+              className="accent-[#e8702a]"
+            />
+            <span>Auto-switch viewport when a new Claude opens a session</span>
+          </label>
         </div>
       </div>
 
@@ -265,6 +284,56 @@ export function AiBridgeDrawer({
                   <span>{copiedId === 'claude-url' ? 'Copied' : 'Copy URL'}</span>
                 </StudioButton>
               </div>
+              <p className="text-[10px] text-[#4ade80]">
+                Multi-Claude Ready: Every Claude chat automatically creates its own isolated session &amp; scene ASAP — zero interference between Claudes.
+              </p>
+            </div>
+
+            {/* Active Isolated AI Sessions */}
+            <div className="rounded border border-[#2a2e36] bg-[#14161a] p-2.5 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-[#e6e8ec]">
+                  Isolated AI Sessions ({sessions.length})
+                </span>
+                <span className="text-[10px] text-[#98a0ad]">No locking / parallel work</span>
+              </div>
+              {sessions.length === 0 ? (
+                <div className="rounded border border-dashed border-[#2a2e36] p-2 text-[11px] text-[#6b7280]">
+                  Waiting for first Claude connection. As soon as a Claude connects, its own session &amp; scene will appear here.
+                </div>
+              ) : (
+                <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                  {sessions.map((sess) => {
+                    const isWatching = sess.sceneId === activeSceneId;
+                    return (
+                      <div
+                        key={sess.sessionId}
+                        className={`flex items-center justify-between gap-2 rounded border px-2 py-1.5 ${
+                          isWatching
+                            ? 'border-[#e8702a] bg-[#2a211c]'
+                            : 'border-[#2a2e36] bg-[#101215]'
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate text-[11px] font-medium text-[#e6e8ec]">
+                            {sess.sceneName}
+                          </div>
+                          <div className="truncate font-mono-code text-[9px] text-[#98a0ad]">
+                            {sess.sessionId} · {sess.batchCount} batch(es)
+                          </div>
+                        </div>
+                        <StudioButton
+                          size="xs"
+                          variant={isWatching ? 'primary' : 'default'}
+                          onClick={() => onSelectSessionScene(sess.sceneId)}
+                        >
+                          <span>{isWatching ? 'Watching' : 'Watch'}</span>
+                        </StudioButton>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
             {/* Universal Chat AI Copy */}
@@ -385,8 +454,11 @@ export function AiBridgeDrawer({
                       </span>
                     </div>
                     <div className="mt-0.5 flex items-center justify-between text-[10px] text-[#6b7280]">
-                      <span>{entry.source}</span>
-                      <span className="font-mono-code">
+                      <span className="truncate">
+                        {entry.source}
+                        {entry.sceneName ? ` · ${entry.sceneName}` : ''}
+                      </span>
+                      <span className="font-mono-code shrink-0">
                         {new Date(entry.timestamp).toLocaleTimeString()}
                       </span>
                     </div>

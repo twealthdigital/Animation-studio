@@ -4,6 +4,7 @@ import type {
   ActionClip,
   AiBridgeCommand,
   AiBridgeLogEntry,
+  AiSessionSummary,
   AssetRecord,
   AudioClipData,
   AxisConstraint,
@@ -375,6 +376,9 @@ export function StudioWorkspace() {
   const [aiLogs, setAiLogs] = useState<AiBridgeLogEntry[]>([]);
   const [aiQueueLength, setAiQueueLength] = useState(0);
   const [aiBatchUndoStack, setAiBatchUndoStack] = useState<SceneData[]>([]);
+  const [aiSessions, setAiSessions] = useState<AiSessionSummary[]>([]);
+  const [aiAutoSwitchSession, setAiAutoSwitchSession] = useState(true);
+  const [cloudSyncCode, setCloudSyncCode] = useState<string | null>(null);
   const [dialogueTargetCharId, setDialogueTargetCharId] = useState<string | null>(null);
   const [confirmState, setConfirmState] = useState<{
     title: string;
@@ -862,10 +866,45 @@ export function StudioWorkspace() {
         if (savedAssets.length > 0) {
           setAssets(savedAssets);
         }
-        if (rawProjects.length > 0) {
-          const migrated = rawProjects.map(migrateProjectData);
-          setProjects(migrated);
-          setActiveProjectId(migrated[0].id);
+        let loadedProjects = rawProjects.map(migrateProjectData);
+
+        // Check URL ?sync=SC-XXXXXX so opening the site on any other computer/browser loads cloud scenes!
+        const urlSync = new URLSearchParams(window.location.search).get('sync')?.trim();
+        if (urlSync) {
+          try {
+            const syncRes = await fetch(`/api/projects/${encodeURIComponent(urlSync)}`);
+            if (syncRes.ok) {
+              const syncData = (await syncRes.json()) as {
+                syncCode?: string;
+                project?: ProjectData;
+                assets?: AssetRecord[];
+              };
+              if (syncData.project && Array.isArray(syncData.project.scenes)) {
+                const syncedProj = migrateProjectData(syncData.project);
+                if (Array.isArray(syncData.assets)) {
+                  for (const a of syncData.assets) {
+                    await dbSaveAsset(a);
+                  }
+                  setAssets((prev) => {
+                    const map = new Map(prev.map((x) => [x.id, x]));
+                    for (const a of syncData.assets!) map.set(a.id, a);
+                    return Array.from(map.values());
+                  });
+                }
+                await dbSaveProject(syncedProj);
+                loadedProjects = [syncedProj, ...loadedProjects.filter((p) => p.id !== syncedProj.id)];
+                if (syncData.syncCode) setCloudSyncCode(syncData.syncCode);
+                setNoticeMessage(`Loaded cloud project "${syncedProj.name}" (${syncData.syncCode ?? urlSync})`);
+              }
+            }
+          } catch {
+            // Non-fatal if sync lookup fails
+          }
+        }
+
+        if (loadedProjects.length > 0) {
+          setProjects(loadedProjects);
+          setActiveProjectId(loadedProjects[0].id);
           setSaveStatus('saved');
         } else {
           const initial = createBlankProject('My Cartoon');
@@ -3069,21 +3108,99 @@ export function StudioWorkspace() {
     [commitSceneMutation],
   );
 
-  // ---------- AI Live Bridge & Watch Mode ----------
+  // ---------- AI Live Bridge & Watch Mode (Multi-Claude Session Isolated) ----------
   const aiPausedRef = useRef(aiPaused);
   const aiStepDelayRef = useRef(aiStepDelayMs);
   const aiAutoHighlightRef = useRef(aiAutoHighlight);
+  const aiAutoSwitchSessionRef = useRef(aiAutoSwitchSession);
+  const aiSessionsRef = useRef(aiSessions);
   aiPausedRef.current = aiPaused;
   aiStepDelayRef.current = aiStepDelayMs;
   aiAutoHighlightRef.current = aiAutoHighlight;
+  aiAutoSwitchSessionRef.current = aiAutoSwitchSession;
+  aiSessionsRef.current = aiSessions;
 
   interface QueuedAiBatch {
     batchId: string;
+    sessionId?: string;
+    sceneId?: string;
+    sceneName?: string;
     source: string;
     commands: AiBridgeCommand[];
   }
   const aiQueueRef = useRef<QueuedAiBatch[]>([]);
   const aiProcessingRef = useRef(false);
+
+  const ensureAiSessionScene = useCallback(
+    (sessionId: string, sceneId: string, sceneName: string) => {
+      if (!sceneId) return;
+      const existing = projectRef.current.scenes.find((s) => s.id === sceneId);
+      if (!existing) {
+        const freshScene: SceneData = {
+          ...buildSceneFromTemplate('blank-stage', sceneName || 'Claude Session'),
+          id: sceneId,
+        };
+        const nextProj: ProjectData = {
+          ...projectRef.current,
+          activeSceneId: aiAutoSwitchSessionRef.current ? sceneId : projectRef.current.activeSceneId,
+          scenes: [...projectRef.current.scenes, freshScene],
+        };
+        projectRef.current = nextProj;
+        if (aiAutoSwitchSessionRef.current) {
+          sceneRef.current = freshScene;
+          setSelection({ kind: 'none' });
+        }
+        setProjects((prev) => prev.map((p) => (p.id === nextProj.id ? nextProj : p)));
+        setSaveStatus('unsaved');
+      } else if (aiAutoSwitchSessionRef.current && projectRef.current.activeSceneId !== sceneId) {
+        updateActiveProject((proj) => ({ ...proj, activeSceneId: sceneId }), false);
+      }
+
+      if (sessionId) {
+        setAiSessions((prev) => {
+          const idx = prev.findIndex((s) => s.sessionId === sessionId);
+          if (idx >= 0) {
+            return prev.map((s, i) =>
+              i === idx ? { ...s, lastActivityAt: Date.now(), batchCount: s.batchCount + 1 } : s,
+            );
+          }
+          return [
+            {
+              sessionId,
+              label: sceneName || 'Claude Session',
+              sceneId,
+              sceneName: sceneName || 'Claude Session',
+              createdAt: Date.now(),
+              lastActivityAt: Date.now(),
+              batchCount: 1,
+            },
+            ...prev,
+          ];
+        });
+      }
+    },
+    [updateActiveProject],
+  );
+
+  const commitSceneMutationForId = useCallback(
+    (targetSceneId: string, label: string, mutator: (scene: SceneData) => SceneData) => {
+      if (!targetSceneId || targetSceneId === sceneRef.current.id) {
+        commitSceneMutation(label, mutator);
+        return;
+      }
+      const existing = projectRef.current.scenes.find((s) => s.id === targetSceneId);
+      if (!existing) return;
+      const nextTarget = mutator(cloneScene(existing));
+      const nextProj: ProjectData = {
+        ...projectRef.current,
+        scenes: projectRef.current.scenes.map((s) => (s.id === targetSceneId ? nextTarget : s)),
+      };
+      projectRef.current = nextProj;
+      setProjects((prev) => prev.map((p) => (p.id === nextProj.id ? nextProj : p)));
+      setSaveStatus('unsaved');
+    },
+    [commitSceneMutation],
+  );
 
   const aiSnapshot = useMemo(
     () =>
@@ -3110,8 +3227,16 @@ export function StudioWorkspace() {
         const batch = aiQueueRef.current.shift()!;
         setAiQueueLength(aiQueueRef.current.length + batch.commands.length);
 
-        const beforeBatchScene = cloneScene(sceneRef.current);
-        setAiBatchUndoStack((prev) => [beforeBatchScene, ...prev].slice(0, 15));
+        const targetSceneId = batch.sceneId || sceneRef.current.id;
+        if (batch.sceneId && batch.sessionId) {
+          ensureAiSessionScene(batch.sessionId, batch.sceneId, batch.sceneName ?? batch.source);
+        }
+
+        const initialTargetScene =
+          projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? sceneRef.current;
+        if (targetSceneId === sceneRef.current.id) {
+          setAiBatchUndoStack((prev) => [cloneScene(initialTargetScene), ...prev].slice(0, 15));
+        }
 
         const results: { op: string; ok: boolean; summary: string }[] = [];
         for (let i = 0; i < batch.commands.length; i++) {
@@ -3129,28 +3254,39 @@ export function StudioWorkspace() {
               id: logId,
               timestamp: Date.now(),
               source: batch.source,
+              sessionId: batch.sessionId,
+              sceneName: batch.sceneName ?? initialTargetScene.name,
               summary: `Running ${cmd.op}...`,
               status: 'running',
             },
             ...prev.slice(0, 59),
           ]);
 
+          const liveTargetScene =
+            projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? sceneRef.current;
+          const isViewingThisScene = targetSceneId === sceneRef.current.id;
+
           const res = executeSingleAiCommand(
             {
-              scene: sceneRef.current,
-              currentTime: timeRef.current,
+              scene: liveTargetScene,
+              currentTime: isViewingThisScene ? timeRef.current : 0,
               rigNodesByInstance: rigNodesRef.current,
-              updateScene: (mutator, desc) => commitSceneMutation(desc, mutator),
-              setSelection: (t) => setSelection(t),
-              setTime: (t) => handleSeek(t),
+              ensureSessionScene: (sid, scId, scName) => ensureAiSessionScene(sid, scId, scName),
+              updateScene: (mutator, desc) => commitSceneMutationForId(targetSceneId, desc, mutator),
+              setSelection: (t) => {
+                if (targetSceneId === sceneRef.current.id) setSelection(t);
+              },
+              setTime: (t) => {
+                if (targetSceneId === sceneRef.current.id) handleSeek(t);
+              },
               startPlayback: () => {
-                if (!isPlayingRef.current) handleTogglePlay();
+                if (targetSceneId === sceneRef.current.id && !isPlayingRef.current) handleTogglePlay();
               },
               stopPlayback: () => {
-                if (isPlayingRef.current) handleTogglePlay();
+                if (targetSceneId === sceneRef.current.id && isPlayingRef.current) handleTogglePlay();
               },
               setCameraPose: (pose) => {
-                commitSceneMutation('AI Camera Pose', (s) => ({
+                commitSceneMutationForId(targetSceneId, 'AI Camera Pose', (s) => ({
                   ...s,
                   camera: { ...s.camera, pose },
                   cameras: (s.cameras ?? []).map((cam, idx) =>
@@ -3160,11 +3296,17 @@ export function StudioWorkspace() {
                   ),
                 }));
               },
-              detachNode: (instId, nid, nname) => handleDetachBodyPart(instId, nid, nname),
-              ungroupCharacter: (instId) => handleBreakApartCharacter(instId),
-              bakeHtmlMotion: (instId) => handleBakeHtmlMotion(instId),
+              detachNode: (instId, nid, nname) => {
+                if (targetSceneId === sceneRef.current.id) handleDetachBodyPart(instId, nid, nname);
+              },
+              ungroupCharacter: (instId) => {
+                if (targetSceneId === sceneRef.current.id) handleBreakApartCharacter(instId);
+              },
+              bakeHtmlMotion: (instId) => {
+                if (targetSceneId === sceneRef.current.id) handleBakeHtmlMotion(instId);
+              },
               addStageWall: (side, opts) => {
-                commitSceneMutation(`AI Add ${side} Wall`, (s) => {
+                commitSceneMutationForId(targetSceneId, `AI Add ${side} Wall`, (s) => {
                   const cur = s.stageConfig ?? createDefaultStageConfig();
                   const half = Math.max(4, (cur.floorSize || 28) * 0.5);
                   const span = Math.max(8, cur.floorSize || 28);
@@ -3195,7 +3337,7 @@ export function StudioWorkspace() {
               },
             },
             cmd,
-            aiAutoHighlightRef.current,
+            aiAutoHighlightRef.current && isViewingThisScene,
           );
 
           results.push({ op: cmd.op, ok: res.ok, summary: res.summary });
@@ -3219,19 +3361,23 @@ export function StudioWorkspace() {
           }
         }
 
+        const updatedTargetScene =
+          projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? sceneRef.current;
         const latestSnapshot = buildAiSceneSnapshot(
           projectRef.current,
-          sceneRef.current,
-          timeRef.current,
-          isPlayingRef.current,
-          selectionRef.current,
+          updatedTargetScene,
+          updatedTargetScene.id === sceneRef.current.id ? timeRef.current : 0,
+          updatedTargetScene.id === sceneRef.current.id ? isPlayingRef.current : false,
+          updatedTargetScene.id === sceneRef.current.id ? selectionRef.current : { kind: 'none' },
           rigNodesRef.current,
+          batch.sessionId,
         );
         void fetch('/api/ai/ack', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             batchId: batch.batchId,
+            sessionId: batch.sessionId,
             ok: results.every((r) => r.ok),
             results,
             state: latestSnapshot,
@@ -3243,7 +3389,8 @@ export function StudioWorkspace() {
       aiProcessingRef.current = false;
     }
   }, [
-    commitSceneMutation,
+    commitSceneMutationForId,
+    ensureAiSessionScene,
     handleBakeHtmlMotion,
     handleBreakApartCharacter,
     handleDetachBodyPart,
@@ -3255,7 +3402,12 @@ export function StudioWorkspace() {
   const lastPollMsRef = useRef<number>(0);
 
   const enqueueAiBatch = useCallback(
-    (commands: AiBridgeCommand[], source = 'External AI', batchId = createId('localbatch')) => {
+    (
+      commands: AiBridgeCommand[],
+      source = 'External AI',
+      batchId = createId('localbatch'),
+      meta?: { sessionId?: string; sceneId?: string; sceneName?: string },
+    ) => {
       if (commands.length === 0) return;
       if (executedBatchIdsRef.current.has(batchId)) return;
       executedBatchIdsRef.current.add(batchId);
@@ -3263,7 +3415,14 @@ export function StudioWorkspace() {
         const first = executedBatchIdsRef.current.values().next().value;
         if (first) executedBatchIdsRef.current.delete(first);
       }
-      aiQueueRef.current.push({ batchId, source, commands });
+      aiQueueRef.current.push({
+        batchId,
+        sessionId: meta?.sessionId,
+        sceneId: meta?.sceneId,
+        sceneName: meta?.sceneName,
+        source,
+        commands,
+      });
       setAiQueueLength((prev) => prev + commands.length);
       void runAiQueue();
     },
@@ -3296,8 +3455,8 @@ export function StudioWorkspace() {
         setAiAccessEnabled(effectiveEnabled);
         if (effectiveToken) setAiToken(effectiveToken);
         if (typeof data.connectedStudios === 'number') setAiConnectedStudios(data.connectedStudios);
+        if (Array.isArray(data.sessions)) setAiSessions(data.sessions as AiSessionSummary[]);
 
-        // Re-hydrate serverless instance if client had saved live access enabled
         if (savedPrefs.enabled || savedPrefs.token) {
           void fetch('/api/ai/config', {
             method: 'POST',
@@ -3321,8 +3480,13 @@ export function StudioWorkspace() {
     const es = new EventSource('/api/ai/stream');
     es.addEventListener('ai:connected', (ev) => {
       try {
-        const d = JSON.parse((ev as MessageEvent).data) as { enabled?: boolean; connectedStudios?: number };
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          enabled?: boolean;
+          connectedStudios?: number;
+          sessions?: AiSessionSummary[];
+        };
         if (typeof d.connectedStudios === 'number') setAiConnectedStudios(d.connectedStudios);
+        if (Array.isArray(d.sessions)) setAiSessions(d.sessions);
         if (typeof savedPrefs.enabled !== 'boolean' && typeof d.enabled === 'boolean') {
           setAiAccessEnabled(d.enabled);
         }
@@ -3332,9 +3496,14 @@ export function StudioWorkspace() {
     });
     es.addEventListener('ai:config', (ev) => {
       try {
-        const d = JSON.parse((ev as MessageEvent).data) as { enabled?: boolean; connectedStudios?: number };
+        const d = JSON.parse((ev as MessageEvent).data) as {
+          enabled?: boolean;
+          connectedStudios?: number;
+          sessions?: AiSessionSummary[];
+        };
         if (typeof d.enabled === 'boolean') setAiAccessEnabled(d.enabled);
         if (typeof d.connectedStudios === 'number') setAiConnectedStudios(d.connectedStudios);
+        if (Array.isArray(d.sessions)) setAiSessions(d.sessions);
       } catch {
         // Ignore parse issue
       }
@@ -3343,11 +3512,18 @@ export function StudioWorkspace() {
       try {
         const d = JSON.parse((ev as MessageEvent).data) as {
           batchId?: string;
+          sessionId?: string;
+          sceneId?: string;
+          sceneName?: string;
           source?: string;
           commands?: AiBridgeCommand[];
         };
         if (Array.isArray(d.commands) && d.commands.length > 0) {
-          enqueueAiBatch(d.commands, d.source ?? 'External AI', d.batchId ?? createId('batch'));
+          enqueueAiBatch(d.commands, d.source ?? 'External AI', d.batchId ?? createId('batch'), {
+            sessionId: d.sessionId,
+            sceneId: d.sceneId,
+            sceneName: d.sceneName,
+          });
         }
       } catch {
         // Ignore malformed command payload
@@ -3373,10 +3549,26 @@ export function StudioWorkspace() {
     }
   }, [aiAccessEnabled, aiToken]);
 
-  // Keep server AI snapshot synced + poll /api/ai/poll every 1.2s for Vercel serverless reliability
+  // Keep server AI snapshot + all per-session isolated scene snapshots synced
   useEffect(() => {
     if (!aiAccessEnabled && !aiBridgeOpen) return;
     const t = window.setTimeout(() => {
+      const sessionSnapshots: Record<string, ReturnType<typeof buildAiSceneSnapshot>> = {};
+      for (const sess of aiSessionsRef.current) {
+        const sc = activeProject.scenes.find((s) => s.id === sess.sceneId);
+        if (sc) {
+          sessionSnapshots[sess.sessionId] = buildAiSceneSnapshot(
+            activeProject,
+            sc,
+            sc.id === activeScene.id ? currentTime : 0,
+            sc.id === activeScene.id ? isPlaying : false,
+            sc.id === activeScene.id ? selection : { kind: 'none' },
+            rigNodesByInstance,
+            sess.sessionId,
+          );
+        }
+      }
+
       void fetch('/api/ai/sync-state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3384,32 +3576,177 @@ export function StudioWorkspace() {
           enabled: aiAccessEnabled,
           token: aiToken,
           state: aiSnapshot,
+          sessionSnapshots,
         }),
       }).catch(() => {});
     }, 240);
     return () => window.clearTimeout(t);
-  }, [aiAccessEnabled, aiBridgeOpen, aiToken, aiSnapshot]);
+  }, [aiAccessEnabled, aiBridgeOpen, aiToken, aiSnapshot, activeProject, activeScene.id, currentTime, isPlaying, selection, rigNodesByInstance]);
 
   useEffect(() => {
     if (!aiAccessEnabled) return;
     const pollId = window.setInterval(() => {
-      void fetch(`/api/ai/poll?after=${lastPollMsRef.current}`)
+      const params = new URLSearchParams({
+        after: String(lastPollMsRef.current),
+        enabled: '1',
+        ...(aiToken ? { token: aiToken } : {}),
+      });
+      void fetch(`/api/ai/poll?${params.toString()}`)
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => {
-          if (!d || !Array.isArray(d.batches)) return;
-          for (const b of d.batches as { batchId?: string; source?: string; commands?: AiBridgeCommand[]; createdAt?: number }[]) {
+          if (!d) return;
+          if (Array.isArray(d.sessions)) setAiSessions(d.sessions as AiSessionSummary[]);
+          if (!Array.isArray(d.batches)) return;
+          for (const b of d.batches as {
+            batchId?: string;
+            sessionId?: string;
+            sceneId?: string;
+            sceneName?: string;
+            source?: string;
+            commands?: AiBridgeCommand[];
+            createdAt?: number;
+          }[]) {
             if (typeof b.createdAt === 'number' && b.createdAt > lastPollMsRef.current) {
               lastPollMsRef.current = b.createdAt;
             }
             if (Array.isArray(b.commands) && b.commands.length > 0 && b.batchId) {
-              enqueueAiBatch(b.commands, b.source ?? 'External AI', b.batchId);
+              enqueueAiBatch(b.commands, b.source ?? 'External AI', b.batchId, {
+                sessionId: b.sessionId,
+                sceneId: b.sceneId,
+                sceneName: b.sceneName,
+              });
             }
           }
         })
         .catch(() => {});
     }, 1200);
     return () => window.clearInterval(pollId);
-  }, [aiAccessEnabled, enqueueAiBatch]);
+  }, [aiAccessEnabled, aiToken, enqueueAiBatch]);
+
+  const handleSaveProjectToCloud = useCallback(async () => {
+    const usedAssetIds = new Set<string>();
+    for (const sc of projectRef.current.scenes) {
+      for (const ch of sc.characters) usedAssetIds.add(ch.assetId);
+      for (const pr of sc.props ?? []) {
+        if (pr.assetId) usedAssetIds.add(pr.assetId);
+      }
+    }
+    const portableAssets = assetsRef.current.filter(
+      (a) => usedAssetIds.has(a.id) && (a.htmlSource || a.kind === 'character-html'),
+    );
+    const res = await fetch('/api/projects/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        syncCode: cloudSyncCode ?? undefined,
+        project: projectRef.current,
+        assets: portableAssets,
+      }),
+    });
+    const data = (await res.json()) as {
+      ok?: boolean;
+      syncCode?: string;
+      persistedVia?: string;
+      error?: string;
+    };
+    if (!res.ok || !data.ok || !data.syncCode) {
+      throw new Error(data.error ?? 'Failed to save project to site.');
+    }
+    setCloudSyncCode(data.syncCode);
+    return { syncCode: data.syncCode, persistedVia: data.persistedVia ?? 'server' };
+  }, [cloudSyncCode]);
+
+  const handleLoadProjectFromCloud = useCallback(async (rawCodeOrUrl: string) => {
+    let code = rawCodeOrUrl.trim();
+    const match = code.match(/[?&]sync=([^&\s]+)/i);
+    if (match) code = decodeURIComponent(match[1]);
+    const res = await fetch(`/api/projects/${encodeURIComponent(code)}`);
+    const data = (await res.json()) as {
+      ok?: boolean;
+      syncCode?: string;
+      project?: ProjectData;
+      assets?: AssetRecord[];
+      error?: string;
+    };
+    if (!res.ok || !data.ok || !data.project) {
+      throw new Error(data.error ?? 'No saved project found for that Sync Code.');
+    }
+    const migrated = migrateProjectData(data.project);
+    if (Array.isArray(data.assets) && data.assets.length > 0) {
+      for (const a of data.assets) {
+        await dbSaveAsset(a);
+      }
+      setAssets((prev) => {
+        const map = new Map(prev.map((x) => [x.id, x]));
+        for (const a of data.assets!) map.set(a.id, a);
+        return Array.from(map.values());
+      });
+    }
+    await dbSaveProject(migrated);
+    setProjects((prev) => [migrated, ...prev.filter((p) => p.id !== migrated.id)]);
+    setActiveProjectId(migrated.id);
+    setSelection({ kind: 'none' });
+    commandManagerRef.current.clear();
+    if (data.syncCode) setCloudSyncCode(data.syncCode);
+    setSaveStatus('saved');
+    setNoticeMessage(`Loaded "${migrated.name}" (${migrated.scenes.length} scene(s))`);
+  }, []);
+
+  const handleExportProjectFile = useCallback(() => {
+    const usedAssetIds = new Set<string>();
+    for (const sc of projectRef.current.scenes) {
+      for (const ch of sc.characters) usedAssetIds.add(ch.assetId);
+      for (const pr of sc.props ?? []) {
+        if (pr.assetId) usedAssetIds.add(pr.assetId);
+      }
+    }
+    const bundle = {
+      format: 'stagecraft-project-v1',
+      exportedAt: Date.now(),
+      project: projectRef.current,
+      assets: assetsRef.current.filter((a) => usedAssetIds.has(a.id) && a.htmlSource),
+    };
+    const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${projectRef.current.name.replace(/[^a-z0-9_-]+/gi, '_')}.stagecraft.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const handleImportProjectFile = useCallback(async (file: File) => {
+    const text = await file.text();
+    const parsed = JSON.parse(text) as { project?: ProjectData; assets?: AssetRecord[]; scenes?: SceneData[] };
+    const rawProj = parsed.project ?? (Array.isArray(parsed.scenes) ? (parsed as unknown as ProjectData) : null);
+    if (!rawProj || !Array.isArray(rawProj.scenes)) {
+      throw new Error('Invalid .stagecraft.json project file.');
+    }
+    const migrated: ProjectData = {
+      ...migrateProjectData(rawProj),
+      id: createId('proj'),
+      updatedAt: Date.now(),
+    };
+    if (Array.isArray(parsed.assets)) {
+      for (const a of parsed.assets) {
+        await dbSaveAsset(a);
+      }
+      setAssets((prev) => {
+        const map = new Map(prev.map((x) => [x.id, x]));
+        for (const a of parsed.assets!) map.set(a.id, a);
+        return Array.from(map.values());
+      });
+    }
+    await dbSaveProject(migrated);
+    setProjects((prev) => [migrated, ...prev]);
+    setActiveProjectId(migrated.id);
+    setSelection({ kind: 'none' });
+    commandManagerRef.current.clear();
+    setSaveStatus('saved');
+    setNoticeMessage(`Opened project file "${migrated.name}" (${migrated.scenes.length} scene(s))`);
+  }, []);
 
   // Expose browser-level window.STAGECRAFT_AI for computer-use / browser agents
   useEffect(() => {
@@ -5537,6 +5874,7 @@ export function StudioWorkspace() {
         onClose={() => setProjectsOpen(false)}
         projects={projects}
         activeProjectId={activeProject.id}
+        cloudSyncCode={cloudSyncCode}
         onCreateProject={(name) => {
           handleStop();
           const proj = createBlankProject(name);
@@ -5585,6 +5923,10 @@ export function StudioWorkspace() {
             },
           });
         }}
+        onSaveProjectToCloud={handleSaveProjectToCloud}
+        onLoadProjectFromCloud={handleLoadProjectFromCloud}
+        onExportProjectFile={handleExportProjectFile}
+        onImportProjectFile={handleImportProjectFile}
       />
 
       <DialogueDialog
@@ -5709,6 +6051,9 @@ export function StudioWorkspace() {
         paused={aiPaused}
         stepDelayMs={aiStepDelayMs}
         autoHighlight={aiAutoHighlight}
+        autoSwitchSession={aiAutoSwitchSession}
+        activeSceneId={activeScene.id}
+        sessions={aiSessions}
         queueLength={aiQueueLength}
         logs={aiLogs}
         snapshot={aiSnapshot}
@@ -5723,6 +6068,7 @@ export function StudioWorkspace() {
             .then((r) => r.json())
             .then((d) => {
               if (typeof d.token === 'string') setAiToken(d.token);
+              if (Array.isArray(d.sessions)) setAiSessions(d.sessions as AiSessionSummary[]);
             })
             .catch(() => {});
         }}
@@ -5741,6 +6087,21 @@ export function StudioWorkspace() {
         onTogglePaused={() => setAiPaused((p) => !p)}
         onChangeStepDelay={setAiStepDelayMs}
         onToggleAutoHighlight={setAiAutoHighlight}
+        onToggleAutoSwitchSession={setAiAutoSwitchSession}
+        onSelectSessionScene={(targetSceneId) => {
+          const exists = activeProject.scenes.some((s) => s.id === targetSceneId);
+          if (exists) {
+            updateActiveProject((proj) => ({ ...proj, activeSceneId: targetSceneId }), false);
+            setSelection({ kind: 'none' });
+          } else {
+            const matchedSess = aiSessions.find((s) => s.sceneId === targetSceneId);
+            ensureAiSessionScene(
+              matchedSess?.sessionId ?? '',
+              targetSceneId,
+              matchedSess?.sceneName ?? 'Claude Session',
+            );
+          }
+        }}
         onUndoLastAiBatch={() => {
           const snap = aiBatchUndoStack[0];
           if (!snap) return;

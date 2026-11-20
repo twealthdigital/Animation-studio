@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { Copy, FolderOpen, Mic, Plus, Square, Trash2, Upload } from 'lucide-react';
+import { Cloud, Copy, Download, FolderOpen, Mic, Plus, Square, Trash2, Upload } from 'lucide-react';
 import type { AssetRecord, CharacterInstanceData, ProjectData, SceneData } from '../../core/types';
 import { analyzeHtmlCharacter } from '../../characters/HtmlCharacterAnalyzer';
 import { HtmlThreeAdapter } from '../../characters/HtmlThreeAdapter';
@@ -242,10 +242,15 @@ interface ProjectManagerDialogProps {
   onClose: () => void;
   projects: ProjectData[];
   activeProjectId: string;
+  cloudSyncCode: string | null;
   onCreateProject: (name: string) => void;
   onOpenProject: (projectId: string) => void;
   onDuplicateProject: (projectId: string) => void;
   onDeleteProject: (projectId: string) => void;
+  onSaveProjectToCloud: () => Promise<{ syncCode: string; persistedVia: string }>;
+  onLoadProjectFromCloud: (syncCode: string) => Promise<void>;
+  onExportProjectFile: () => void;
+  onImportProjectFile: (file: File) => Promise<void>;
 }
 
 export function ProjectManagerDialog({
@@ -253,15 +258,61 @@ export function ProjectManagerDialog({
   onClose,
   projects,
   activeProjectId,
+  cloudSyncCode,
   onCreateProject,
   onOpenProject,
   onDuplicateProject,
   onDeleteProject,
+  onSaveProjectToCloud,
+  onLoadProjectFromCloud,
+  onExportProjectFile,
+  onImportProjectFile,
 }: ProjectManagerDialogProps) {
   const [newName, setNewName] = useState('');
+  const [loadCode, setLoadCode] = useState('');
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  const handleSaveCloud = async () => {
+    setSyncBusy(true);
+    setSyncError(null);
+    setSyncStatus(null);
+    try {
+      const res = await onSaveProjectToCloud();
+      const shareUrl = `${window.location.origin}/?sync=${encodeURIComponent(res.syncCode)}`;
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+        setSyncStatus(`Saved! Sync Code: ${res.syncCode} (Share link copied to clipboard)`);
+      } catch {
+        setSyncStatus(`Saved! Sync Code: ${res.syncCode}`);
+      }
+    } catch (err) {
+      setSyncError(err instanceof Error ? err.message : 'Failed to save to site.');
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const handleLoadCloud = async () => {
+    const clean = loadCode.trim();
+    if (!clean) return;
+    setSyncBusy(true);
+    setSyncError(null);
+    setSyncStatus(null);
+    try {
+      await onLoadProjectFromCloud(clean);
+      setLoadCode('');
+      onClose();
+    } catch (err) {
+      setSyncError(err instanceof Error ? err.message : 'Could not load project for that Sync Code.');
+    } finally {
+      setSyncBusy(false);
+    }
+  };
 
   return (
-    <Dialog open={open} title="Projects" onClose={onClose}>
+    <Dialog open={open} title="Projects & Cross-Device Save" onClose={onClose}>
       <div className="space-y-4 text-xs">
         <div className="flex gap-2">
           <input
@@ -293,7 +344,67 @@ export function ProjectManagerDialog({
           </StudioButton>
         </div>
 
-        <div className="space-y-2">
+        {/* Save on Site / Load Anywhere */}
+        <div className="rounded border border-[#2a2e36] bg-[#14161a] p-2.5 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="font-semibold text-[#e6e8ec] flex items-center gap-1.5">
+              <Cloud className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
+              <span>Save &amp; Load Anywhere</span>
+            </span>
+            {cloudSyncCode && (
+              <span className="rounded bg-[#2b211a] px-1.5 py-0.5 font-mono-code text-[10px] text-[#e8702a]">
+                Code: {cloudSyncCode}
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-1.5">
+            <StudioButton variant="primary" size="xs" disabled={syncBusy} onClick={() => void handleSaveCloud()}>
+              <Cloud className="h-3 w-3" aria-hidden="true" />
+              <span>{syncBusy ? 'Saving...' : 'Save to Site & Copy Link'}</span>
+            </StudioButton>
+            <StudioButton size="xs" onClick={onExportProjectFile}>
+              <Download className="h-3 w-3" aria-hidden="true" />
+              <span>Download .stagecraft File</span>
+            </StudioButton>
+          </div>
+          <div className="flex gap-1.5">
+            <input
+              type="text"
+              placeholder="Enter Sync Code (e.g. SC-A1B2C3) or ?sync= URL"
+              value={loadCode}
+              onChange={(e) => setLoadCode(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && loadCode.trim()) void handleLoadCloud();
+              }}
+              className="h-7 flex-1 rounded border border-[#2e333d] bg-[#101215] px-2 text-xs text-[#e6e8ec] focus:border-[#e8702a] focus:outline-none"
+            />
+            <StudioButton size="xs" disabled={!loadCode.trim() || syncBusy} onClick={() => void handleLoadCloud()}>
+              <span>Load Code</span>
+            </StudioButton>
+            <label className="inline-flex h-7 cursor-pointer items-center gap-1 rounded border border-[#383e49] bg-[#1f232b] px-2 text-[11px] font-medium text-[#e6e8ec] hover:bg-[#2a2e36]">
+              <Upload className="h-3 w-3" aria-hidden="true" />
+              <span>Open File</span>
+              <input
+                type="file"
+                accept=".json,.stagecraft,.stagecraft.json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = '';
+                  if (!file) return;
+                  setSyncError(null);
+                  void onImportProjectFile(file)
+                    .then(() => onClose())
+                    .catch((err) => setSyncError(err instanceof Error ? err.message : 'Failed to import file.'));
+                }}
+              />
+            </label>
+          </div>
+          {syncStatus && <div className="text-[11px] text-[#4ade80]">{syncStatus}</div>}
+          {syncError && <div className="text-[11px] text-[#f3b3b3]">{syncError}</div>}
+        </div>
+
+        <div className="space-y-2 max-h-56 overflow-y-auto">
           {projects.map((p) => {
             const isActive = p.id === activeProjectId;
             return (
