@@ -10,6 +10,7 @@ import {
   Lightbulb,
   Link2,
   Lock,
+  Palette,
   PanelRightClose,
   PanelRightOpen,
   Play,
@@ -21,6 +22,7 @@ import {
   Smile,
   Trash2,
   Ungroup,
+  Unlock,
   Wand2,
 } from 'lucide-react';
 import type {
@@ -109,9 +111,16 @@ interface RightInspectorProps {
   rigNodesByInstance: Record<string, RigNodeInfo[]>;
   multiSelectedNodes?: MultiSelectedNodeRef[];
   getLiveNodeMaterial?: (instanceId: string, nodeId: string) => NodeMaterialOverride | null;
+  getLivePropMaterial?: (propId: string) => NodeMaterialOverride | null;
+  canBreakApartSelection?: boolean;
   onSelectTarget: (target: SelectionTarget) => void;
   onEnterPoseMode: (instanceId: string) => void;
   onGroupSelection?: () => void;
+  onBreakApartCharacter?: (instanceId: string) => void;
+  onDetachBodyPart?: (instanceId: string, nodeId: string, nodeName: string) => void;
+  onBreakApartProp?: (propId: string) => void;
+  onDetachPropAttachment?: (propId: string) => void;
+  onDeleteProp?: (propId: string) => void;
   onUpdateCharacterMeta: (instanceId: string, patch: Partial<CharacterInstanceData>) => void;
   onUpdateCharacterTransform: (instanceId: string, transform: Transform3D) => void;
   onKeyCharacterTransform: (instanceId: string, easing: EasingType) => void;
@@ -236,9 +245,16 @@ export function RightInspector({
   rigNodesByInstance,
   multiSelectedNodes = [],
   getLiveNodeMaterial,
+  getLivePropMaterial,
+  canBreakApartSelection = false,
   onSelectTarget,
   onEnterPoseMode,
   onGroupSelection,
+  onBreakApartCharacter,
+  onDetachBodyPart,
+  onBreakApartProp,
+  onDetachPropAttachment,
+  onDeleteProp,
   onUpdateCharacterMeta,
   onUpdateCharacterTransform,
   onKeyCharacterTransform,
@@ -776,16 +792,30 @@ export function RightInspector({
                 {selectedCharRigNodes.filter((n) => !n.isAuxiliary).length} joints · {rigReport?.rigKind ?? 'rig'}
               </span>
             </div>
-            <StudioButton
-              size="xs"
-              className="w-full"
-              note="Enter Pose Mode to drag & rotate joints directly without detaching"
-              shortcut="Dbl-Click"
-              onClick={() => onEnterPoseMode(char.id)}
-            >
-              <Bone className="h-3 w-3" aria-hidden="true" />
-              <span>Pose Joints</span>
-            </StudioButton>
+            <div className="grid grid-cols-1 gap-1.5">
+              <StudioButton
+                size="xs"
+                className="w-full"
+                note="Enter Pose Mode to click, highlight, move or rotate individual parts"
+                shortcut="Dbl-Click"
+                onClick={() => onEnterPoseMode(char.id)}
+              >
+                <Bone className="h-3 w-3" aria-hidden="true" />
+                <span>Pose / Pick Parts</span>
+              </StudioButton>
+              {onBreakApartCharacter && (
+                <StudioButton
+                  size="xs"
+                  className="w-full"
+                  note="Ungroup character into independent clickable parts that are no longer attached to the source"
+                  shortcut="Ctrl+Shift+G"
+                  onClick={() => onBreakApartCharacter(char.id)}
+                >
+                  <Ungroup className="h-3 w-3" aria-hidden="true" />
+                  <span>Ungroup / Break Apart</span>
+                </StudioButton>
+              )}
+            </div>
             <div className="flex flex-wrap gap-1 pt-0.5">
               {Array.from(
                 new Set(selectedCharRigNodes.flatMap((n) => n.materials ?? [])),
@@ -971,23 +1001,58 @@ export function RightInspector({
     const t = evaluatedPropTransform ?? prop.transform;
     const attachTargetChar = activeScene.characters.find((c) => c.id === prop.parentAttachment?.targetId);
     const attachNodes = attachTargetChar ? rigNodesByInstance[attachTargetChar.id] ?? [] : [];
+    const isDetachedPart = prop.kind === 'detached-part';
+    const isLocked = Boolean(prop.locked);
+    const liveMat = getLivePropMaterial ? getLivePropMaterial(prop.id) : null;
+    const effectiveMat: NodeMaterialOverride = {
+      color: prop.materialOverride?.color ?? liveMat?.color ?? prop.color ?? '#e8702a',
+      emissive: prop.materialOverride?.emissive ?? liveMat?.emissive ?? '#000000',
+      emissiveIntensity: prop.materialOverride?.emissiveIntensity ?? liveMat?.emissiveIntensity ?? 0,
+      roughness: prop.materialOverride?.roughness ?? liveMat?.roughness ?? 0.65,
+      metalness: prop.materialOverride?.metalness ?? liveMat?.metalness ?? 0.15,
+      opacity: prop.materialOverride?.opacity ?? liveMat?.opacity ?? 1,
+    };
+    const hasMatOverride = Boolean(prop.materialOverride);
 
     return (
       <div className="space-y-4">
-        <div className="flex items-center justify-between border-b border-[#2a2e36] pb-2">
-          <span className="flex items-center gap-1.5 font-semibold text-[#e6e8ec]">
-            <Shapes className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
-            <span>Prop: {prop.name}</span>
-          </span>
+        <div className="flex items-center justify-between gap-1.5 border-b border-[#2a2e36] pb-2">
+          <div className="min-w-0">
+            <div className="text-[10px] text-[#98a0ad]">
+              {isDetachedPart ? 'Independent Part' : `Prop · ${prop.kind}`}
+            </div>
+            <div className="flex items-center gap-1.5 truncate font-semibold text-[#e6e8ec]">
+              <Shapes className="h-3.5 w-3.5 shrink-0 text-[#e8702a]" aria-hidden="true" />
+              <span className="truncate">{prop.name}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <IconButton
+              label={isLocked ? `Unlock ${prop.name}` : `Lock ${prop.name}`}
+              active={isLocked}
+              onClick={() => onUpdateProp(prop.id, { locked: !isLocked })}
+            >
+              {isLocked ? (
+                <Lock className="h-3.5 w-3.5" aria-hidden="true" />
+              ) : (
+                <Unlock className="h-3.5 w-3.5" aria-hidden="true" />
+              )}
+            </IconButton>
+            {onDeleteProp && (
+              <IconButton label={`Remove ${prop.name}`} onClick={() => onDeleteProp(prop.id)}>
+                <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+              </IconButton>
+            )}
+          </div>
         </div>
 
         <label className="block">
-          <span className="text-[11px] text-[#98a0ad]">Prop Name</span>
+          <span className="text-[11px] text-[#98a0ad]">Object Name</span>
           <input
             type="text"
             value={prop.name}
             onChange={(e) => onUpdateProp(prop.id, { name: e.target.value })}
-            className="mt-1 h-7 w-full rounded border border-[#2e333d] bg-[#14161a] px-2 text-xs text-[#e6e8ec]"
+            className="mt-1 h-7 w-full rounded border border-[#2e333d] bg-[#14161a] px-2 text-xs text-[#e6e8ec] focus:border-[#e8702a] focus:outline-none"
           />
         </label>
 
@@ -1001,32 +1066,58 @@ export function RightInspector({
             />
             <span>Visible</span>
           </label>
-          <label className="flex items-center gap-2 text-xs">
-            <span className="text-[#98a0ad]">Color</span>
-            <input
-              type="color"
-              value={prop.color}
-              onChange={(e) => onUpdateProp(prop.id, { color: e.target.value })}
-              className="h-6 w-12 rounded border border-[#2e333d] bg-[#14161a]"
-            />
-          </label>
+          <span className="font-mono-code text-[10px] text-[#98a0ad]">
+            {prop.parentAttachment ? 'Attached' : 'Independent'}
+          </span>
         </div>
+
+        {(canBreakApartSelection || Boolean(prop.parentAttachment)) && (
+          <div className="space-y-1.5 rounded border border-[#2a2e36] bg-[#14161a] p-2">
+            {canBreakApartSelection && onBreakApartProp && (
+              <StudioButton
+                size="xs"
+                className="w-full"
+                shortcut="Ctrl+Shift+G"
+                note="Ungroup into smaller independent clickable pieces with separate properties"
+                onClick={() => onBreakApartProp(prop.id)}
+              >
+                <Ungroup className="h-3 w-3" aria-hidden="true" />
+                <span>Ungroup / Separate Pieces</span>
+              </StudioButton>
+            )}
+            {prop.parentAttachment && onDetachPropAttachment && (
+              <StudioButton
+                size="xs"
+                className="w-full"
+                shortcut={!canBreakApartSelection ? 'Ctrl+Shift+G' : undefined}
+                note="Detach from parent while keeping current world position"
+                onClick={() => onDetachPropAttachment(prop.id)}
+              >
+                <Ungroup className="h-3 w-3" aria-hidden="true" />
+                <span>Detach from Parent</span>
+              </StudioButton>
+            )}
+          </div>
+        )}
 
         <div className="space-y-1.5">
           <div className="text-[11px] text-[#98a0ad]">Position</div>
           <div className="grid grid-cols-3 gap-1.5">
             <NumericInput
               label="X"
+              disabled={isLocked}
               value={t.position.x}
               onChange={(x) => onUpdateProp(prop.id, { transform: { ...t, position: { ...t.position, x } } })}
             />
             <NumericInput
               label="Y"
+              disabled={isLocked}
               value={t.position.y}
               onChange={(y) => onUpdateProp(prop.id, { transform: { ...t, position: { ...t.position, y } } })}
             />
             <NumericInput
               label="Z"
+              disabled={isLocked}
               value={t.position.z}
               onChange={(z) => onUpdateProp(prop.id, { transform: { ...t, position: { ...t.position, z } } })}
             />
@@ -1037,6 +1128,7 @@ export function RightInspector({
               label="X"
               step={5}
               decimals={1}
+              disabled={isLocked}
               value={t.rotation.x * RAD_TO_DEG}
               onChange={(x) =>
                 onUpdateProp(prop.id, { transform: { ...t, rotation: { ...t.rotation, x: x * DEG_TO_RAD } } })
@@ -1046,6 +1138,7 @@ export function RightInspector({
               label="Y"
               step={5}
               decimals={1}
+              disabled={isLocked}
               value={t.rotation.y * RAD_TO_DEG}
               onChange={(y) =>
                 onUpdateProp(prop.id, { transform: { ...t, rotation: { ...t.rotation, y: y * DEG_TO_RAD } } })
@@ -1055,6 +1148,7 @@ export function RightInspector({
               label="Z"
               step={5}
               decimals={1}
+              disabled={isLocked}
               value={t.rotation.z * RAD_TO_DEG}
               onChange={(z) =>
                 onUpdateProp(prop.id, { transform: { ...t, rotation: { ...t.rotation, z: z * DEG_TO_RAD } } })
@@ -1065,19 +1159,22 @@ export function RightInspector({
           <div className="grid grid-cols-3 gap-1.5">
             <NumericInput
               label="X"
-              min={0.1}
+              min={0.05}
+              disabled={isLocked}
               value={t.scale.x}
               onChange={(x) => onUpdateProp(prop.id, { transform: { ...t, scale: { ...t.scale, x } } })}
             />
             <NumericInput
               label="Y"
-              min={0.1}
+              min={0.05}
+              disabled={isLocked}
               value={t.scale.y}
               onChange={(y) => onUpdateProp(prop.id, { transform: { ...t, scale: { ...t.scale, y } } })}
             />
             <NumericInput
               label="Z"
-              min={0.1}
+              min={0.05}
+              disabled={isLocked}
               value={t.scale.z}
               onChange={(z) => onUpdateProp(prop.id, { transform: { ...t, scale: { ...t.scale, z } } })}
             />
@@ -1086,8 +1183,111 @@ export function RightInspector({
 
         <StudioButton variant="primary" className="w-full" onClick={() => onKeyPropTransform(prop.id, easing)}>
           <Key className="h-3.5 w-3.5" aria-hidden="true" />
-          <span>Key Prop @ {currentTime.toFixed(1)}s</span>
+          <span>Key Object @ {currentTime.toFixed(1)}s</span>
         </StudioButton>
+
+        {/* Independent Color & Material Properties */}
+        <div className="space-y-2 border-t border-[#2a2e36] pt-3">
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5 font-semibold text-[#e6e8ec]">
+              <Palette className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
+              <span>Color &amp; Material</span>
+            </span>
+            {hasMatOverride && (
+              <button
+                type="button"
+                onClick={() => onUpdateProp(prop.id, { materialOverride: undefined })}
+                className="text-[10px] text-[#f5a16a] hover:underline"
+              >
+                Reset Material
+              </button>
+            )}
+          </div>
+          <div className="text-[10px] text-[#98a0ad]">
+            Independent properties for “{prop.name}”.
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="flex items-center justify-between rounded border border-[#2a2e36] bg-[#14161a] px-2 py-1 text-[11px]">
+              <span className="text-[#98a0ad]">Color</span>
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono-code text-[10px] text-[#cbd5e1]">{effectiveMat.color}</span>
+                <input
+                  type="color"
+                  aria-label={`${prop.name} color`}
+                  value={effectiveMat.color ?? '#e8702a'}
+                  onChange={(e) =>
+                    onUpdateProp(prop.id, {
+                      color: e.target.value,
+                      materialOverride: { ...effectiveMat, color: e.target.value },
+                    })
+                  }
+                  className="h-5 w-7 cursor-pointer rounded border border-[#2e333d] bg-transparent p-0"
+                />
+              </div>
+            </label>
+            <label className="flex items-center justify-between rounded border border-[#2a2e36] bg-[#14161a] px-2 py-1 text-[11px]">
+              <span className="text-[#98a0ad]">Glow</span>
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono-code text-[10px] text-[#cbd5e1]">{effectiveMat.emissive}</span>
+                <input
+                  type="color"
+                  aria-label={`${prop.name} emissive color`}
+                  value={effectiveMat.emissive ?? '#000000'}
+                  onChange={(e) =>
+                    onUpdateProp(prop.id, {
+                      materialOverride: { ...effectiveMat, emissive: e.target.value },
+                    })
+                  }
+                  className="h-5 w-7 cursor-pointer rounded border border-[#2e333d] bg-transparent p-0"
+                />
+              </div>
+            </label>
+          </div>
+          <StudioSlider
+            label="Glow Intensity"
+            min={0}
+            max={2}
+            step={0.05}
+            value={effectiveMat.emissiveIntensity ?? 0}
+            displayValue={(effectiveMat.emissiveIntensity ?? 0).toFixed(2)}
+            onChange={(emissiveIntensity) =>
+              onUpdateProp(prop.id, { materialOverride: { ...effectiveMat, emissiveIntensity } })
+            }
+          />
+          <StudioSlider
+            label="Roughness"
+            min={0}
+            max={1}
+            step={0.05}
+            value={effectiveMat.roughness ?? 0.65}
+            displayValue={(effectiveMat.roughness ?? 0.65).toFixed(2)}
+            onChange={(roughness) =>
+              onUpdateProp(prop.id, { materialOverride: { ...effectiveMat, roughness } })
+            }
+          />
+          <StudioSlider
+            label="Metalness"
+            min={0}
+            max={1}
+            step={0.05}
+            value={effectiveMat.metalness ?? 0.15}
+            displayValue={(effectiveMat.metalness ?? 0.15).toFixed(2)}
+            onChange={(metalness) =>
+              onUpdateProp(prop.id, { materialOverride: { ...effectiveMat, metalness } })
+            }
+          />
+          <StudioSlider
+            label="Opacity"
+            min={0.05}
+            max={1}
+            step={0.05}
+            value={effectiveMat.opacity ?? 1}
+            displayValue={`${Math.round((effectiveMat.opacity ?? 1) * 100)}%`}
+            onChange={(opacity) =>
+              onUpdateProp(prop.id, { materialOverride: { ...effectiveMat, opacity } })
+            }
+          />
+        </div>
 
         {/* Parent-Child Bone / Character Attachment */}
         <div className="space-y-2 border-t border-[#2a2e36] pt-3">
@@ -1104,7 +1304,8 @@ export function RightInspector({
             ]}
             onChange={(targetId) => {
               if (!targetId) {
-                onUpdateProp(prop.id, { parentAttachment: null });
+                if (onDetachPropAttachment) onDetachPropAttachment(prop.id);
+                else onUpdateProp(prop.id, { parentAttachment: null });
               } else {
                 onUpdateProp(prop.id, {
                   parentAttachment: {
@@ -1852,6 +2053,7 @@ export function RightInspector({
           onResetNodeMaterial={onResetNodeMaterial}
           onRenameNodeGroup={onRenameNodeGroup}
           onUngroupNodeGroup={onUngroupNodeGroup}
+          onDetachPart={onDetachBodyPart}
           onResetNode={onResetNodeRotation}
           onToggleNodeLock={onToggleNodeLock}
           onToggleNodeVisibility={onToggleNodeVisibility}

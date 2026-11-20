@@ -158,7 +158,9 @@ export async function buildPropObject3D(
   });
   const darkMat = new THREE.MeshStandardMaterial({ color: 0x1f242d, roughness: 0.65, metalness: 0.25 });
 
-  if (prop.kind === 'glb' && glbBinary) {
+  if (prop.kind === 'detached-part') {
+    content.userData.isDetachedPartContainer = true;
+  } else if (prop.kind === 'glb' && glbBinary) {
     const loader = new GLTFLoader();
     const gltf = await new Promise<{ scene: THREE.Group }>((resolve, reject) => {
       loader.parse(glbBinary.slice(0), '', resolve, reject);
@@ -167,50 +169,69 @@ export async function buildPropObject3D(
     if (Number.isFinite(box.min.y)) gltf.scene.position.y -= box.min.y;
     content.add(gltf.scene);
   } else if (prop.kind === 'sphere') {
-    const m = new THREE.Mesh(new THREE.SphereGeometry(0.42, 24, 18), mat);
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.42, 24, 18), mat.clone());
+    m.name = 'Sphere';
     m.position.y = 0.42;
     content.add(m);
   } else if (prop.kind === 'cylinder') {
-    const m = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 1.2, 20), mat);
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 1.2, 20), mat.clone());
+    m.name = 'Cylinder';
     m.position.y = 0.6;
     content.add(m);
   } else if (prop.kind === 'cone') {
-    const base = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.08, 0.7), darkMat);
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.08, 0.7), darkMat.clone());
+    base.name = 'Cone Base';
     base.position.y = 0.04;
-    const cone = new THREE.Mesh(new THREE.ConeGeometry(0.3, 0.85, 18), mat);
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(0.3, 0.85, 18), mat.clone());
+    cone.name = 'Cone Body';
     cone.position.y = 0.46;
     content.add(base, cone);
   } else if (prop.kind === 'podium') {
-    const step1 = new THREE.Mesh(new THREE.CylinderGeometry(2.4, 2.55, 0.28, 32), darkMat);
+    const step1 = new THREE.Mesh(new THREE.CylinderGeometry(2.4, 2.55, 0.28, 32), darkMat.clone());
+    step1.name = 'Podium Platform';
     step1.position.y = 0.14;
-    const rim = new THREE.Mesh(new THREE.CylinderGeometry(2.42, 2.42, 0.05, 32), mat);
+    const rim = new THREE.Mesh(new THREE.CylinderGeometry(2.42, 2.42, 0.05, 32), mat.clone());
+    rim.name = 'Podium Rim';
     rim.position.y = 0.27;
     content.add(step1, rim);
   } else if (prop.kind === 'desk') {
-    const top = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.12, 0.95), mat);
+    const top = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.12, 0.95), mat.clone());
+    top.name = 'Desk Top';
     top.position.y = 1.05;
-    const body = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.95, 0.78), darkMat);
+    const body = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.95, 0.78), darkMat.clone());
+    body.name = 'Desk Base';
     body.position.y = 0.48;
     content.add(top, body);
   } else if (prop.kind === 'chair') {
-    const seat = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.1, 0.75), mat);
+    const seat = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.1, 0.75), mat.clone());
+    seat.name = 'Chair Seat';
     seat.position.y = 0.65;
-    const back = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.8, 0.1), mat);
+    const back = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.8, 0.1), mat.clone());
+    back.name = 'Chair Backrest';
     back.position.set(0, 1.05, -0.32);
-    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.6, 12), darkMat);
+    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.6, 12), darkMat.clone());
+    stem.name = 'Chair Stem';
     stem.position.y = 0.32;
-    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.4, 0.07, 16), darkMat);
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.4, 0.07, 16), darkMat.clone());
+    base.name = 'Chair Base';
     base.position.y = 0.035;
     content.add(seat, back, stem, base);
   } else if (prop.kind === 'lamp') {
-    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.36, 0.08, 16), darkMat);
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.36, 0.08, 16), darkMat.clone());
+    base.name = 'Lamp Base';
     base.position.y = 0.04;
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 2.3, 10), darkMat);
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 2.3, 10), darkMat.clone());
+    pole.name = 'Lamp Pole';
     pole.position.y = 1.18;
     const shade = new THREE.Mesh(
       new THREE.CylinderGeometry(0.24, 0.42, 0.45, 16),
-      new THREE.MeshStandardMaterial({ color: prop.color || '#facc15', emissive: new THREE.Color(prop.color || '#facc15'), emissiveIntensity: 0.35 }),
+      new THREE.MeshStandardMaterial({
+        color: prop.color || '#facc15',
+        emissive: new THREE.Color(prop.color || '#facc15'),
+        emissiveIntensity: 0.35,
+      }),
     );
+    shade.name = 'Lamp Shade';
     shade.position.y = 2.35;
     content.add(base, pole, shade);
   } else if (prop.kind === 'tree') {
@@ -218,32 +239,56 @@ export async function buildPropObject3D(
       new THREE.CylinderGeometry(0.18, 0.26, 1.4, 10),
       new THREE.MeshStandardMaterial({ color: 0x6b4423, roughness: 0.9 }),
     );
+    trunk.name = 'Tree Trunk';
     trunk.position.y = 0.7;
-    const crown1 = new THREE.Mesh(new THREE.ConeGeometry(0.95, 1.4, 10), mat);
+    const crown1 = new THREE.Mesh(new THREE.ConeGeometry(0.95, 1.4, 10), mat.clone());
+    crown1.name = 'Lower Foliage';
     crown1.position.y = 1.8;
-    const crown2 = new THREE.Mesh(new THREE.ConeGeometry(0.72, 1.1, 10), mat);
+    const crown2 = new THREE.Mesh(new THREE.ConeGeometry(0.72, 1.1, 10), mat.clone());
+    crown2.name = 'Upper Foliage';
     crown2.position.y = 2.55;
     content.add(trunk, crown1, crown2);
   } else {
     // default box
-    const m = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.85, 0.85), mat);
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.85, 0.85), mat.clone());
+    m.name = 'Box';
     m.position.y = 0.425;
     content.add(m);
   }
 
-  content.traverse((obj) => {
-    obj.userData.propId = prop.id;
-    if ((obj as THREE.Mesh).isMesh) {
-      obj.castShadow = true;
-      obj.receiveShadow = true;
-    }
-  });
+  mat.dispose();
+  darkMat.dispose();
+
+  tagPropSubtree(content, prop.id, prop.name);
 
   if (prop.pivot) {
     content.position.set(-prop.pivot.x, -prop.pivot.y, -prop.pivot.z);
   }
   root.add(content);
   return root;
+}
+
+export function tagPropSubtree(root: THREE.Object3D, propId: string, propName: string): void {
+  const visit = (obj: THREE.Object3D, path: string) => {
+    obj.userData.propId = propId;
+    obj.userData.propName = propName;
+    obj.userData.propChildPath = path;
+    delete obj.userData.characterInstanceId;
+    delete obj.userData.rigNodeId;
+    delete obj.userData.rigNodeName;
+    delete obj.userData.componentGroupId;
+    delete obj.userData.componentGroupName;
+    delete obj.userData.__detachedHidden;
+    if ((obj as THREE.Mesh).isMesh) {
+      obj.castShadow = true;
+      obj.receiveShadow = true;
+      obj.frustumCulled = false;
+    }
+    obj.children.forEach((child, idx) => {
+      visit(child, path ? `${path}/${idx}` : `${idx}`);
+    });
+  };
+  visit(root, '');
 }
 
 export type SceneTemplateId = 'blank-stage' | 'talk-show' | 'outdoor-park' | 'spotlight-monologue';

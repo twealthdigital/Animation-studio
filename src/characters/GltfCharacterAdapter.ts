@@ -325,11 +325,15 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
     return readNodeMaterialSnapshot(this.nodeObjectMap.get(nodeId));
   }
 
-  setNodeVisibilityOverrides(hiddenNodeIds: string[]): void {
+  setNodeVisibilityOverrides(hiddenNodeIds: string[], detachedNodeIds: string[] = []): void {
     const hiddenSet = new Set(hiddenNodeIds);
+    const detachedSet = new Set(detachedNodeIds);
     for (const [nodeId, obj] of this.nodeObjectMap.entries()) {
       if (obj === this.rootGroup) continue;
-      obj.visible = !hiddenSet.has(nodeId) && !this.hiddenGroupIds.has(nodeId);
+      const isDetached = detachedSet.has(nodeId);
+      const isHidden = hiddenSet.has(nodeId) || this.hiddenGroupIds.has(nodeId) || isDetached;
+      obj.visible = !isHidden;
+      obj.userData.__detachedHidden = isDetached;
     }
   }
 

@@ -62,7 +62,7 @@ export interface ICharacterAdapter {
   getNodeDeltaRotation?(nodeId: string, currentEuler: { x: number; y: number; z: number }): Vec3;
   getNodeDeltaPosition?(nodeId: string, currentPos: { x: number; y: number; z: number }): Vec3;
   getNodeDeltaScale?(nodeId: string, currentScale: { x: number; y: number; z: number }): Vec3;
-  setNodeVisibilityOverrides?(hiddenNodeIds: string[]): void;
+  setNodeVisibilityOverrides?(hiddenNodeIds: string[], detachedNodeIds?: string[]): void;
   syncNodeGroups?(groups: CharacterNodeGroup[]): void;
   applyNodeMaterialOverrides?(overrides: Record<string, NodeMaterialOverride>): void;
   getNodeMaterialInfo?(nodeId: string): NodeMaterialOverride | null;

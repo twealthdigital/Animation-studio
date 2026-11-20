@@ -189,6 +189,8 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
   private lastMaterialSig = '';
   private pendingFacial: FacialState | null = null;
   private morphMeshes: THREE.Mesh[] = [];
+  private lastHiddenNodeIds: string[] = [];
+  private lastDetachedNodeIds: string[] = [];
 
   constructor(instanceId: string, assetId: string, htmlSource: string, includeStageProps = false) {
     this.instanceId = instanceId;
@@ -396,6 +398,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     this.characterGroup = primaryGroup;
     this.groundWrapper.add(primaryGroup);
     this.stagePropsGroup.visible = this.includeStageProps;
+    this.stagePropsGroup.userData.__isStagePropsGroup = true;
     this.groundWrapper.add(this.stagePropsGroup);
     this.rootGroup.add(this.groundWrapper);
 
@@ -837,11 +840,17 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     return readNodeMaterialSnapshot(this.nodeObjectMap.get(nodeId));
   }
 
-  setNodeVisibilityOverrides(hiddenNodeIds: string[]): void {
+  setNodeVisibilityOverrides(hiddenNodeIds: string[], detachedNodeIds: string[] = []): void {
+    this.lastHiddenNodeIds = hiddenNodeIds;
+    this.lastDetachedNodeIds = detachedNodeIds;
     const hiddenSet = new Set(hiddenNodeIds);
+    const detachedSet = new Set(detachedNodeIds);
     for (const [nodeId, obj] of this.nodeObjectMap.entries()) {
       if (nodeId === 'node_0') continue;
-      obj.visible = !hiddenSet.has(nodeId) && !this.hiddenGroupIds.has(nodeId);
+      const isDetached = detachedSet.has(nodeId);
+      const isHidden = hiddenSet.has(nodeId) || this.hiddenGroupIds.has(nodeId) || isDetached;
+      obj.visible = !isHidden;
+      obj.userData.__detachedHidden = isDetached;
     }
   }
 
@@ -1075,6 +1084,9 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     this.frameCallback(this.virtualTimeMs);
     // 2. Apply user body-part keyframes / IK / preset overrides AFTER native frame so they always stick!
     this.applyPendingNodeTransforms();
+    if (this.lastHiddenNodeIds.length > 0 || this.lastDetachedNodeIds.length > 0 || this.hiddenGroupIds.size > 0) {
+      this.setNodeVisibilityOverrides(this.lastHiddenNodeIds, this.lastDetachedNodeIds);
+    }
     if (this.pendingFacial) {
       this.applyFacialState(this.pendingFacial);
     }

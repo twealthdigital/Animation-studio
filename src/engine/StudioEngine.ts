@@ -5,6 +5,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import type {
   AxisConstraint,
   CameraPose,
+  DetachedPartSource,
   EditorCameraPreset,
   GizmoMode,
   GizmoSpace,
@@ -12,6 +13,7 @@ import type {
   IkChainType,
   IkTargetData,
   MotionPathData,
+  NodeMaterialOverride,
   SceneGroupData,
   SceneLightData,
   ScenePropData,
@@ -24,8 +26,20 @@ import type {
 import { sampleMotionPathCurve } from '../animation/MotionPath';
 import type { EvaluatedGroupState, EvaluatedLightState, EvaluatedPropState } from '../animation/SceneEvaluator';
 import type { AnyCharacterAdapter } from '../characters/CharacterRegistry';
-import { buildPropObject3D } from './PropsFactory';
+import { HtmlThreeAdapter } from '../characters/HtmlThreeAdapter';
+import { GltfCharacterAdapter } from '../characters/GltfCharacterAdapter';
+import { buildPropObject3D, tagPropSubtree } from './PropsFactory';
 import { RigVisualizer } from './RigVisualizer';
+
+export interface DetachedPartExtraction {
+  name: string;
+  transform: Transform3D;
+  color: string;
+  detachedSource: DetachedPartSource;
+  sourceNodeId?: string;
+  sourceChildPath?: string;
+  templateGroup: THREE.Group;
+}
 
 export type CameraViewMode = 'editor' | 'scene';
 
@@ -49,6 +63,7 @@ export interface StudioEngineCallbacks {
   onGroupTransformCommit?: (groupId: string, transform: Transform3D) => void;
   onLightPositionCommit: (lightId: string, position: Vec3) => void;
   onCameraTransformCommit: (pose: CameraPose) => void;
+  onSceneCameraZoom?: (factor: number) => void;
   onWaypointTransformCommit: (
     ownerId: string,
     ownerKind: 'character' | 'prop' | 'camera',
@@ -103,6 +118,7 @@ export class StudioEngine {
   private readonly floorMesh: THREE.Mesh;
   private readonly sceneCameraMarker: THREE.Group;
   private readonly selectionBoxHelper: THREE.BoxHelper;
+  private readonly selectionBoxesGroup = new THREE.Group();
   private readonly hoverBoxHelper: THREE.BoxHelper;
   private readonly marqueeOverlay: HTMLDivElement;
   private readonly motionPathGroup = new THREE.Group();
@@ -116,6 +132,20 @@ export class StudioEngine {
   private readonly adapters = new Map<string, AnyCharacterAdapter>();
   private readonly propObjects = new Map<string, THREE.Group>();
   private readonly propHashes = new Map<string, string>();
+  private readonly propMaterialSigs = new Map<string, string>();
+  private readonly detachedTemplates = new Map<string, THREE.Group>();
+  private readonly propBaseMaterials = new WeakMap<
+    THREE.Mesh,
+    Array<{
+      colorHex?: number;
+      emissiveHex?: number;
+      emissiveIntensity?: number;
+      roughness?: number;
+      metalness?: number;
+      opacity?: number;
+      transparent?: boolean;
+    }>
+  >();
   private readonly groupProxies = new Map<string, THREE.Group>();
   private readonly groupMeta = new Map<string, { name: string; locked: boolean; memberIds: string[] }>();
   private readonly memberToGroup = new Map<string, string>();
@@ -123,16 +153,23 @@ export class StudioEngine {
   private readonly lightMarkers = new Map<string, THREE.Mesh>();
   private readonly lockedObjects = new Set<string>();
   private readonly lockedCharacterNodes = new Map<string, Set<string>>();
+  private readonly multiSelectedIds = new Set<string>();
   private readonly multiSelectedNodeKeys = new Set<string>();
   private readonly waypointNodes = new Map<
     string,
     { ownerId: string; ownerKind: 'character' | 'prop' | 'camera'; pointId: string; kind: 'point' | 'in' | 'out'; mesh: THREE.Mesh }
   >();
 
+  // Selection highlight state (restored cleanly before material reads/writes/exports)
+  private readonly restoredSelectionHighlights = new Map<
+    THREE.Material,
+    { emissiveHex?: number; emissiveIntensity?: number; colorHex?: number }
+  >();
+
   // Hover highlight state (zero material cloning / allocation)
   private readonly restoredHoverEmissives = new Map<
-    THREE.MeshStandardMaterial,
-    { hex: number; intensity: number }
+    THREE.Material,
+    { emissiveHex?: number; emissiveIntensity?: number; colorHex?: number }
   >();
   private lastHoverRayMs = 0;
   private lastHover: HoverTargetInfo | null = null;
@@ -308,10 +345,16 @@ export class StudioEngine {
 
     this.selectionBoxHelper = new THREE.BoxHelper(new THREE.Object3D(), 0xe8702a);
     this.selectionBoxHelper.visible = false;
+    this.selectionBoxHelper.userData.__isSelectionHighlight = true;
     this.scene.add(this.selectionBoxHelper);
+
+    this.selectionBoxesGroup.name = 'selection_boxes_group';
+    this.selectionBoxesGroup.userData.__isSelectionHighlight = true;
+    this.scene.add(this.selectionBoxesGroup);
 
     this.hoverBoxHelper = new THREE.BoxHelper(new THREE.Object3D(), 0x67e8f9);
     this.hoverBoxHelper.visible = false;
+    this.hoverBoxHelper.userData.__isSelectionHighlight = true;
     this.scene.add(this.hoverBoxHelper);
 
     this.scene.add(this.motionPathGroup);
@@ -323,15 +366,20 @@ export class StudioEngine {
     this.orbitControls.dampingFactor = 0.08;
     this.orbitControls.target.set(0, 1.8, 0);
     this.orbitControls.maxPolarAngle = Math.PI * 0.495;
-    this.orbitControls.minDistance = 0.7;
-    this.orbitControls.maxDistance = 48;
-    this.orbitControls.zoomToCursor = true;
+    this.orbitControls.minDistance = 0.15;
+    this.orbitControls.maxDistance = 90;
+    this.orbitControls.minZoom = 0.12;
+    this.orbitControls.maxZoom = 35;
+    // Touch pinch uses OrbitControls; mouse wheel & trackpad pinch are intercepted in capture phase by handleWheel.
+    this.orbitControls.enableZoom = true;
     this.applyMouseButtonsForGizmoMode();
     this.orbitControls.addEventListener('start', () => {
       this.focusAnim = null;
     });
     this.orbitControls.addEventListener('change', () => {
-      this.syncEditorOrthoCamera();
+      if (this.editorProjection === 'perspective') {
+        this.syncEditorOrthoCamera();
+      }
       this.requestRender();
     });
 
@@ -350,9 +398,7 @@ export class StudioEngine {
     });
 
     this.transformControls.addEventListener('objectChange', () => {
-      if (this.selectionBoxHelper.visible) {
-        this.selectionBoxHelper.update();
-      }
+      this.updateSelectionBoxesOnly();
       if (this.lastRigInstanceId) {
         this.rigVisualizer.updateLivePositions(
           this.adapters.get(this.lastRigInstanceId),
@@ -363,6 +409,7 @@ export class StudioEngine {
     });
 
     const dom = this.renderer.domElement;
+    dom.addEventListener('wheel', this.handleWheel, { passive: false, capture: true });
     dom.addEventListener('pointerdown', this.handlePointerDown);
     dom.addEventListener('pointermove', this.handlePointerMove);
     dom.addEventListener('pointerup', this.handlePointerUp);
@@ -404,29 +451,129 @@ export class StudioEngine {
     return this.editorProjection === 'orthographic' ? this.editorOrthoCamera : this.editorCamera;
   }
 
-  private syncEditorOrthoCamera(): void {
+  private syncEditorOrthoCamera(updatePoseFromPerspective = true): void {
     const w = Math.max(1, this.container.clientWidth);
     const h = Math.max(1, this.container.clientHeight);
     const aspect = w / h;
-    const dist = this.editorCamera.position.distanceTo(this.orbitControls.target);
-    this.editorOrthoSize = Math.max(0.8, dist * 0.42);
+    if (updatePoseFromPerspective) {
+      const dist = this.editorCamera.position.distanceTo(this.orbitControls.target);
+      this.editorOrthoSize = Math.max(0.5, dist * 0.42);
+      this.editorOrthoCamera.zoom = 1;
+      this.editorOrthoCamera.position.copy(this.editorCamera.position);
+      this.editorOrthoCamera.quaternion.copy(this.editorCamera.quaternion);
+    }
     this.editorOrthoCamera.left = -this.editorOrthoSize * aspect;
     this.editorOrthoCamera.right = this.editorOrthoSize * aspect;
     this.editorOrthoCamera.top = this.editorOrthoSize;
     this.editorOrthoCamera.bottom = -this.editorOrthoSize;
-    this.editorOrthoCamera.position.copy(this.editorCamera.position);
-    this.editorOrthoCamera.quaternion.copy(this.editorCamera.quaternion);
     this.editorOrthoCamera.updateProjectionMatrix();
   }
 
   setEditorProjection(projection: 'perspective' | 'orthographic'): void {
+    if (this.editorProjection === projection) return;
+    if (projection === 'orthographic') {
+      this.syncEditorOrthoCamera(true);
+    } else {
+      // Preserve current ortho view direction & effective zoom distance when returning to perspective
+      const dir = this.editorOrthoCamera.position.clone().sub(this.orbitControls.target);
+      if (dir.lengthSq() < 1e-4) dir.set(0.5, 0.3, 1);
+      dir.normalize();
+      const effectiveSize = this.editorOrthoSize / Math.max(0.12, this.editorOrthoCamera.zoom);
+      const nextDist = THREE.MathUtils.clamp(effectiveSize / 0.42, 0.25, 85);
+      this.editorCamera.position.copy(this.orbitControls.target).addScaledVector(dir, nextDist);
+      this.editorCamera.lookAt(this.orbitControls.target);
+    }
     this.editorProjection = projection;
-    this.syncEditorOrthoCamera();
     const cam = this.getActiveEditorCamera();
     this.orbitControls.object = cam;
     this.transformControls.camera = cam;
     this.orbitControls.update();
     this.requestRender();
+  }
+
+  /**
+   * Smoothly zooms in (`factor < 1`) or out (`factor > 1`) across Perspective, Orthographic,
+   * and Final Camera views. Optionally anchors zoom toward the cursor position on screen.
+   */
+  zoomBy(factor: number, cursorClient?: { x: number; y: number }): void {
+    if (!Number.isFinite(factor) || factor <= 0) return;
+    this.focusAnim = null;
+
+    if (this.viewMode === 'scene') {
+      this.callbacks.onSceneCameraZoom?.(factor);
+      return;
+    }
+
+    const clampedFactor = THREE.MathUtils.clamp(factor, 0.5, 2.0);
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const hasCursor = Boolean(cursorClient && rect.width > 0 && rect.height > 0);
+    const ndcX = hasCursor ? ((cursorClient!.x - rect.left) / rect.width) * 2 - 1 : 0;
+    const ndcY = hasCursor ? -((cursorClient!.y - rect.top) / rect.height) * 2 + 1 : 0;
+
+    if (this.editorProjection === 'orthographic') {
+      const cam = this.editorOrthoCamera;
+      const mouseBefore = hasCursor ? new THREE.Vector3(ndcX, ndcY, 0).unproject(cam) : null;
+      const prevZoom = cam.zoom;
+      const nextZoom = THREE.MathUtils.clamp(prevZoom / clampedFactor, 0.12, 35);
+      if (Math.abs(nextZoom - prevZoom) < 1e-6) return;
+      cam.zoom = nextZoom;
+      cam.updateProjectionMatrix();
+
+      if (mouseBefore) {
+        const mouseAfter = new THREE.Vector3(ndcX, ndcY, 0).unproject(cam);
+        const shift = mouseBefore.sub(mouseAfter);
+        cam.position.add(shift);
+        this.orbitControls.target.add(shift);
+      }
+      cam.updateMatrixWorld();
+      this.orbitControls.update();
+      this.rigVisualizer.updateScales(cam);
+      this.requestRender();
+      return;
+    }
+
+    // Perspective camera zoom
+    const cam = this.editorCamera;
+    const target = this.orbitControls.target;
+    const offset = cam.position.clone().sub(target);
+    const currentDist = offset.length();
+    if (currentDist < 1e-5) {
+      offset.set(0, 0.5, 2);
+    }
+    const minDist = this.orbitControls.minDistance;
+    const maxDist = this.orbitControls.maxDistance;
+    const nextDist = THREE.MathUtils.clamp(currentDist * clampedFactor, minDist, maxDist);
+    const distDelta = currentDist - nextDist;
+    if (Math.abs(distDelta) < 1e-6) return;
+
+    if (hasCursor && clampedFactor < 1) {
+      // Gently steer toward the cursor ray while zooming in so tiny pieces stay under the pointer
+      this.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), cam);
+      const rayDir = this.raycaster.ray.direction.clone().normalize();
+      const camForward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
+      const lateralShift = rayDir
+        .clone()
+        .sub(camForward.multiplyScalar(rayDir.dot(camForward)))
+        .multiplyScalar(distDelta * 0.65);
+      target.add(lateralShift);
+    }
+
+    offset.setLength(nextDist);
+    cam.position.copy(target).add(offset);
+    cam.lookAt(target);
+    cam.updateMatrixWorld();
+    this.syncEditorOrthoCamera(true);
+    this.orbitControls.update();
+    this.rigVisualizer.updateScales(cam);
+    this.requestRender();
+  }
+
+  zoomIn(): void {
+    this.zoomBy(0.8);
+  }
+
+  zoomOut(): void {
+    this.zoomBy(1.25);
   }
 
   setEditorCameraPreset(preset: EditorCameraPreset): void {
@@ -547,26 +694,63 @@ export class StudioEngine {
     return c;
   }
 
+  private isObjectEffectivelyVisible(obj: THREE.Object3D): boolean {
+    let cur: THREE.Object3D | null = obj;
+    while (cur) {
+      if (!cur.visible) return false;
+      if (cur.userData?.__detachedHidden === true) return false;
+      if (cur.userData?.__isSelectionHighlight === true) return false;
+      if (cur === this.scene) return true;
+      cur = cur.parent;
+    }
+    return false;
+  }
+
+  private computeVisibleBox3(root: THREE.Object3D): THREE.Box3 {
+    const box = new THREE.Box3();
+    root.updateMatrixWorld(true);
+    const meshBox = new THREE.Box3();
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.geometry) return;
+      if (!this.isObjectEffectivelyVisible(mesh)) return;
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      if (!mesh.geometry.boundingBox) return;
+      meshBox.copy(mesh.geometry.boundingBox).applyMatrix4(mesh.matrixWorld);
+      box.union(meshBox);
+    });
+    return box;
+  }
+
   private getSelectionWorldBox(): THREE.Box3 | null {
     const box = new THREE.Box3();
     if (this.currentSelection.kind === 'character') {
       const a = this.adapters.get(this.currentSelection.instanceId);
-      if (a) return box.setFromObject(a.rootGroup);
+      if (a) {
+        const b = this.computeVisibleBox3(a.rootGroup);
+        if (!b.isEmpty()) return b;
+      }
     } else if (this.currentSelection.kind === 'body-part') {
       const a = this.adapters.get(this.currentSelection.instanceId);
       const n = a && 'getNodeObject' in a && typeof a.getNodeObject === 'function' ? a.getNodeObject(this.currentSelection.nodeId) : undefined;
-      if (n) return box.setFromObject(n);
+      if (n) {
+        const b = this.computeVisibleBox3(n);
+        if (!b.isEmpty()) return b;
+      }
     } else if (this.currentSelection.kind === 'prop') {
       const p = this.propObjects.get(this.currentSelection.propId);
-      if (p) return box.setFromObject(p);
+      if (p) {
+        const b = this.computeVisibleBox3(p);
+        if (!b.isEmpty()) return b;
+      }
     } else if (this.currentSelection.kind === 'group') {
       const meta = this.groupMeta.get(this.currentSelection.groupId);
       if (meta) {
         for (const id of meta.memberIds) {
           const ch = this.adapters.get(id);
-          if (ch) box.expandByObject(ch.rootGroup);
+          if (ch) box.union(this.computeVisibleBox3(ch.rootGroup));
           const pr = this.propObjects.get(id);
-          if (pr) box.expandByObject(pr);
+          if (pr) box.union(this.computeVisibleBox3(pr));
         }
         if (!box.isEmpty()) return box;
       }
@@ -598,15 +782,14 @@ export class StudioEngine {
     this.lightMarkersGroup.visible = isEditor;
     this.rigOverlayGroup.visible = isEditor && this.showRigOverlay;
     this.transformControls.getHelper().visible = isEditor;
-    this.selectionBoxHelper.visible =
-      isEditor &&
-      (this.currentSelection.kind === 'character' ||
-        this.currentSelection.kind === 'prop' ||
-        this.currentSelection.kind === 'body-part' ||
-        this.currentSelection.kind === 'group');
+    this.selectionBoxesGroup.visible = isEditor;
+    this.selectionBoxHelper.visible = false;
     this.motionPathGroup.visible = isEditor;
     if (!isEditor) {
       this.clearHoverHighlight();
+      this.clearSelectionHighlight();
+    } else {
+      this.refreshSelectionVisuals();
     }
     this.requestRender();
   }
@@ -647,9 +830,17 @@ export class StudioEngine {
     }
   }
 
+  setMultiSelectedIds(ids: string[]): void {
+    this.multiSelectedIds.clear();
+    for (const id of ids) this.multiSelectedIds.add(id);
+    this.refreshSelectionVisuals();
+    this.requestRender();
+  }
+
   setMultiSelectedNodeKeys(keys: string[]): void {
     this.multiSelectedNodeKeys.clear();
     for (const k of keys) this.multiSelectedNodeKeys.add(k);
+    this.refreshSelectionVisuals();
     this.rebuildRigVisuals();
     this.requestRender();
   }
@@ -723,6 +914,8 @@ export class StudioEngine {
   }
 
   resetEditorCamera(): void {
+    this.editorOrthoCamera.zoom = 1;
+    this.editorOrthoCamera.updateProjectionMatrix();
     this.focusAnim = {
       targetPos: new THREE.Vector3(7.5, 4.8, 12.8),
       targetLook: new THREE.Vector3(0, 1.8, 0),
@@ -911,42 +1104,617 @@ export class StudioEngine {
     }
   }
 
+  /* ---------- Detached Part Extraction, Registration & Material Editing ---------- */
+
+  registerDetachedTemplate(propId: string, templateGroup: THREE.Group): void {
+    this.detachedTemplates.set(propId, templateGroup);
+  }
+
+  private cloneWithUniqueMaterials(source: THREE.Object3D): THREE.Object3D {
+    const clone = source.clone(true);
+    clone.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.frustumCulled = false;
+      if (Array.isArray(mesh.material)) {
+        mesh.material = mesh.material.map((m) => m.clone());
+      } else if (mesh.material) {
+        mesh.material = mesh.material.clone();
+      }
+      if (mesh.geometry) {
+        mesh.geometry.computeBoundingBox();
+        mesh.geometry.computeBoundingSphere();
+      }
+    });
+    return clone;
+  }
+
+  private readPrimaryColorHex(root: THREE.Object3D): string {
+    let hex = '#e8702a';
+    root.traverse((obj) => {
+      if (hex !== '#e8702a') return;
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.material) return;
+      const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+      const std = mat as THREE.MeshStandardMaterial;
+      if (std && 'color' in std && std.color) {
+        hex = `#${std.color.getHexString()}`;
+      }
+    });
+    return hex;
+  }
+
+  private hasVisibleMesh(root: THREE.Object3D): boolean {
+    let found = false;
+    root.traverse((obj) => {
+      if (found) return;
+      const mesh = obj as THREE.Mesh;
+      if (mesh.isMesh && this.isObjectEffectivelyVisible(mesh)) {
+        found = true;
+      }
+    });
+    return found;
+  }
+
+  private cloneSubtreeCentered(sourceObj: THREE.Object3D): {
+    templateGroup: THREE.Group;
+    transform: Transform3D;
+    color: string;
+  } {
+    // Strip any temporary editor highlights before cloning so base colors remain authentic
+    this.clearHoverEmissivesOnly();
+    this.clearSelectionHighlight();
+
+    sourceObj.updateMatrixWorld(true);
+    const worldBox = this.computeVisibleBox3(sourceObj);
+    const worldCenter = new THREE.Vector3();
+    if (!worldBox.isEmpty()) {
+      worldBox.getCenter(worldCenter);
+    } else {
+      sourceObj.getWorldPosition(worldCenter);
+    }
+
+    const worldPos = new THREE.Vector3();
+    const worldQuat = new THREE.Quaternion();
+    const worldScale = new THREE.Vector3();
+    sourceObj.matrixWorld.decompose(worldPos, worldQuat, worldScale);
+
+    // Ensure non-zero scale for safe matrix inversion
+    const safeScale = new THREE.Vector3(
+      Math.abs(worldScale.x) < 1e-4 ? 1 : worldScale.x,
+      Math.abs(worldScale.y) < 1e-4 ? 1 : worldScale.y,
+      Math.abs(worldScale.z) < 1e-4 ? 1 : worldScale.z,
+    );
+
+    const pivotMatrix = new THREE.Matrix4().compose(worldCenter, worldQuat, safeScale);
+    const invPivotMatrix = pivotMatrix.clone().invert();
+    const localMatrix = invPivotMatrix.multiply(sourceObj.matrixWorld.clone());
+
+    const cloned = this.cloneWithUniqueMaterials(sourceObj);
+    cloned.visible = true;
+    cloned.traverse((o) => {
+      delete o.userData.__detachedHidden;
+      delete o.userData.characterInstanceId;
+      delete o.userData.rigNodeId;
+      delete o.userData.rigNodeName;
+      delete o.userData.componentGroupId;
+      delete o.userData.componentGroupName;
+    });
+
+    const locPos = new THREE.Vector3();
+    const locQuat = new THREE.Quaternion();
+    const locScale = new THREE.Vector3();
+    localMatrix.decompose(locPos, locQuat, locScale);
+    cloned.position.copy(locPos);
+    cloned.quaternion.copy(locQuat);
+    cloned.scale.copy(locScale);
+
+    const templateGroup = new THREE.Group();
+    templateGroup.name = sourceObj.name || 'Detached Part';
+    templateGroup.add(cloned);
+
+    const euler = new THREE.Euler().setFromQuaternion(worldQuat, 'XYZ');
+    const color = this.readPrimaryColorHex(templateGroup);
+
+    this.refreshSelectionVisuals();
+
+    return {
+      templateGroup,
+      transform: {
+        position: { x: worldCenter.x, y: worldCenter.y, z: worldCenter.z },
+        rotation: { x: euler.x, y: euler.y, z: euler.z },
+        scale: { x: safeScale.x, y: safeScale.y, z: safeScale.z },
+      },
+      color,
+    };
+  }
+
+  private getDirectBreakableChildren(root: THREE.Object3D): THREE.Object3D[] {
+    let container = root;
+    let depth = 0;
+    while (depth < 6) {
+      const visibleMeshChildren = container.children.filter((ch) => {
+        if (!ch.visible || ch.userData?.__detachedHidden || ch.userData?.__isStagePropsGroup) return false;
+        return this.hasVisibleMesh(ch);
+      });
+      if (visibleMeshChildren.length >= 2) {
+        return visibleMeshChildren;
+      }
+      if (visibleMeshChildren.length === 1 && !(visibleMeshChildren[0] as THREE.Mesh).isMesh) {
+        container = visibleMeshChildren[0];
+        depth += 1;
+        continue;
+      }
+      return visibleMeshChildren;
+    }
+    return [];
+  }
+
+  extractDetachedPartsForCharacter(
+    instanceId: string,
+    sourceAssetId: string,
+    alreadyDetachedNodeIds: string[] = [],
+  ): { parts: DetachedPartExtraction[]; detachedNodeIds: string[]; allDetached: boolean } {
+    const adapter = this.adapters.get(instanceId);
+    if (!adapter || !('getNodeObject' in adapter) || typeof adapter.getNodeObject !== 'function') {
+      return { parts: [], detachedNodeIds: [], allDetached: false };
+    }
+    const rootNode = adapter.getNodeObject('node_0') ?? adapter.rootGroup;
+    const rigNodes =
+      'getRigNodes' in adapter && typeof adapter.getRigNodes === 'function' ? adapter.getRigNodes() : [];
+    const nodeNameByObj = new Map<THREE.Object3D, { nodeId: string; name: string }>();
+    for (const rn of rigNodes) {
+      const obj = adapter.getNodeObject(rn.nodeId);
+      if (obj) nodeNameByObj.set(obj, { nodeId: rn.nodeId, name: rn.name });
+    }
+
+    const detachedSet = new Set(alreadyDetachedNodeIds);
+    const children = this.getDirectBreakableChildren(rootNode);
+    const parts: DetachedPartExtraction[] = [];
+    const newlyDetachedIds: string[] = [];
+
+    children.forEach((child, idx) => {
+      const meta = nodeNameByObj.get(child);
+      const nodeId =
+        meta?.nodeId ??
+        (typeof child.userData?.rigNodeId === 'string' ? child.userData.rigNodeId : undefined);
+      if (nodeId && detachedSet.has(nodeId)) return;
+
+      const label =
+        meta?.name ||
+        (typeof child.userData?.rigNodeName === 'string' ? child.userData.rigNodeName : '') ||
+        child.name ||
+        `Part ${idx + 1}`;
+      const { templateGroup, transform, color } = this.cloneSubtreeCentered(child);
+      parts.push({
+        name: label,
+        transform,
+        color,
+        sourceNodeId: nodeId,
+        detachedSource: {
+          originKind: 'character-node',
+          sourceAssetId,
+          sourceCharacterId: instanceId,
+          sourceNodeId: nodeId,
+          sourceChildPath: nodeId ? undefined : `${idx}`,
+          sourceColor: color,
+        },
+        templateGroup,
+      });
+      if (nodeId) newlyDetachedIds.push(nodeId);
+    });
+
+    // Check if any visible meshes remain outside the newly extracted children
+    const allDetached = parts.length > 0 && children.length === parts.length;
+    return { parts, detachedNodeIds: newlyDetachedIds, allDetached };
+  }
+
+  extractSingleBodyPart(
+    instanceId: string,
+    sourceAssetId: string,
+    nodeId: string,
+    nodeName: string,
+  ): DetachedPartExtraction | null {
+    const adapter = this.adapters.get(instanceId);
+    if (!adapter || !('getNodeObject' in adapter) || typeof adapter.getNodeObject !== 'function') {
+      return null;
+    }
+    const nodeObj = adapter.getNodeObject(nodeId);
+    if (!nodeObj || !this.hasVisibleMesh(nodeObj)) return null;
+    const { templateGroup, transform, color } = this.cloneSubtreeCentered(nodeObj);
+    return {
+      name: nodeName || nodeObj.name || 'Detached Part',
+      transform,
+      color,
+      sourceNodeId: nodeId,
+      detachedSource: {
+        originKind: 'character-node',
+        sourceAssetId,
+        sourceCharacterId: instanceId,
+        sourceNodeId: nodeId,
+        sourceColor: color,
+      },
+      templateGroup,
+    };
+  }
+
+  extractSubPartsForProp(prop: ScenePropData): DetachedPartExtraction[] {
+    const propObj = this.propObjects.get(prop.id);
+    if (!propObj) return [];
+    const content = propObj.children[0] ?? propObj;
+    const children = this.getDirectBreakableChildren(content);
+    if (children.length < 2) return [];
+
+    const parts: DetachedPartExtraction[] = [];
+    children.forEach((child, idx) => {
+      const label =
+        (child.name && child.name.trim()) ||
+        (typeof child.userData?.rigNodeName === 'string' && child.userData.rigNodeName) ||
+        `${prop.name} ${idx + 1}`;
+      const { templateGroup, transform, color } = this.cloneSubtreeCentered(child);
+      const childPathRel =
+        typeof child.userData?.propChildPath === 'string' && child.userData.propChildPath
+          ? child.userData.propChildPath
+          : `${idx}`;
+      const parentSource = prop.detachedSource;
+      const combinedPath = parentSource?.sourceChildPath
+        ? `${parentSource.sourceChildPath}/${childPathRel}`
+        : childPathRel;
+
+      const detachedSource: DetachedPartSource = parentSource
+        ? {
+            ...parentSource,
+            sourceChildPath: combinedPath,
+            sourceColor: color,
+          }
+        : {
+            originKind: 'prop-part',
+            sourcePropKind: prop.kind,
+            sourcePropAssetId: prop.assetId,
+            sourceChildPath: childPathRel,
+            sourceColor: prop.color,
+          };
+
+      parts.push({
+        name: label,
+        transform,
+        color,
+        sourceChildPath: childPathRel,
+        detachedSource,
+        templateGroup,
+      });
+    });
+    return parts;
+  }
+
+  canBreakApartTarget(target: SelectionTarget): boolean {
+    if (target.kind === 'group') return true;
+    if (target.kind === 'body-part') return target.nodeId !== 'node_0';
+    if (target.kind === 'character') {
+      const adapter = this.adapters.get(target.instanceId);
+      if (!adapter || !('getNodeObject' in adapter) || typeof adapter.getNodeObject !== 'function') {
+        return false;
+      }
+      const rootNode = adapter.getNodeObject('node_0') ?? adapter.rootGroup;
+      return this.getDirectBreakableChildren(rootNode).length >= 1;
+    }
+    if (target.kind === 'prop') {
+      const propObj = this.propObjects.get(target.propId);
+      if (!propObj) return false;
+      const content = propObj.children[0] ?? propObj;
+      return this.getDirectBreakableChildren(content).length >= 2;
+    }
+    return false;
+  }
+
+  getPropWorldTransform(propId: string): Transform3D | null {
+    const obj = this.propObjects.get(propId);
+    if (!obj) return null;
+    obj.updateMatrixWorld(true);
+    const pos = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    obj.matrixWorld.decompose(pos, quat, scale);
+    const euler = new THREE.Euler().setFromQuaternion(quat, 'XYZ');
+    return {
+      position: { x: pos.x, y: pos.y, z: pos.z },
+      rotation: { x: euler.x, y: euler.y, z: euler.z },
+      scale: { x: scale.x, y: scale.y, z: scale.z },
+    };
+  }
+
+  private snapshotPropBaseMaterials(root: THREE.Object3D): void {
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.material || this.propBaseMaterials.has(mesh)) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      this.propBaseMaterials.set(
+        mesh,
+        mats.map((m) => {
+          const std = m as THREE.MeshStandardMaterial;
+          return {
+            colorHex: 'color' in std && std.color ? std.color.getHex() : undefined,
+            emissiveHex: 'emissive' in std && std.emissive ? std.emissive.getHex() : undefined,
+            emissiveIntensity: typeof std.emissiveIntensity === 'number' ? std.emissiveIntensity : undefined,
+            roughness: typeof std.roughness === 'number' ? std.roughness : undefined,
+            metalness: typeof std.metalness === 'number' ? std.metalness : undefined,
+            opacity: typeof m.opacity === 'number' ? m.opacity : 1,
+            transparent: Boolean(m.transparent),
+          };
+        }),
+      );
+    });
+  }
+
+  private applyPropMaterialOverrideToObject(root: THREE.Object3D, override?: NodeMaterialOverride): void {
+    this.clearHoverEmissivesOnly();
+    this.clearSelectionHighlight();
+    this.snapshotPropBaseMaterials(root);
+
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.material) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const baseList = this.propBaseMaterials.get(mesh);
+
+      mats.forEach((m, idx) => {
+        const std = m as THREE.MeshStandardMaterial;
+        const base = baseList?.[idx];
+
+        if (!override) {
+          if (base) {
+            if (base.colorHex !== undefined && 'color' in std && std.color) std.color.setHex(base.colorHex);
+            if (base.emissiveHex !== undefined && 'emissive' in std && std.emissive) {
+              std.emissive.setHex(base.emissiveHex);
+            }
+            if (base.emissiveIntensity !== undefined && 'emissiveIntensity' in std) {
+              std.emissiveIntensity = base.emissiveIntensity;
+            }
+            if (base.roughness !== undefined && 'roughness' in std) std.roughness = base.roughness;
+            if (base.metalness !== undefined && 'metalness' in std) std.metalness = base.metalness;
+            if (base.opacity !== undefined) m.opacity = base.opacity;
+            if (base.transparent !== undefined) m.transparent = base.transparent;
+            m.needsUpdate = true;
+          }
+          return;
+        }
+
+        if (override.color && 'color' in std && std.color) {
+          std.color.set(override.color);
+        }
+        if (override.emissive && 'emissive' in std && std.emissive) {
+          std.emissive.set(override.emissive);
+        }
+        if (typeof override.emissiveIntensity === 'number' && 'emissiveIntensity' in std) {
+          std.emissiveIntensity = override.emissiveIntensity;
+        }
+        if (typeof override.roughness === 'number' && 'roughness' in std) {
+          std.roughness = override.roughness;
+        }
+        if (typeof override.metalness === 'number' && 'metalness' in std) {
+          std.metalness = override.metalness;
+        }
+        if (typeof override.opacity === 'number') {
+          m.opacity = override.opacity;
+          m.transparent = override.opacity < 0.999 || Boolean(base?.transparent);
+        }
+        m.needsUpdate = true;
+      });
+    });
+
+    this.refreshSelectionVisuals();
+  }
+
+  getPropMaterialInfo(propId: string): NodeMaterialOverride | null {
+    const root = this.propObjects.get(propId);
+    if (!root) return null;
+    this.clearHoverEmissivesOnly();
+    this.clearSelectionHighlight();
+
+    let info: NodeMaterialOverride | null = null;
+    root.traverse((obj) => {
+      if (info) return;
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.material) return;
+      const m = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+      const std = m as THREE.MeshStandardMaterial;
+      info = {
+        color: 'color' in std && std.color ? `#${std.color.getHexString()}` : '#e8702a',
+        emissive: 'emissive' in std && std.emissive ? `#${std.emissive.getHexString()}` : '#000000',
+        emissiveIntensity: typeof std.emissiveIntensity === 'number' ? std.emissiveIntensity : 0,
+        roughness: typeof std.roughness === 'number' ? std.roughness : 0.65,
+        metalness: typeof std.metalness === 'number' ? std.metalness : 0.15,
+        opacity: typeof m.opacity === 'number' ? m.opacity : 1,
+      };
+    });
+
+    this.refreshSelectionVisuals();
+    return info;
+  }
+
+  private resolveChildByPath(root: THREE.Object3D, path: string): THREE.Object3D | null {
+    const parts = path.split('/').filter(Boolean);
+    let cur: THREE.Object3D | null = root;
+    for (const seg of parts) {
+      const idx = Number(seg);
+      if (!Number.isFinite(idx) || !cur || !cur.children[idx]) return null;
+      cur = cur.children[idx];
+    }
+    return cur;
+  }
+
+  private async reconstructDetachedTemplate(
+    prop: ScenePropData,
+    glbBinaries: Map<string, ArrayBuffer>,
+    htmlAssetSources?: Map<string, string>,
+  ): Promise<THREE.Group | null> {
+    const src = prop.detachedSource;
+    if (!src) return null;
+
+    try {
+      if (src.originKind === 'character-node') {
+        let sourceObj: THREE.Object3D | undefined;
+        let tempAdapter: HtmlThreeAdapter | GltfCharacterAdapter | null = null;
+
+        // First try active adapter if still loaded in scene
+        if (src.sourceCharacterId) {
+          const liveAdapter = this.adapters.get(src.sourceCharacterId);
+          if (liveAdapter && 'getNodeObject' in liveAdapter && typeof liveAdapter.getNodeObject === 'function' && src.sourceNodeId) {
+            sourceObj = liveAdapter.getNodeObject(src.sourceNodeId);
+          }
+        }
+
+        // Fallback: load temporary adapter from asset source (e.g. after page reload or after full ungroup)
+        if (!sourceObj && src.sourceAssetId) {
+          const html = htmlAssetSources?.get(src.sourceAssetId);
+          const glb = glbBinaries.get(src.sourceAssetId);
+          if (html) {
+            tempAdapter = new HtmlThreeAdapter(`tmp_${prop.id}`, src.sourceAssetId, html, false);
+            await tempAdapter.load();
+            sourceObj = src.sourceNodeId ? tempAdapter.getNodeObject(src.sourceNodeId) : tempAdapter.getNodeObject('node_0');
+          } else if (glb) {
+            tempAdapter = new GltfCharacterAdapter(`tmp_${prop.id}`, src.sourceAssetId, glb);
+            await tempAdapter.load();
+            sourceObj = src.sourceNodeId ? tempAdapter.getNodeObject(src.sourceNodeId) : tempAdapter.getNodeObject('node_0');
+          }
+        }
+
+        if (sourceObj) {
+          let targetObj: THREE.Object3D = sourceObj;
+          if (src.sourceChildPath) {
+            const sub = this.resolveChildByPath(sourceObj, src.sourceChildPath);
+            if (sub) targetObj = sub;
+          }
+          const wasVisible = targetObj.visible;
+          const wasDetached = targetObj.userData.__detachedHidden;
+          targetObj.visible = true;
+          delete targetObj.userData.__detachedHidden;
+          const { templateGroup } = this.cloneSubtreeCentered(targetObj);
+          targetObj.visible = wasVisible;
+          targetObj.userData.__detachedHidden = wasDetached;
+          tempAdapter?.dispose();
+          return templateGroup;
+        }
+        tempAdapter?.dispose();
+      } else if (src.originKind === 'prop-part' && src.sourcePropKind) {
+        const tempProp: ScenePropData = {
+          ...prop,
+          id: `tmp_${prop.id}`,
+          kind: src.sourcePropKind,
+          assetId: src.sourcePropAssetId,
+          color: src.sourceColor ?? prop.color,
+          detachedSource: undefined,
+        };
+        const rebuilt = await buildPropObject3D(
+          tempProp,
+          src.sourcePropAssetId ? glbBinaries.get(src.sourcePropAssetId) : undefined,
+        );
+        const content = rebuilt.children[0] ?? rebuilt;
+        const targetObj = src.sourceChildPath ? this.resolveChildByPath(content, src.sourceChildPath) : content;
+        if (targetObj) {
+          const { templateGroup } = this.cloneSubtreeCentered(targetObj);
+          return templateGroup;
+        }
+      }
+    } catch {
+      // Fall back to small placeholder box if source asset was deleted
+    }
+    return null;
+  }
+
   /* ---------- Props & Parent-Child Bone Attachment ---------- */
+
+  private propSyncEpoch = 0;
 
   async syncSceneProps(
     props: readonly ScenePropData[],
     evalProps: Map<string, EvaluatedPropState>,
     glbBinaries: Map<string, ArrayBuffer>,
+    htmlAssetSources?: Map<string, string>,
   ): Promise<void> {
+    const epoch = ++this.propSyncEpoch;
     const desiredIds = new Set(props.map((p) => p.id));
     for (const [id, group] of this.propObjects.entries()) {
       if (!desiredIds.has(id)) {
         if (this.currentSelection.kind === 'prop' && this.currentSelection.propId === id) {
           this.transformControls.detach();
-          this.selectionBoxHelper.visible = false;
         }
         this.propsGroup.remove(group);
         this.propObjects.delete(id);
         this.propHashes.delete(id);
+        this.propMaterialSigs.delete(id);
       }
     }
 
+    let rebuiltAny = false;
     for (const prop of props) {
-      const sig = `${prop.kind}:${prop.color}:${prop.assetId ?? ''}:${prop.pivot?.x ?? 0},${prop.pivot?.y ?? 0},${prop.pivot?.z ?? 0}`;
+      const sig =
+        prop.kind === 'detached-part'
+          ? `detached:${prop.id}:${prop.detachedSource?.sourceNodeId ?? ''}:${prop.detachedSource?.sourceChildPath ?? ''}:${prop.pivot?.x ?? 0},${prop.pivot?.y ?? 0},${prop.pivot?.z ?? 0}`
+          : `${prop.kind}:${prop.color}:${prop.assetId ?? ''}:${prop.pivot?.x ?? 0},${prop.pivot?.y ?? 0},${prop.pivot?.z ?? 0}`;
+
       if (this.propHashes.get(prop.id) !== sig) {
-        const old = this.propObjects.get(prop.id);
-        if (old) this.propsGroup.remove(old);
+        this.propHashes.set(prop.id, sig);
         const built = await buildPropObject3D(prop, prop.assetId ? glbBinaries.get(prop.assetId) : undefined);
+
+        if (prop.kind === 'detached-part') {
+          let template = this.detachedTemplates.get(prop.id);
+          if (!template) {
+            const reconstructed = await this.reconstructDetachedTemplate(prop, glbBinaries, htmlAssetSources);
+            if (reconstructed) {
+              template = reconstructed;
+              this.detachedTemplates.set(prop.id, template);
+            }
+          }
+          const content = built.children[0] ?? built;
+          if (template) {
+            const clonedContent = this.cloneWithUniqueMaterials(template);
+            content.add(clonedContent);
+          } else {
+            const fallback = new THREE.Mesh(
+              new THREE.BoxGeometry(0.3, 0.3, 0.3),
+              new THREE.MeshStandardMaterial({ color: prop.color || '#e8702a', roughness: 0.6 }),
+            );
+            content.add(fallback);
+          }
+          tagPropSubtree(content, prop.id, prop.name);
+        }
+
+        // If a newer sync superseded this build or the prop was removed mid-await, discard stale mesh
+        if (epoch !== this.propSyncEpoch && this.propHashes.get(prop.id) !== sig) {
+          continue;
+        }
+        const prev = this.propObjects.get(prop.id);
+        if (prev) this.propsGroup.remove(prev);
+
+        built.userData.propId = prop.id;
         built.userData.propName = prop.name;
+        this.snapshotPropBaseMaterials(built);
         this.propsGroup.add(built);
         this.propObjects.set(prop.id, built);
-        this.propHashes.set(prop.id, sig);
+        this.propMaterialSigs.delete(prop.id);
+        rebuiltAny = true;
       }
+
       const obj = this.propObjects.get(prop.id);
       const evalState = evalProps.get(prop.id);
       if (!obj || !evalState) continue;
 
+      if (obj.userData.propName !== prop.name) {
+        obj.traverse((c) => {
+          c.userData.propName = prop.name;
+        });
+      }
       obj.visible = evalState.visible;
+
+      // Apply independent material overrides (especially for detached parts & custom props)
+      const matSig = JSON.stringify(prop.materialOverride ?? null);
+      if (this.propMaterialSigs.get(prop.id) !== matSig) {
+        this.propMaterialSigs.set(prop.id, matSig);
+        this.applyPropMaterialOverrideToObject(obj, prop.materialOverride);
+      }
 
       if (evalState.parentAttachment) {
         const att = evalState.parentAttachment;
@@ -980,6 +1748,20 @@ export class StudioEngine {
         obj.scale.set(evalState.transform.scale.x, evalState.transform.scale.y, evalState.transform.scale.z);
       }
     }
+
+    // Re-attach gizmo & selection highlights if current prop was rebuilt
+    if (this.currentSelection.kind === 'prop' && this.propObjects.has(this.currentSelection.propId)) {
+      if (rebuiltAny || !this.transformControls.object) {
+        this.attachGizmoToSelection();
+      } else {
+        this.refreshSelectionVisuals();
+      }
+    } else if (rebuiltAny) {
+      this.refreshSelectionVisuals();
+    }
+    if (rebuiltAny) {
+      this.requestRender();
+    }
   }
 
   syncSceneCamera(pose: CameraPose, projection: 'perspective' | 'orthographic' = 'perspective', orthoSize = 6): void {
@@ -1011,9 +1793,199 @@ export class StudioEngine {
 
   setSelection(target: SelectionTarget): void {
     this.currentSelection = target;
+    if (target.kind === 'none') {
+      this.multiSelectedIds.clear();
+      this.multiSelectedNodeKeys.clear();
+    }
     this.attachGizmoToSelection();
+    this.refreshSelectionVisuals();
     this.rebuildRigVisuals();
     this.requestRender();
+  }
+
+  private clearSelectionBoxes(): void {
+    while (this.selectionBoxesGroup.children.length > 0) {
+      const ch = this.selectionBoxesGroup.children[0];
+      this.selectionBoxesGroup.remove(ch);
+      const line = ch as THREE.LineSegments;
+      if (line.geometry) line.geometry.dispose();
+      if (line.material) {
+        const mats = Array.isArray(line.material) ? line.material : [line.material];
+        mats.forEach((m) => m.dispose());
+      }
+    }
+    this.selectionBoxHelper.visible = false;
+  }
+
+  private clearSelectionHighlight(): void {
+    for (const [mat, prev] of this.restoredSelectionHighlights.entries()) {
+      const std = mat as THREE.MeshStandardMaterial;
+      if (prev.emissiveHex !== undefined && 'emissive' in std && std.emissive) {
+        std.emissive.setHex(prev.emissiveHex);
+      }
+      if (prev.emissiveIntensity !== undefined && 'emissiveIntensity' in std) {
+        std.emissiveIntensity = prev.emissiveIntensity;
+      }
+      if (prev.colorHex !== undefined && 'color' in std && std.color) {
+        std.color.setHex(prev.colorHex);
+      }
+    }
+    this.restoredSelectionHighlights.clear();
+  }
+
+  private applyMeshSelectionHighlight(rootObj: THREE.Object3D): void {
+    const tintColor = new THREE.Color(0xff9248);
+    rootObj.traverse((child) => {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.material) return;
+      if (!this.isObjectEffectivelyVisible(mesh)) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of mats) {
+        if (this.restoredSelectionHighlights.has(m)) continue;
+        const std = m as THREE.MeshStandardMaterial;
+        if ('emissive' in std && std.emissive) {
+          this.restoredSelectionHighlights.set(m, {
+            emissiveHex: std.emissive.getHex(),
+            emissiveIntensity: std.emissiveIntensity ?? 1,
+          });
+          std.emissive.setHex(0xe8702a);
+          std.emissiveIntensity = Math.max(0.36, (std.emissiveIntensity ?? 0) + 0.28);
+        } else if ('color' in std && std.color) {
+          this.restoredSelectionHighlights.set(m, {
+            colorHex: std.color.getHex(),
+          });
+          std.color.lerp(tintColor, 0.35);
+        }
+      }
+    });
+  }
+
+  private collectSelectedObjectRoots(): THREE.Object3D[] {
+    const roots = new Set<THREE.Object3D>();
+    const addById = (id: string) => {
+      const ch = this.adapters.get(id);
+      if (ch && ch.rootGroup.visible) roots.add(ch.rootGroup);
+      const pr = this.propObjects.get(id);
+      if (pr && pr.visible) roots.add(pr);
+    };
+
+    if (this.currentSelection.kind === 'character') {
+      addById(this.currentSelection.instanceId);
+    } else if (this.currentSelection.kind === 'prop') {
+      addById(this.currentSelection.propId);
+    } else if (this.currentSelection.kind === 'body-part') {
+      const a = this.adapters.get(this.currentSelection.instanceId);
+      const n =
+        a && 'getNodeObject' in a && typeof a.getNodeObject === 'function'
+          ? a.getNodeObject(this.currentSelection.nodeId)
+          : undefined;
+      if (n && this.isObjectEffectivelyVisible(n)) roots.add(n);
+    } else if (this.currentSelection.kind === 'group') {
+      const meta = this.groupMeta.get(this.currentSelection.groupId);
+      if (meta) {
+        for (const mId of meta.memberIds) addById(mId);
+      }
+    } else if (this.currentSelection.kind === 'light') {
+      const lm = this.lightMarkers.get(this.currentSelection.lightId);
+      if (lm && lm.visible) roots.add(lm);
+    } else if (this.currentSelection.kind === 'camera') {
+      if (this.sceneCameraMarker.visible) roots.add(this.sceneCameraMarker);
+    }
+
+    for (const id of this.multiSelectedIds) {
+      addById(id);
+    }
+    for (const key of this.multiSelectedNodeKeys) {
+      const sep = key.indexOf(':');
+      if (sep <= 0) continue;
+      const charId = key.slice(0, sep);
+      const nodeId = key.slice(sep + 1);
+      const a = this.adapters.get(charId);
+      const n =
+        a && 'getNodeObject' in a && typeof a.getNodeObject === 'function'
+          ? a.getNodeObject(nodeId)
+          : undefined;
+      if (n && this.isObjectEffectivelyVisible(n)) roots.add(n);
+    }
+
+    return [...roots];
+  }
+
+  private updateSelectionBoxesOnly(): void {
+    this.clearSelectionBoxes();
+    if (this.viewMode !== 'editor' || this.currentSelection.kind === 'none') {
+      return;
+    }
+
+    const addBoxHelper = (box: THREE.Box3, color = 0xff8a3d) => {
+      if (box.isEmpty()) return;
+      // Ensure even super-tiny detached pieces have a clearly visible highlight box
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const minPad = 0.02;
+      if (size.x < minPad || size.y < minPad || size.z < minPad) {
+        box.expandByScalar(minPad);
+      }
+      const helper = new THREE.Box3Helper(box.clone(), new THREE.Color(color));
+      helper.userData.__isSelectionHighlight = true;
+      this.selectionBoxesGroup.add(helper);
+    };
+
+    if (this.currentSelection.kind === 'group') {
+      const unionBox = new THREE.Box3();
+      const meta = this.groupMeta.get(this.currentSelection.groupId);
+      if (meta) {
+        for (const mId of meta.memberIds) {
+          const ch = this.adapters.get(mId);
+          if (ch && ch.rootGroup.visible) {
+            const b = this.computeVisibleBox3(ch.rootGroup);
+            unionBox.union(b);
+          }
+          const pr = this.propObjects.get(mId);
+          if (pr && pr.visible) {
+            const b = this.computeVisibleBox3(pr);
+            unionBox.union(b);
+          }
+        }
+      }
+      addBoxHelper(unionBox, 0xff8a3d);
+      return;
+    }
+
+    const roots = this.collectSelectedObjectRoots();
+    for (const root of roots) {
+      const box = this.computeVisibleBox3(root);
+      addBoxHelper(box, 0xff8a3d);
+    }
+  }
+
+  private refreshSelectionVisuals(): void {
+    this.clearHoverEmissivesOnly();
+    this.clearSelectionHighlight();
+    this.updateSelectionBoxesOnly();
+
+    if (this.viewMode !== 'editor' || this.currentSelection.kind === 'none') {
+      return;
+    }
+
+    const roots = this.collectSelectedObjectRoots();
+    for (const root of roots) {
+      this.applyMeshSelectionHighlight(root);
+    }
+  }
+
+  refreshSelectionHighlight(): void {
+    this.refreshSelectionVisuals();
+  }
+
+  withoutEditorHighlights<T>(fn: () => T): T {
+    this.clearHoverEmissivesOnly();
+    this.clearSelectionHighlight();
+    try {
+      return fn();
+    } finally {
+      this.refreshSelectionVisuals();
+    }
   }
 
   updateRigAndIkVisuals(instanceId: string | null, ikTargets: readonly IkTargetData[]): void {
@@ -1050,50 +2022,14 @@ export class StudioEngine {
     this.transformControls.detach();
     this.selectionBoxHelper.visible = false;
 
-    if (this.viewMode !== 'editor') return;
+    if (this.viewMode !== 'editor' || this.currentSelection.kind === 'none') return;
     if (this.gizmoMode === 'orbit' || this.gizmoMode === 'box-select') {
-      if (this.currentSelection.kind === 'character') {
-        const adapter = this.adapters.get(this.currentSelection.instanceId);
-        if (adapter) {
-          this.selectionBoxHelper.setFromObject(adapter.rootGroup);
-          this.selectionBoxHelper.visible = true;
-        }
-      } else if (this.currentSelection.kind === 'prop') {
-        const propObj = this.propObjects.get(this.currentSelection.propId);
-        if (propObj) {
-          this.selectionBoxHelper.setFromObject(propObj);
-          this.selectionBoxHelper.visible = true;
-        }
-      } else if (this.currentSelection.kind === 'body-part') {
-        const adapter = this.adapters.get(this.currentSelection.instanceId);
-        const nodeObj =
-          adapter && 'getNodeObject' in adapter && typeof adapter.getNodeObject === 'function'
-            ? adapter.getNodeObject(this.currentSelection.nodeId)
-            : undefined;
-        if (nodeObj) {
-          this.selectionBoxHelper.setFromObject(nodeObj);
-          this.selectionBoxHelper.visible = true;
-        }
-      }
       return;
     }
 
     // Allow body-part & IK interaction in Pose Mode even if toolbar gizmoMode is 'select'
     const isBodyOrIk = this.currentSelection.kind === 'body-part' || this.currentSelection.kind === 'ik-handle';
     if (this.gizmoMode === 'select' && !isBodyOrIk) {
-      if (this.currentSelection.kind === 'character') {
-        const adapter = this.adapters.get(this.currentSelection.instanceId);
-        if (adapter) {
-          this.selectionBoxHelper.setFromObject(adapter.rootGroup);
-          this.selectionBoxHelper.visible = true;
-        }
-      } else if (this.currentSelection.kind === 'prop') {
-        const propObj = this.propObjects.get(this.currentSelection.propId);
-        if (propObj) {
-          this.selectionBoxHelper.setFromObject(propObj);
-          this.selectionBoxHelper.visible = true;
-        }
-      }
       return;
     }
 
@@ -1107,8 +2043,6 @@ export class StudioEngine {
       if (adapter) {
         this.transformControls.setMode(tcMode);
         this.transformControls.attach(adapter.rootGroup);
-        this.selectionBoxHelper.setFromObject(adapter.rootGroup);
-        this.selectionBoxHelper.visible = true;
       }
     } else if (this.currentSelection.kind === 'body-part') {
       const { instanceId, nodeId } = this.currentSelection;
@@ -1119,11 +2053,8 @@ export class StudioEngine {
         adapter && 'getNodeObject' in adapter && typeof adapter.getNodeObject === 'function'
           ? adapter.getNodeObject(nodeId)
           : undefined;
-      if (nodeObj) {
+      if (nodeObj && this.isObjectEffectivelyVisible(nodeObj)) {
         const isRootNode = nodeId === 'node_0';
-        this.selectionBoxHelper.setFromObject(nodeObj);
-        this.selectionBoxHelper.visible = true;
-
         // Give every component (even tiny parts and component groups) full Move (G) & Scale (S) gizmos,
         // and clean RigVisualizer X/Y/Z arrowhead rings for Rotate (R) / Select (Q).
         if (!isRootNode && this.showRigOverlay && (this.gizmoMode === 'select' || this.gizmoMode === 'rotate')) {
@@ -1147,11 +2078,9 @@ export class StudioEngine {
     } else if (this.currentSelection.kind === 'prop') {
       if (this.lockedObjects.has(this.currentSelection.propId)) return;
       const propObj = this.propObjects.get(this.currentSelection.propId);
-      if (propObj) {
+      if (propObj && propObj.visible) {
         this.transformControls.setMode(tcMode);
         this.transformControls.attach(propObj);
-        this.selectionBoxHelper.setFromObject(propObj);
-        this.selectionBoxHelper.visible = true;
       }
     } else if (this.currentSelection.kind === 'group') {
       const grpMeta = this.groupMeta.get(this.currentSelection.groupId);
@@ -1160,7 +2089,6 @@ export class StudioEngine {
       if (proxy) {
         this.transformControls.setMode(tcMode);
         this.transformControls.attach(proxy);
-        this.selectionBoxHelper.visible = false;
       }
     } else if (this.currentSelection.kind === 'light') {
       const marker = this.lightMarkers.get(this.currentSelection.lightId);
@@ -1392,12 +2320,24 @@ export class StudioEngine {
     this.raycaster.setFromCamera(this.pointerNdc, this.getActiveEditorCamera());
   }
 
-  private clearHoverHighlight(): void {
+  private clearHoverEmissivesOnly(): void {
     for (const [mat, prev] of this.restoredHoverEmissives.entries()) {
-      mat.emissive.setHex(prev.hex);
-      mat.emissiveIntensity = prev.intensity;
+      const std = mat as THREE.MeshStandardMaterial;
+      if (prev.emissiveHex !== undefined && 'emissive' in std && std.emissive) {
+        std.emissive.setHex(prev.emissiveHex);
+      }
+      if (prev.emissiveIntensity !== undefined && 'emissiveIntensity' in std) {
+        std.emissiveIntensity = prev.emissiveIntensity;
+      }
+      if (prev.colorHex !== undefined && 'color' in std && std.color) {
+        std.color.setHex(prev.colorHex);
+      }
     }
     this.restoredHoverEmissives.clear();
+  }
+
+  private clearHoverHighlight(): void {
+    this.clearHoverEmissivesOnly();
     this.hoverBoxHelper.visible = false;
     if (this.hoveredInstanceId !== null || this.hoveredNodeKey !== null || this.hoveredRingAxis !== null) {
       this.hoveredInstanceId = null;
@@ -1412,19 +2352,27 @@ export class StudioEngine {
   }
 
   private applyMeshHoverEmissive(rootObj: THREE.Object3D): void {
+    const hoverTint = new THREE.Color(0x5eead4);
     rootObj.traverse((child) => {
       const mesh = child as THREE.Mesh;
       if (!mesh.isMesh || !mesh.material) return;
+      if (!this.isObjectEffectivelyVisible(mesh)) return;
       const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       for (const m of mats) {
+        if (this.restoredHoverEmissives.has(m)) continue;
         const std = m as THREE.MeshStandardMaterial;
-        if (std && 'emissive' in std && std.emissive && !this.restoredHoverEmissives.has(std)) {
-          this.restoredHoverEmissives.set(std, {
-            hex: std.emissive.getHex(),
-            intensity: std.emissiveIntensity ?? 1,
+        if ('emissive' in std && std.emissive) {
+          this.restoredHoverEmissives.set(m, {
+            emissiveHex: std.emissive.getHex(),
+            emissiveIntensity: std.emissiveIntensity ?? 1,
           });
           std.emissive.setHex(0x2dd4bf);
           std.emissiveIntensity = 0.28;
+        } else if ('color' in std && std.color) {
+          this.restoredHoverEmissives.set(m, {
+            colorHex: std.color.getHex(),
+          });
+          std.color.lerp(hoverTint, 0.25);
         }
       }
     });
@@ -1545,16 +2493,22 @@ export class StudioEngine {
       }
     }
 
-    // 4. Characters, Props, Lights, Camera
+    // 4. Characters, Props (including detached smallest pieces), Lights, Camera
     const targets: THREE.Object3D[] = [];
     if (allow('character') || allow('body-part') || allow('group')) {
       for (const a of this.adapters.values()) {
-        if (a.rootGroup.visible) targets.push(a.rootGroup);
+        if (a.rootGroup.visible) {
+          a.rootGroup.updateMatrixWorld(true);
+          targets.push(a.rootGroup);
+        }
       }
     }
     if (allow('prop') || allow('group')) {
       for (const p of this.propObjects.values()) {
-        if (p.visible) targets.push(p);
+        if (p.visible) {
+          p.updateMatrixWorld(true);
+          targets.push(p);
+        }
       }
     }
     if (allow('light')) {
@@ -1562,12 +2516,18 @@ export class StudioEngine {
         if (lm.visible) targets.push(lm);
       }
     }
-    if (allow('camera')) {
+    if (allow('camera') && this.sceneCameraMarker.visible) {
       targets.push(this.sceneCameraMarker);
     }
 
-    const hits = this.raycaster.intersectObjects(targets, true);
-    if (hits.length === 0) return null;
+    // CRITICAL: Filter out invisible meshes (such as hidden HTML stagePropsGroup floors or detached nodes!)
+    const rawHits = this.raycaster.intersectObjects(targets, true);
+    const hits = rawHits.filter((h) => this.isObjectEffectivelyVisible(h.object));
+
+    if (hits.length === 0) {
+      // Small-piece proximity fallback: make tiny detached pieces (pupils, cuffs, buttons) & markers effortless to click
+      return this.inspectTinyPieceScreenFallback(clientX, clientY, allow, options);
+    }
 
     const hitObj = hits[0].object;
     if (hitObj.userData.isSceneCamera) {
@@ -1629,7 +2589,7 @@ export class StudioEngine {
           hitMesh: this.propObjects.get(propId) ?? hitObj,
           worldPoint: hits[0].point,
           title: gMeta?.name ?? 'Group',
-          description: 'Grouped object • Alt+Click to pick member',
+          description: 'Grouped object • Ctrl+Shift+G to ungroup • Alt+Click to pick member',
           locked: Boolean(gMeta?.locked),
         };
       }
@@ -1638,7 +2598,7 @@ export class StudioEngine {
         hitMesh: this.propObjects.get(propId) ?? hitObj,
         worldPoint: hits[0].point,
         title: propName,
-        description: 'Move, rotate or scale stage prop',
+        description: 'Independent object • Ctrl+Shift+G to break apart further',
         locked: this.lockedObjects.has(propId),
       };
     }
@@ -1665,7 +2625,7 @@ export class StudioEngine {
           ? adapter.getNodeObject(rigNodeId)
           : undefined;
 
-      // Return exact penetrated body-part / tiny component / component group if hovering or in Pose Mode / body-part filter
+      // Return exact body-part / tiny component / component group if hovering or in Pose Mode / body-part filter / Alt-click
       if (
         rigNodeId &&
         (options?.preferBodyPart ||
@@ -1678,7 +2638,7 @@ export class StudioEngine {
           hitMesh: nodeObj ?? hitObj,
           worldPoint: hits[0].point,
           title: rigNodeName,
-          description: effectiveNode?.description || `Control ${rigNodeName} directly (Ctrl+Click to multi-select)`,
+          description: effectiveNode?.description || `Control ${rigNodeName} • Ctrl+Shift+G to detach independently`,
           locked: lockedNode || this.lockedObjects.has(charId),
         };
       }
@@ -1691,7 +2651,7 @@ export class StudioEngine {
           hitMesh: adapter?.rootGroup ?? hitObj,
           worldPoint: hits[0].point,
           title: gMeta?.name ?? 'Group',
-          description: 'Grouped character • Double-click to pose',
+          description: 'Grouped character • Ctrl+Shift+G to ungroup • Double-click to pose',
           locked: Boolean(gMeta?.locked),
         };
       }
@@ -1702,13 +2662,90 @@ export class StudioEngine {
         worldPoint: hits[0].point,
         title: effectiveNode ? rigNodeName : 'Character',
         description: effectiveNode
-          ? `${effectiveNode.description ?? 'Select part'} • Double-click to pose component`
-          : 'Click to transform • Double-click to pose joints',
+          ? `${effectiveNode.description ?? 'Select part'} • Double-click to pick part • Ctrl+Shift+G to ungroup apart`
+          : 'Click to select • Double-click to pick parts • Ctrl+Shift+G to ungroup apart',
         locked: this.lockedObjects.has(charId),
       };
     }
 
     return null;
+  }
+
+  private inspectTinyPieceScreenFallback(
+    clientX: number,
+    clientY: number,
+    allow: (k: SelectionFilter) => boolean,
+    options?: { preferBodyPart?: boolean; ignoreFilter?: boolean; ignoreGroups?: boolean },
+  ): {
+    target: SelectionTarget;
+    hitMesh: THREE.Object3D | null;
+    worldPoint: THREE.Vector3;
+    title: string;
+    description: string;
+    locked: boolean;
+    ringAxis?: 'x' | 'y' | 'z';
+  } | null {
+    if (!allow('prop') && !allow('group')) return null;
+    const domRect = this.renderer.domElement.getBoundingClientRect();
+    const cam = this.getActiveEditorCamera();
+    cam.updateMatrixWorld();
+
+    let best: {
+      propId: string;
+      propObj: THREE.Group;
+      center: THREE.Vector3;
+      distPx: number;
+      camDist: number;
+    } | null = null;
+
+    const proj = new THREE.Vector3();
+    for (const [propId, propObj] of this.propObjects.entries()) {
+      if (!propObj.visible) continue;
+      const box = this.computeVisibleBox3(propObj);
+      if (box.isEmpty()) continue;
+      const center = new THREE.Vector3();
+      box.getCenter(center);
+      proj.copy(center).project(cam);
+      if (proj.z < -1 || proj.z > 1) continue;
+      const sx = domRect.left + (proj.x * 0.5 + 0.5) * domRect.width;
+      const sy = domRect.top + (-proj.y * 0.5 + 0.5) * domRect.height;
+      const distPx = Math.hypot(clientX - sx, clientY - sy);
+      if (distPx > 12) continue;
+
+      // Only apply proximity fallback to visually small pieces (< 28px bounding extent)
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z);
+      if (maxDim > 0.65) continue;
+
+      const camDist = center.distanceTo(cam.position);
+      if (!best || camDist < best.camDist) {
+        best = { propId, propObj, center, distPx, camDist };
+      }
+    }
+
+    if (!best) return null;
+    const propName = String(best.propObj.userData.propName || best.propId);
+    const grpId = this.memberToGroup.get(best.propId);
+    if (grpId && !options?.preferBodyPart && !options?.ignoreGroups && this.currentSelection.kind !== 'prop') {
+      const gMeta = this.groupMeta.get(grpId);
+      return {
+        target: { kind: 'group', groupId: grpId },
+        hitMesh: best.propObj,
+        worldPoint: best.center,
+        title: gMeta?.name ?? 'Group',
+        description: 'Grouped object • Ctrl+Shift+G to ungroup',
+        locked: Boolean(gMeta?.locked),
+      };
+    }
+    return {
+      target: { kind: 'prop', propId: best.propId },
+      hitMesh: best.propObj,
+      worldPoint: best.center,
+      title: propName,
+      description: 'Independent object • Ctrl+Shift+G to break apart further',
+      locked: this.lockedObjects.has(best.propId),
+    };
   }
 
   private updateMarqueeOverlay(drag: NonNullable<typeof this.marqueeDrag>): void {
@@ -1855,8 +2892,8 @@ export class StudioEngine {
     if (allowChars) {
       for (const [charId, adapter] of this.adapters.entries()) {
         if (!adapter.rootGroup.visible) continue;
-        const box = new THREE.Box3().setFromObject(adapter.rootGroup);
-        if (this.projectBoxIntersectsScreenRect(box, cam, domRect, minX, maxX, minY, maxY)) {
+        const box = this.computeVisibleBox3(adapter.rootGroup);
+        if (!box.isEmpty() && this.projectBoxIntersectsScreenRect(box, cam, domRect, minX, maxX, minY, maxY)) {
           results.push({ kind: 'character', instanceId: charId });
         }
       }
@@ -1864,8 +2901,8 @@ export class StudioEngine {
     if (allowProps) {
       for (const [propId, propObj] of this.propObjects.entries()) {
         if (!propObj.visible) continue;
-        const box = new THREE.Box3().setFromObject(propObj);
-        if (this.projectBoxIntersectsScreenRect(box, cam, domRect, minX, maxX, minY, maxY)) {
+        const box = this.computeVisibleBox3(propObj);
+        if (!box.isEmpty() && this.projectBoxIntersectsScreenRect(box, cam, domRect, minX, maxX, minY, maxY)) {
           results.push({ kind: 'prop', propId });
         }
       }
@@ -2053,17 +3090,18 @@ export class StudioEngine {
       return;
     }
 
-    // Clear previous emissive boost without resetting hover tooltip state until updated
-    for (const [mat, prev] of this.restoredHoverEmissives.entries()) {
-      mat.emissive.setHex(prev.hex);
-      mat.emissiveIntensity = prev.intensity;
-    }
-    this.restoredHoverEmissives.clear();
+    // Clear previous hover emissive boost cleanly
+    this.clearHoverEmissivesOnly();
 
     if (hit.hitMesh) {
       this.applyMeshHoverEmissive(hit.hitMesh);
-      this.hoverBoxHelper.setFromObject(hit.hitMesh);
-      this.hoverBoxHelper.visible = true;
+      const hoverBox = this.computeVisibleBox3(hit.hitMesh);
+      if (!hoverBox.isEmpty()) {
+        this.hoverBoxHelper.setFromObject(hit.hitMesh);
+        this.hoverBoxHelper.visible = true;
+      } else {
+        this.hoverBoxHelper.visible = false;
+      }
     } else {
       this.hoverBoxHelper.visible = false;
     }
@@ -2230,6 +3268,30 @@ export class StudioEngine {
     }
   }
 
+  private handleWheel = (e: WheelEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+
+    let delta = e.deltaY;
+    if (e.deltaMode === 1) {
+      // DOM_DELTA_LINE
+      delta *= 16;
+    } else if (e.deltaMode === 2) {
+      // DOM_DELTA_PAGE
+      delta *= 100;
+    }
+    if (e.ctrlKey) {
+      // Trackpad pinch-to-zoom dispatches wheel with ctrlKey=true and smaller deltaY
+      delta *= 4.5;
+    }
+    if (Math.abs(delta) < 1e-4) return;
+
+    const clampedDelta = THREE.MathUtils.clamp(delta, -320, 320);
+    const factor = Math.exp(clampedDelta * 0.0018);
+    this.zoomBy(factor, { x: e.clientX, y: e.clientY });
+  };
+
   private handlePointerDown = (e: PointerEvent) => {
     this.pointerDownPos = { x: e.clientX, y: e.clientY };
     const activeTcAxis = (this.transformControls as unknown as { axis?: string | null }).axis;
@@ -2370,7 +3432,12 @@ export class StudioEngine {
         }
       }
 
-      // Direct click-and-drag / trackpad double-click-and-drag on any stage object
+      // Do NOT hijack body-part selection in translate/scale mode with whole-character root dragging!
+      if (hit && hit.target.kind === 'body-part') {
+        return;
+      }
+
+      // Direct click-and-drag on any standalone stage object (character, detached part, prop, group, light, camera)
       const objHit = this.inspectRayTarget(e.clientX, e.clientY, {
         preferBodyPart: false,
         ignoreGroups: e.altKey,
@@ -2440,7 +3507,15 @@ export class StudioEngine {
       }
       if (drag.active) {
         const targets = this.collectMarqueeTargets(drag);
-        this.callbacks.onMarqueeSelect?.(targets, drag.additive);
+        if (targets.length === 0 && !drag.additive) {
+          if (this.poseModeInstanceId) {
+            this.poseModeInstanceId = null;
+            this.callbacks.onPoseModeChange?.(null);
+          }
+          this.callbacks.onSelectTarget({ kind: 'none' }, false);
+        } else {
+          this.callbacks.onMarqueeSelect?.(targets, drag.additive);
+        }
         this.requestRender();
         return;
       }
@@ -2507,6 +3582,7 @@ export class StudioEngine {
         }
         this.callbacks.onSelectTarget(drag.target, additive);
         this.commitObjectDragTransform(drag.target, drag.obj);
+        this.updateSelectionBoxesOnly();
         this.requestRender();
         return;
       }
@@ -2517,7 +3593,8 @@ export class StudioEngine {
       return;
     }
     if (this.transformControls.dragging || this.viewMode !== 'editor' || e.button !== 0) return;
-    if (this.gizmoMode === 'orbit') return;
+
+    // Allow short clicks (<= 5px) to select or deselect in ALL modes (including orbit mode!)
     const dist = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
     if (dist > 5) return;
 
@@ -2527,7 +3604,7 @@ export class StudioEngine {
     });
 
     if (hit) {
-      // If clicking outside pose character, exit Pose Mode cleanly or select new object
+      // If clicking outside pose character, exit Pose Mode cleanly and select the clicked object
       if (
         this.poseModeInstanceId &&
         !(
@@ -2542,12 +3619,12 @@ export class StudioEngine {
       return;
     }
 
-    if (additive) return;
-
+    // Clicked outside on empty viewport space: ALWAYS clear ALL selection completely!
     if (this.poseModeInstanceId) {
       this.poseModeInstanceId = null;
       this.callbacks.onPoseModeChange?.(null);
     }
+    this.clearHoverHighlight();
     this.callbacks.onSelectTarget({ kind: 'none' }, false);
   };
 
@@ -2662,6 +3739,7 @@ export class StudioEngine {
       this.lastTickMs = now;
 
       this.callbacks.onAnimationTick(dt);
+      this.orbitControls.update();
       this.renderFrame();
 
       if (this.isSoftwareGl) {
@@ -2733,10 +3811,16 @@ export class StudioEngine {
           this.orbitControls.target.copy(this.focusAnim.targetLook);
           this.focusAnim = null;
         }
+        this.syncEditorOrthoCamera(true);
         this.renderDirty = Boolean(this.focusAnim);
       }
-      this.orbitControls.update();
-      this.syncEditorOrthoCamera();
+      const controlsChanged = this.orbitControls.update();
+      if (controlsChanged) {
+        this.renderDirty = true;
+      }
+      if (this.editorProjection === 'perspective') {
+        this.syncEditorOrthoCamera(true);
+      }
       this.rigVisualizer.updateScales(this.getActiveEditorCamera());
       this.renderFrame();
       const done = () => {
@@ -2753,8 +3837,8 @@ export class StudioEngine {
 
   renderFrame(): void {
     if (this.disposed) return;
-    if (this.selectionBoxHelper.visible) {
-      this.selectionBoxHelper.update();
+    if (this.viewMode === 'editor' && this.currentSelection.kind !== 'none' && (this.isPlaying || this.transformControls.dragging)) {
+      this.updateSelectionBoxesOnly();
     }
     const activeSceneCam =
       this.activeCameraProjection === 'orthographic' ? this.orthoSceneCamera : this.sceneCamera;
@@ -2764,8 +3848,19 @@ export class StudioEngine {
 
   captureThumbnailDataUrl(): string | undefined {
     try {
+      const wasEditor = this.viewMode === 'editor';
+      if (wasEditor) {
+        this.clearHoverEmissivesOnly();
+        this.clearSelectionHighlight();
+        this.selectionBoxesGroup.visible = false;
+      }
       this.renderFrame();
-      return this.renderer.domElement.toDataURL('image/jpeg', 0.65);
+      const url = this.renderer.domElement.toDataURL('image/jpeg', 0.65);
+      if (wasEditor) {
+        this.selectionBoxesGroup.visible = true;
+        this.refreshSelectionVisuals();
+      }
+      return url;
     } catch {
       return undefined;
     }
@@ -2777,7 +3872,7 @@ export class StudioEngine {
     const aspect = w / h;
     this.editorCamera.aspect = aspect;
     this.editorCamera.updateProjectionMatrix();
-    this.syncEditorOrthoCamera();
+    this.syncEditorOrthoCamera(this.editorProjection === 'perspective');
     this.sceneCamera.aspect = aspect;
     this.sceneCamera.updateProjectionMatrix();
     const os = this.activeCameraOrthoSize;
@@ -2794,7 +3889,11 @@ export class StudioEngine {
     this.disposed = true;
     this.stopLoop();
     this.clearHoverHighlight();
+    this.clearSelectionHighlight();
+    this.clearSelectionBoxes();
+    this.detachedTemplates.clear();
     const dom = this.renderer.domElement;
+    dom.removeEventListener('wheel', this.handleWheel, { capture: true });
     dom.removeEventListener('pointerdown', this.handlePointerDown);
     dom.removeEventListener('pointermove', this.handlePointerMove);
     dom.removeEventListener('pointerup', this.handlePointerUp);

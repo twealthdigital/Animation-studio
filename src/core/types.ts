@@ -243,6 +243,7 @@ export interface CharacterInstanceData {
   lockedProperties?: { transform?: boolean; keys?: boolean };
   lockedNodes?: string[];
   hiddenNodes?: string[];
+  detachedNodes?: string[];
   nodeGroups?: CharacterNodeGroup[];
   nodeMaterialOverrides?: Record<string, NodeMaterialOverride>;
   positionKeyframes: Vec3Keyframe[];
@@ -270,7 +271,20 @@ export type PropGeometryKind =
   | 'chair'
   | 'lamp'
   | 'tree'
-  | 'glb';
+  | 'glb'
+  | 'detached-part';
+
+export interface DetachedPartSource {
+  originKind: 'character-node' | 'prop-part';
+  sourceAssetId?: string;
+  sourceCharacterId?: string;
+  sourceNodeId?: string;
+  sourcePropKind?: PropGeometryKind;
+  sourcePropAssetId?: string;
+  /** Slash-separated child index path inside the source subtree (e.g. "0/2"). */
+  sourceChildPath?: string;
+  sourceColor?: string;
+}
 
 export interface ParentAttachment {
   targetId: string; // character or prop ID
@@ -294,6 +308,9 @@ export interface ScenePropData {
   scaleKeyframes: Vec3Keyframe[];
   motionPath: MotionPathData;
   parentAttachment?: ParentAttachment | null;
+  detachedSource?: DetachedPartSource;
+  detachedChildPaths?: string[];
+  materialOverride?: NodeMaterialOverride;
 }
 
 export type SceneLightKind = 'directional' | 'point' | 'spot' | 'ambient';

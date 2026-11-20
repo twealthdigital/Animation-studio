@@ -17,6 +17,8 @@ import {
   RotateCcw,
   RotateCw,
   Sparkles,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import type {
   AxisConstraint,
@@ -63,6 +65,8 @@ interface CenterViewportProps {
   onChangeEditorCameraPreset: (preset: EditorCameraPreset) => void;
   onFocusTarget: () => void;
   onFrameAll: () => void;
+  onZoomIn: () => void;
+  onZoomOut: () => void;
   onExitPoseMode: () => void;
   onToggleTabHud: () => void;
   tabHud: {
@@ -137,6 +141,8 @@ export function CenterViewport({
   onChangeEditorCameraPreset,
   onFocusTarget,
   onFrameAll,
+  onZoomIn,
+  onZoomOut,
   onExitPoseMode,
   onToggleTabHud,
   tabHud,
@@ -354,6 +360,24 @@ export function CenterViewport({
           </StudioButton>
 
           <IconButton
+            label="Zoom In"
+            note="Zoom viewport camera closer (Mouse Wheel Up / Pinch Out)"
+            shortcut="+"
+            onClick={onZoomIn}
+          >
+            <ZoomIn className="h-3.5 w-3.5" aria-hidden="true" />
+          </IconButton>
+
+          <IconButton
+            label="Zoom Out"
+            note="Zoom viewport camera farther away (Mouse Wheel Down / Pinch In)"
+            shortcut="-"
+            onClick={onZoomOut}
+          >
+            <ZoomOut className="h-3.5 w-3.5" aria-hidden="true" />
+          </IconButton>
+
+          <IconButton
             label="Focus Target"
             note="Zoom tightly onto hovered part or active selection"
             shortcut="F"
@@ -415,7 +439,7 @@ export function CenterViewport({
         <div
           ref={mountRef}
           data-testid="viewport-canvas-host"
-          className={`h-full w-full ${
+          className={`h-full w-full touch-none overscroll-none ${
             gizmoMode === 'orbit'
               ? 'cursor-grab'
               : gizmoMode === 'box-select'

@@ -185,10 +185,20 @@ export class RigVisualizer {
     const quatByNode = new Map<string, THREE.Quaternion>();
     const nodeById = new Map<string, RigNodeInfo>();
 
+    const isNodeVisible = (obj: THREE.Object3D): boolean => {
+      let cur: THREE.Object3D | null = obj;
+      while (cur) {
+        if (!cur.visible || cur.userData?.__detachedHidden === true) return false;
+        if (cur === adapter.rootGroup) return true;
+        cur = cur.parent;
+      }
+      return true;
+    };
+
     for (const node of nodes) {
       nodeById.set(node.nodeId, node);
       const obj = getNodeObj(node.nodeId);
-      if (!obj || !obj.visible) continue;
+      if (!obj || !isNodeVisible(obj)) continue;
       const wp = new THREE.Vector3();
       const wq = new THREE.Quaternion();
       obj.getWorldPosition(wp);

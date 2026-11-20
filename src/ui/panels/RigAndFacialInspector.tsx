@@ -760,6 +760,7 @@ export function BodyPartInspector({
   onResetNodeMaterial,
   onRenameNodeGroup,
   onUngroupNodeGroup,
+  onDetachPart,
   onResetNode,
   onToggleNodeLock,
   onToggleNodeVisibility,
@@ -793,6 +794,7 @@ export function BodyPartInspector({
   onResetNodeMaterial?: (instanceId: string, nodeId: string) => void;
   onRenameNodeGroup?: (instanceId: string, groupId: string, name: string) => void;
   onUngroupNodeGroup?: (instanceId: string, groupId: string) => void;
+  onDetachPart?: (instanceId: string, nodeId: string, nodeName: string) => void;
   onResetNode: (instanceId: string, nodeId: string) => void;
   onToggleNodeLock: (instanceId: string, nodeId: string) => void;
   onToggleNodeVisibility: (instanceId: string, nodeId: string) => void;
@@ -886,18 +888,38 @@ export function BodyPartInspector({
         </div>
       )}
 
-      {/* Parent Joint Lock Indicator */}
-      <div
-        data-studio-note={
-          nodeInfo?.parentId
-            ? 'Joint position stays locked to parent bone so limbs pivot smoothly without detaching'
-            : 'Root bone for this character rig'
-        }
-        className="flex items-center justify-between rounded border border-[#2a2e36] bg-[#14161a] px-2.5 py-1 text-[10px] text-[#98a0ad]"
-      >
-        <span>{nodeInfo?.parentId ? 'Socket-locked to parent' : 'Character root joint'}</span>
-        <span className="font-mono-code text-[#e8702a]">G Move · R Rotate · S Scale</span>
-      </div>
+      {/* Detach Part as Independent Object */}
+      {!nodeGroup && nodeId !== 'node_0' && onDetachPart && (
+        <div className="space-y-1.5 rounded border border-[#2a2e36] bg-[#14161a] p-2">
+          <div className="flex items-center justify-between gap-2 text-[10px] text-[#98a0ad]">
+            <span>{nodeInfo?.parentId ? 'Attached to character hierarchy' : 'Part component'}</span>
+            <span className="font-mono-code text-[#e8702a]">G · R · S</span>
+          </div>
+          <StudioButton
+            size="xs"
+            className="w-full"
+            shortcut="Ctrl+Shift+G"
+            note="Detach this part from the character into its own independent clickable object with separate properties"
+            onClick={() => onDetachPart(char.id, nodeId, nodeName)}
+          >
+            <Ungroup className="h-3 w-3" aria-hidden="true" />
+            <span>Detach as Independent Object</span>
+          </StudioButton>
+        </div>
+      )}
+      {(nodeGroup || nodeId === 'node_0' || !onDetachPart) && (
+        <div
+          data-studio-note={
+            nodeGroup
+              ? 'Grouped parts transform together until ungrouped with Ctrl+Shift+G'
+              : 'Root node for this character'
+          }
+          className="flex items-center justify-between rounded border border-[#2a2e36] bg-[#14161a] px-2.5 py-1 text-[10px] text-[#98a0ad]"
+        >
+          <span>{nodeGroup ? 'Grouped assembly' : 'Character root node'}</span>
+          <span className="font-mono-code text-[#e8702a]">G Move · R Rotate · S Scale</span>
+        </div>
+      )}
 
       {/* Smooth Drag Sliders + Precise Degree Inputs */}
       <div className="space-y-2">

@@ -84,6 +84,7 @@ interface LeftAssetPanelProps {
   onGroupSelection: () => void;
   onUngroupGroup: (groupId: string) => void;
   onUngroupNodeGroup?: (instanceId: string, groupId: string) => void;
+  onDetachBodyPart?: (instanceId: string, nodeId: string, nodeName: string) => void;
   onDuplicateGroup: (groupId: string) => void;
   onRenameGroup: (groupId: string, name: string) => void;
   onSelectGroupMembers: (groupId: string) => void;
@@ -136,6 +137,7 @@ export function LeftAssetPanel({
   onGroupSelection,
   onUngroupGroup,
   onUngroupNodeGroup,
+  onDetachBodyPart,
   onDuplicateGroup,
   onRenameGroup,
   onSelectGroupMembers,
@@ -961,11 +963,26 @@ export function LeftAssetPanel({
                           </div>
 
                           {/* Expandable Body Parts / Bone Nodes */}
-                          {expanded && nodes.length > 0 && (
-                            <div className="ml-4 space-y-0.5 border-l border-[#2a2e36] pl-2">
-                              {nodes
-                                .filter((n) => !q || n.name.toLowerCase().includes(q))
-                                .map((node) => {
+                          {expanded && nodes.length > 0 && (() => {
+                            const detachedSet = new Set(char.detachedNodes ?? []);
+                            const nodeById = new Map(nodes.map((n) => [n.nodeId, n]));
+                            const isNodeDetached = (nId: string): boolean => {
+                              let cur: string | null | undefined = nId;
+                              let guard = 0;
+                              while (cur && guard < 16) {
+                                if (detachedSet.has(cur)) return true;
+                                cur = nodeById.get(cur)?.parentId;
+                                guard += 1;
+                              }
+                              return false;
+                            };
+                            const visibleNodes = nodes.filter(
+                              (n) => !isNodeDetached(n.nodeId) && (!q || n.name.toLowerCase().includes(q)),
+                            );
+                            if (visibleNodes.length === 0) return null;
+                            return (
+                              <div className="ml-4 space-y-0.5 border-l border-[#2a2e36] pl-2">
+                                {visibleNodes.map((node) => {
                                   const isNodeSel =
                                     (selection.kind === 'body-part' &&
                                       selection.instanceId === char.id &&
@@ -989,7 +1006,7 @@ export function LeftAssetPanel({
                                         type="button"
                                         data-studio-note={
                                           node.description ??
-                                          `Click to edit ${node.name} · Ctrl+Click to multi-select parts for Ctrl+G group`
+                                          `Click to select ${node.name} · Ctrl+Shift+G to detach into an independent object`
                                         }
                                         onClick={(e) =>
                                           onSelectTarget(
@@ -1021,9 +1038,20 @@ export function LeftAssetPanel({
                                           <button
                                             type="button"
                                             aria-label={`Ungroup ${node.name}`}
-                                            data-studio-note="Ungroup parts back to original joints (Ctrl+Shift+G)"
+                                            data-studio-note="Ungroup parts (Ctrl+Shift+G)"
                                             onClick={() => onUngroupNodeGroup(char.id, node.nodeId)}
                                             className="rounded p-0.5 text-[#f5a16a] hover:bg-[#2a2e36]"
+                                          >
+                                            <Ungroup className="h-2.5 w-2.5" />
+                                          </button>
+                                        )}
+                                        {!isPartGroup && node.nodeId !== 'node_0' && onDetachBodyPart && (
+                                          <button
+                                            type="button"
+                                            aria-label={`Detach ${node.name}`}
+                                            data-studio-note="Detach as independent object (Ctrl+Shift+G)"
+                                            onClick={() => onDetachBodyPart(char.id, node.nodeId, node.name)}
+                                            className="rounded p-0.5 text-[#6b7280] hover:bg-[#2a2e36] hover:text-[#f5a16a]"
                                           >
                                             <Ungroup className="h-2.5 w-2.5" />
                                           </button>
@@ -1050,8 +1078,9 @@ export function LeftAssetPanel({
                                     </div>
                                   );
                                 })}
-                            </div>
-                          )}
+                              </div>
+                            );
+                          })()}
                         </div>
                       );
                     })}
@@ -1059,54 +1088,61 @@ export function LeftAssetPanel({
               )}
             </div>
 
-            {/* Scene Props */}
+            {/* Scene Props & Detached Parts */}
             {sceneProps.length > 0 && (
               <div className="space-y-1">
-                <div className="text-[11px] text-[#98a0ad]">Props</div>
-                {sceneProps.map((prop) => {
-                  const sel =
-                    (selection.kind === 'prop' && selection.propId === prop.id) ||
-                    multiSelectedIds.includes(prop.id);
-                  const isolated = isolatedIds.includes(prop.id);
-                  return (
-                    <div
-                      key={prop.id}
-                      className={`flex items-center gap-0.5 rounded border p-1 ${
-                        sel ? 'border-[#e8702a] bg-[#2a211c]' : 'border-[#2a2e36] bg-[#1e2127]'
-                      }`}
-                    >
-                      <button
-                        type="button"
-                        onClick={(e) =>
-                          onSelectTarget(
-                            { kind: 'prop', propId: prop.id },
-                            e.shiftKey || e.ctrlKey || e.metaKey,
-                          )
-                        }
-                        className="flex min-w-0 flex-1 items-center gap-1.5 px-1 text-left"
+                <div className="text-[11px] text-[#98a0ad]">Props &amp; Detached Parts</div>
+                {sceneProps
+                  .filter((p) => !q || p.name.toLowerCase().includes(q))
+                  .map((prop) => {
+                    const sel =
+                      (selection.kind === 'prop' && selection.propId === prop.id) ||
+                      multiSelectedIds.includes(prop.id);
+                    const isolated = isolatedIds.includes(prop.id);
+                    return (
+                      <div
+                        key={prop.id}
+                        className={`flex items-center gap-0.5 rounded border p-1 ${
+                          sel ? 'border-[#e8702a] bg-[#2a211c]' : 'border-[#2a2e36] bg-[#1e2127]'
+                        }`}
                       >
-                        <Shapes className="h-3.5 w-3.5 shrink-0 text-[#e8702a]" aria-hidden="true" />
-                        <span className="truncate font-medium text-[#e6e8ec]">{prop.name}</span>
-                      </button>
-                      <IconButton
-                        label={`Isolate ${prop.name}`}
-                        active={isolated}
-                        onClick={() => onToggleIsolate(prop.id)}
-                      >
-                        <Focus className="h-3 w-3" />
-                      </IconButton>
-                      <IconButton
-                        label={prop.visible ? `Hide ${prop.name}` : `Show ${prop.name}`}
-                        onClick={() => onTogglePropVisibility(prop.id)}
-                      >
-                        {prop.visible ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
-                      </IconButton>
-                      <IconButton label={`Delete ${prop.name}`} onClick={() => onRemovePropFromScene(prop.id)}>
-                        <Trash2 className="h-3 w-3" />
-                      </IconButton>
-                    </div>
-                  );
-                })}
+                        <button
+                          type="button"
+                          onClick={(e) =>
+                            onSelectTarget(
+                              { kind: 'prop', propId: prop.id },
+                              e.shiftKey || e.ctrlKey || e.metaKey,
+                            )
+                          }
+                          className="flex min-w-0 flex-1 items-center gap-1.5 px-1 text-left"
+                        >
+                          <Shapes className="h-3.5 w-3.5 shrink-0 text-[#e8702a]" aria-hidden="true" />
+                          <span className="truncate font-medium text-[#e6e8ec]">{prop.name}</span>
+                          {prop.kind === 'detached-part' && (
+                            <span className="shrink-0 rounded bg-[#252932] px-1 text-[9px] text-[#98a0ad]">
+                              Part
+                            </span>
+                          )}
+                        </button>
+                        <IconButton
+                          label={`Isolate ${prop.name}`}
+                          active={isolated}
+                          onClick={() => onToggleIsolate(prop.id)}
+                        >
+                          <Focus className="h-3 w-3" />
+                        </IconButton>
+                        <IconButton
+                          label={prop.visible ? `Hide ${prop.name}` : `Show ${prop.name}`}
+                          onClick={() => onTogglePropVisibility(prop.id)}
+                        >
+                          {prop.visible ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
+                        </IconButton>
+                        <IconButton label={`Delete ${prop.name}`} onClick={() => onRemovePropFromScene(prop.id)}>
+                          <Trash2 className="h-3 w-3" />
+                        </IconButton>
+                      </div>
+                    );
+                  })}
               </div>
             )}
 
