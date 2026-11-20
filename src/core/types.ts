@@ -716,18 +716,31 @@ export interface AiBridgeCommand {
     | 'rotate'
     | 'scale'
     | 'set_color'
+    | 'set_visibility'
+    | 'duplicate_target'
     | 'pose_part'
     | 'reset_part'
     | 'detach_part'
     | 'ungroup_all'
     | 'add_keyframe'
+    | 'delete_keyframe'
     | 'add_prop'
     | 'delete_target'
     | 'add_wall'
     | 'remove_wall'
     | 'update_stage'
+    | 'update_scene'
+    | 'set_duration'
+    | 'add_light'
     | 'update_light'
+    | 'delete_light'
     | 'set_camera_pose'
+    | 'add_camera_keyframe'
+    | 'add_action_clip'
+    | 'set_facial_expression'
+    | 'update_motion_path'
+    | 'create_group'
+    | 'ungroup_scene_group'
     | 'set_time'
     | 'play'
     | 'pause'
@@ -737,25 +750,41 @@ export interface AiBridgeCommand {
   sceneId?: string;
   sceneName?: string;
   targetId?: string;
-  targetKind?: 'character' | 'body-part' | 'prop' | 'light' | 'camera' | 'none';
+  targetKind?: 'character' | 'body-part' | 'prop' | 'light' | 'camera' | 'group' | 'none';
   characterId?: string;
   nodeId?: string;
   nodeName?: string;
+  groupId?: string;
+  memberIds?: string[];
   id?: string;
   position?: Partial<Vec3>;
   rotationDeg?: Partial<Vec3>;
   rotationRad?: Partial<Vec3>;
   scale?: Partial<Vec3> | number;
   relative?: boolean;
+  visible?: boolean;
   color?: string;
   emissive?: string;
   roughness?: number;
   metalness?: number;
   opacity?: number;
   time?: number;
+  duration?: number;
+  startTime?: number;
   easing?: EasingType;
   kind?: PropGeometryKind;
+  lightKind?: SceneLightKind;
+  castShadow?: boolean;
   name?: string;
+  actionId?: string;
+  mood?: string;
+  facialState?: Partial<FacialState>;
+  points?: { x: number; y: number; z: number }[];
+  enabled?: boolean;
+  orientAlongPath?: boolean;
+  workArea?: { enabled?: boolean; start?: number; end?: number };
+  showGrid?: boolean;
+  environmentPreset?: EnvironmentPresetId;
   side?: StageWallSide;
   height?: number;
   wallId?: string;
@@ -803,9 +832,13 @@ export interface AiBridgeStateSnapshot {
   sceneId: string;
   sceneName: string;
   duration: number;
+  maxDuration: number;
   currentTime: number;
   isPlaying: boolean;
   backgroundColor: string;
+  showGrid: boolean;
+  environmentPreset?: EnvironmentPresetId;
+  workArea?: { enabled: boolean; start: number; end: number };
   stageConfig: StageEnvironmentConfig;
   camera: CameraPose;
   selection: SelectionTarget;
@@ -817,6 +850,7 @@ export interface AiBridgeStateSnapshot {
     playNativeLoop: boolean;
     transform: Transform3D;
     keyframeCount: number;
+    actionClipsCount: number;
     nodes: { nodeId: string; name: string; type: string; slot?: string }[];
   }[];
   props: {
@@ -826,6 +860,7 @@ export interface AiBridgeStateSnapshot {
     color: string;
     visible: boolean;
     transform: Transform3D;
+    keyframeCount: number;
   }[];
   lights: {
     id: string;
@@ -835,6 +870,13 @@ export interface AiBridgeStateSnapshot {
     intensity: number;
     position: Vec3;
   }[];
+  groups: {
+    id: string;
+    name: string;
+    memberIds: string[];
+    visible: boolean;
+  }[];
 }
+
 
 

@@ -1825,7 +1825,7 @@ export function RightInspector({
         <NumericInput
           label="Dur"
           min={1}
-          max={600}
+          max={3600}
           step={1}
           decimals={1}
           value={activeScene.duration}

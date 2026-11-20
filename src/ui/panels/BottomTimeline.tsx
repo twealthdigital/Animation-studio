@@ -77,6 +77,7 @@ interface BottomTimelineProps {
   onToggleAutoKey: () => void;
   onToggleWorkArea: () => void;
   onTogglePreviewScope: (fullStory: boolean) => void;
+  onChangeDuration?: (duration: number) => void;
   onSelectTarget: (target: SelectionTarget) => void;
   onMoveAudioClip: (clipId: string, startTime: number, duration?: number) => void;
   onDeleteAudioClip: (clipId: string) => void;
@@ -132,6 +133,7 @@ export function BottomTimeline({
   onToggleAutoKey,
   onToggleWorkArea,
   onTogglePreviewScope,
+  onChangeDuration,
   onSelectTarget,
   onMoveAudioClip,
   onDeleteAudioClip,
@@ -547,10 +549,32 @@ export function BottomTimeline({
             <Square className="h-3 w-3" aria-hidden="true" />
           </IconButton>
 
-          <span className="ml-1.5 font-mono-code text-xs text-[#e6e8ec]">
-            {formatTimecode(currentTime)}{' '}
-            <span className="text-[#6b7280]">/ {formatTimecode(scene.duration)}</span>
-            <span className="ml-1.5 text-[10px] text-[#98a0ad]">F{currentFrame}</span>
+          <span className="ml-1.5 flex items-center gap-1 font-mono-code text-xs text-[#e6e8ec]">
+            <span>{formatTimecode(currentTime)}</span>
+            <span className="text-[#6b7280]">/</span>
+            {onChangeDuration ? (
+              <label className="inline-flex items-center gap-0.5 rounded border border-[#2a2e36] bg-[#14161a] px-1 py-0.5 text-[11px] text-[#98a0ad] hover:border-[#383e49]" title="Timeline Duration (seconds, 1–3600)">
+                <input
+                  type="number"
+                  min={1}
+                  max={3600}
+                  step={1}
+                  aria-label="Timeline Duration Seconds"
+                  value={Math.round(scene.duration * 10) / 10}
+                  onChange={(e) => {
+                    const next = Number(e.target.value);
+                    if (Number.isFinite(next) && next >= 1) {
+                      onChangeDuration(Math.min(3600, next));
+                    }
+                  }}
+                  className="w-11 bg-transparent text-right font-mono-code text-[11px] text-[#e6e8ec] focus:text-[#e8702a] focus:outline-none"
+                />
+                <span>s</span>
+              </label>
+            ) : (
+              <span className="text-[#6b7280]">{formatTimecode(scene.duration)}</span>
+            )}
+            <span className="ml-1 text-[10px] text-[#98a0ad]">F{currentFrame}</span>
           </span>
 
           <div className="mx-1.5 h-4 w-px bg-[#2a2e36]" aria-hidden="true" />

@@ -2406,14 +2406,16 @@ export function StudioWorkspace() {
   // Transport controls
   const handleSeek = useCallback(
     (time: number) => {
-      const clamped = Math.max(0, Math.min(activeScene.duration, time));
-      timeRef.current = clamped;
-      setCurrentTime(clamped);
-      const profiles = new Map(activeScene.characters.map((c) => [c.id, c.audioProfile]));
-      audioEngineRef.current?.seek(clamped, activeScene.audioClips, profiles);
-      applySceneEvaluation(displayedScene, clamped, 0);
+      const liveScene = sceneRef.current;
+      const clamped = Math.max(0, Math.min(Math.max(liveScene.duration, 3600), time));
+      const bounded = clamped > liveScene.duration ? liveScene.duration : clamped;
+      timeRef.current = bounded;
+      setCurrentTime(bounded);
+      const profiles = new Map(liveScene.characters.map((c) => [c.id, c.audioProfile]));
+      audioEngineRef.current?.seek(bounded, liveScene.audioClips, profiles);
+      applySceneEvaluation(liveScene, bounded, 0);
     },
-    [activeScene, displayedScene, applySceneEvaluation],
+    [applySceneEvaluation],
   );
 
   const handleTogglePlay = useCallback(() => {
@@ -5647,6 +5649,19 @@ export function StudioWorkspace() {
           }))
         }
         onTogglePreviewScope={setPreviewFullStory}
+        onChangeDuration={(duration) =>
+          commitSceneMutation(
+            `Set Duration ${duration}s`,
+            (s) => ({
+              ...s,
+              duration: Math.max(1, Math.min(3600, duration)),
+              workArea: s.workArea
+                ? { ...s.workArea, end: Math.max(s.workArea.start + 0.5, duration) }
+                : s.workArea,
+            }),
+            'timeline-duration',
+          )
+        }
         onSelectTarget={setSelection}
         onMoveAudioClip={(clipId, startTime, duration) =>
           commitSceneMutation(

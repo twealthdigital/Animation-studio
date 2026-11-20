@@ -215,6 +215,7 @@ function buildStarterSessionState(
     sceneId,
     sceneName,
     duration: 10,
+    maxDuration: 3600,
     currentTime: 0,
     isPlaying: false,
     backgroundColor: '#17191f',
@@ -402,25 +403,41 @@ function isAuthorized(store: BridgeMemoryStore, req: Request, res: Response): bo
 }
 
 export const COMMAND_SCHEMA_SUMMARY = {
+  maxDurationSeconds: 3600,
+  autoExpandsDurationOnKeyframes: true,
   commands: [
     { op: 'create_session', sceneName: 'optional string', note: 'Starts a new isolated scene session immediately.' },
-    { op: 'select', targetKind: 'character|body-part|prop|light|camera|none', id: 'string', nodeId: 'optional string' },
-    { op: 'move', targetId: 'string', nodeId: 'optional string', position: { x: 0, y: 0, z: 0 }, relative: false },
-    { op: 'rotate', targetId: 'string', nodeId: 'optional string', rotationDeg: { x: 0, y: 0, z: 0 }, relative: false },
-    { op: 'scale', targetId: 'string', nodeId: 'optional string', scale: { x: 1, y: 1, z: 1 } },
-    { op: 'set_color', targetId: 'string', nodeId: 'optional string', color: '#hex', emissive: 'optional #hex' },
-    { op: 'pose_part', characterId: 'string', nodeId: 'string (or nodeName)', rotationDeg: { x: 0, y: 0, z: 0 }, position: 'optional vec3', scale: 'optional vec3' },
+    { op: 'set_duration', duration: 'number (1..3600 seconds, e.g. 60)' },
+    { op: 'update_scene', duration: '1..3600', name: 'string', backgroundColor: '#hex', showGrid: true, environmentPreset: 'studio-dark|sunset-stage|daylight-cyclorama|neon-night|minimal-white', workArea: { enabled: true, start: 0, end: 60 } },
+    { op: 'select', targetKind: 'character|body-part|prop|light|camera|group|none', id: 'string', nodeId: 'optional string' },
+    { op: 'move', targetId: 'string', nodeId: 'optional string', position: { x: 0, y: 0, z: 0 }, relative: false, time: 'optional number (seconds)' },
+    { op: 'rotate', targetId: 'string', nodeId: 'optional string', rotationDeg: { x: 0, y: 0, z: 0 }, relative: false, time: 'optional number (seconds)' },
+    { op: 'scale', targetId: 'string', nodeId: 'optional string', scale: { x: 1, y: 1, z: 1 }, time: 'optional number (seconds)' },
+    { op: 'set_color', targetId: 'string', nodeId: 'optional string', color: '#hex', emissive: 'optional #hex', roughness: '0..1', metalness: '0..1', opacity: '0..1' },
+    { op: 'set_visibility', targetId: 'string', nodeId: 'optional string', visible: true },
+    { op: 'duplicate_target', targetId: 'string', name: 'optional string', position: 'optional vec3' },
+    { op: 'pose_part', characterId: 'string', nodeId: 'string (or nodeName)', rotationDeg: { x: 0, y: 0, z: 0 }, position: 'optional vec3', scale: 'optional vec3', time: 'optional number' },
     { op: 'reset_part', characterId: 'string', nodeId: 'string' },
     { op: 'detach_part', characterId: 'string', nodeId: 'string' },
     { op: 'ungroup_all', characterId: 'string' },
-    { op: 'add_keyframe', targetId: 'string', nodeId: 'optional string', time: 'number (seconds)', easing: 'smooth|linear|easeIn|easeOut|easeInOut|step' },
-    { op: 'add_prop', kind: 'box|sphere|cylinder|cone|podium|desk|chair|lamp|tree', name: 'string', color: '#hex', position: { x: 0, y: 0, z: 0 } },
+    { op: 'add_keyframe', targetId: 'string', nodeId: 'optional string', time: 'number (seconds, auto-extends duration)', position: 'optional vec3', rotationDeg: 'optional vec3', scale: 'optional vec3|number', easing: 'smooth|linear|easeIn|easeOut|easeInOut|step' },
+    { op: 'delete_keyframe', targetId: 'string', nodeId: 'optional string', time: 'optional number (omit to clear all)' },
+    { op: 'add_prop', kind: 'box|sphere|cylinder|cone|podium|desk|chair|lamp|tree', name: 'string', color: '#hex', position: { x: 0, y: 0, z: 0 }, rotationDeg: 'optional vec3', scale: 'optional vec3|number' },
     { op: 'delete_target', targetId: 'string' },
     { op: 'add_wall', side: 'back|left|right|front', color: '#hex', height: 8 },
-    { op: 'update_stage', floorShape: 'square|rectangle|circle|polygon', floorSides: 4, floorSize: 28, floorColor: '#hex', showClouds: true, cloudColor: '#hex', floorLockEnabled: true, backgroundColor: '#hex' },
-    { op: 'update_light', lightId: 'string', color: '#hex', intensity: 1.4, position: { x: 4, y: 8, z: 6 } },
+    { op: 'remove_wall', wallId: 'string' },
+    { op: 'update_stage', floorShape: 'square|rectangle|circle|polygon', floorSides: 4, floorSize: 28, floorColor: '#hex', gridColor: '#hex', showClouds: true, cloudColor: '#hex', cloudOpacity: 0.42, floorLockEnabled: true, backgroundColor: '#hex' },
+    { op: 'add_light', lightKind: 'point|directional|spot|ambient', name: 'string', color: '#hex', intensity: 1.5, position: { x: 3, y: 6, z: 4 } },
+    { op: 'update_light', lightId: 'string', color: '#hex', intensity: 1.4, position: { x: 4, y: 8, z: 6 }, visible: true },
+    { op: 'delete_light', lightId: 'string' },
     { op: 'set_camera_pose', position: { x: 0, y: 3, z: 12 }, target: { x: 0, y: 1.5, z: 0 }, fov: 40 },
-    { op: 'set_time', time: 'number (seconds)' },
+    { op: 'add_camera_keyframe', time: 'number (seconds, auto-extends duration)', position: { x: 0, y: 4, z: 10 }, target: { x: 0, y: 1.5, z: 0 }, fov: 40, easing: 'smooth|linear' },
+    { op: 'add_action_clip', characterId: 'string', actionId: 'walk|run|wave|jump|dance|sit|idle|celebrate|nod', startTime: 0, duration: 3, speed: 1, mood: 'optional string' },
+    { op: 'set_facial_expression', characterId: 'string', time: 'number', facialState: { smile: 0.8, mouthOpen: 0.4, blink: 0, surprise: 0 } },
+    { op: 'update_motion_path', targetId: 'string', points: [{ x: 0, y: 0, z: 0 }, { x: 4, y: 0, z: 0 }], duration: 6, orientAlongPath: true, enabled: true },
+    { op: 'create_group', name: 'string', memberIds: ['id1', 'id2'] },
+    { op: 'ungroup_scene_group', groupId: 'string' },
+    { op: 'set_time', time: 'number (seconds, auto-extends duration)' },
     { op: 'play', speed: 1 },
     { op: 'pause' },
     { op: 'bake_html_motion', characterId: 'string' },
@@ -439,6 +456,27 @@ async function dispatchCommandsToStudio(
   const batchId = `aibatch_${now}_${crypto.randomBytes(3).toString('hex')}`;
   session.lastActivityAt = now;
   session.batchCount += 1;
+
+  // Optimistically mirror timeline duration/rename changes on starter session state
+  if (session.state) {
+    for (const rawCmd of commands) {
+      if (!rawCmd || typeof rawCmd !== 'object') continue;
+      const c = rawCmd as Record<string, unknown>;
+      if ((c.op === 'set_duration' || c.op === 'update_scene') && typeof c.duration === 'number' && Number.isFinite(c.duration)) {
+        session.state.duration = Math.max(1, Math.min(3600, c.duration));
+      }
+      if ((c.op === 'rename_scene' || c.op === 'update_scene') && typeof c.name === 'string' && c.name.trim()) {
+        session.sceneName = c.name.trim();
+        session.state.sceneName = c.name.trim();
+      }
+      if (typeof c.time === 'number' && Number.isFinite(c.time)) {
+        const curDur = typeof session.state.duration === 'number' ? session.state.duration : 10;
+        if (c.time > curDur) {
+          session.state.duration = Math.max(curDur, Math.min(3600, Math.ceil(c.time)));
+        }
+      }
+    }
+  }
 
   const batch: PendingBatch = {
     batchId,
@@ -621,7 +659,7 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
       {
         name: 'run_commands',
         description:
-          'Send live editing commands exclusively to THIS session’s isolated Stagecraft 3D scene while the user watches in real time. Never blocks or interferes with other Claude sessions.',
+          'Send live editing commands exclusively to THIS session’s isolated Stagecraft 3D scene while the user watches in real time. Full studio control: set_duration (1..3600s, also auto-expands when keyframing past current end), update_scene, add_prop, move, rotate, scale, set_color, set_visibility, duplicate_target, pose_part, add_keyframe, delete_keyframe, add_action_clip, set_facial_expression, update_motion_path, add_light, update_light, delete_light, set_camera_pose, add_camera_keyframe, update_stage, add_wall, create_group, ungroup_all, detach_part, set_time, play, pause, bake_html_motion.',
         inputSchema: {
           type: 'object',
           properties: {
