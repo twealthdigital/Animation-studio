@@ -30,6 +30,7 @@ import type {
   RigNodeInfo,
   SaveStatus,
   SceneCameraItem,
+  SceneCreationEvent,
   SceneData,
   SceneLightData,
   SceneLightKind,
@@ -369,14 +370,31 @@ export function StudioWorkspace() {
   const [aiBridgeOpen, setAiBridgeOpen] = useState(false);
   const [aiAccessEnabled, setAiAccessEnabled] = useState(false);
   const [aiToken, setAiToken] = useState('');
+  const [aiTokenRevoked, setAiTokenRevoked] = useState(false);
+  const [aiTokenUpdatedAt, setAiTokenUpdatedAt] = useState(0);
+  const [aiSingleClientLock, setAiSingleClientLock] = useState(true);
+  const [aiMultiClientWarning, setAiMultiClientWarning] = useState<string | null>(null);
+  const [aiMultiStudioWarning, setAiMultiStudioWarning] = useState<string | null>(null);
   const [aiConnectedStudios, setAiConnectedStudios] = useState(0);
   const [aiPaused, setAiPaused] = useState(false);
-  const [aiStepDelayMs, setAiStepDelayMs] = useState(350);
+  const [aiStepDelayMs, setAiStepDelayMs] = useState(0);
   const [aiAutoHighlight, setAiAutoHighlight] = useState(true);
   const [aiLogs, setAiLogs] = useState<AiBridgeLogEntry[]>([]);
   const [aiQueueLength, setAiQueueLength] = useState(0);
   const [aiBatchUndoStack, setAiBatchUndoStack] = useState<SceneData[]>([]);
-  const [aiSessions, setAiSessions] = useState<AiSessionSummary[]>([]);
+  const [aiSessions, setAiSessions] = useState<AiSessionSummary[]>(() => {
+    try {
+      const raw = window.localStorage.getItem('stagecraft_ai_sessions_v1');
+      if (raw) {
+        const parsed = JSON.parse(raw) as AiSessionSummary[];
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // Ignore storage error
+    }
+    return [];
+  });
+  const [aiSceneEvents, setAiSceneEvents] = useState<SceneCreationEvent[]>([]);
   const [aiAutoSwitchSession, setAiAutoSwitchSession] = useState(true);
   const [cloudSyncCode, setCloudSyncCode] = useState<string | null>(null);
   const [dialogueTargetCharId, setDialogueTargetCharId] = useState<string | null>(null);
@@ -3110,17 +3128,35 @@ export function StudioWorkspace() {
     [commitSceneMutation],
   );
 
-  // ---------- AI Live Bridge & Watch Mode (Multi-Claude Session Isolated) ----------
+  // ---------- AI Live Bridge & Watch Mode (1 Session = 1 Stable Scene) ----------
+  const studioTabIdRef = useRef<string>('');
+  if (!studioTabIdRef.current && typeof window !== 'undefined') {
+    try {
+      const existingTab = window.sessionStorage.getItem('stagecraft_tab_id_v1');
+      if (existingTab) {
+        studioTabIdRef.current = existingTab;
+      } else {
+        const nextTab = createId('tab');
+        window.sessionStorage.setItem('stagecraft_tab_id_v1', nextTab);
+        studioTabIdRef.current = nextTab;
+      }
+    } catch {
+      studioTabIdRef.current = createId('tab');
+    }
+  }
+
   const aiPausedRef = useRef(aiPaused);
   const aiStepDelayRef = useRef(aiStepDelayMs);
   const aiAutoHighlightRef = useRef(aiAutoHighlight);
   const aiAutoSwitchSessionRef = useRef(aiAutoSwitchSession);
   const aiSessionsRef = useRef(aiSessions);
+  const aiTokenUpdatedAtRef = useRef(aiTokenUpdatedAt);
   aiPausedRef.current = aiPaused;
   aiStepDelayRef.current = aiStepDelayMs;
   aiAutoHighlightRef.current = aiAutoHighlight;
   aiAutoSwitchSessionRef.current = aiAutoSwitchSession;
   aiSessionsRef.current = aiSessions;
+  aiTokenUpdatedAtRef.current = aiTokenUpdatedAt;
 
   interface QueuedAiBatch {
     batchId: string;
@@ -3128,10 +3164,41 @@ export function StudioWorkspace() {
     sceneId?: string;
     sceneName?: string;
     source: string;
+    isSessionCreation?: boolean;
     commands: AiBridgeCommand[];
   }
   const aiQueueRef = useRef<QueuedAiBatch[]>([]);
   const aiProcessingRef = useRef(false);
+
+  const applyServerBridgeState = useCallback((d: Record<string, unknown>) => {
+    const incomingTokenUpdatedAt = typeof d.tokenUpdatedAt === 'number' ? d.tokenUpdatedAt : 0;
+    const isNewerOrEqualToken = incomingTokenUpdatedAt >= aiTokenUpdatedAtRef.current;
+
+    if (isNewerOrEqualToken) {
+      if (typeof d.tokenRevoked === 'boolean') {
+        setAiTokenRevoked(d.tokenRevoked);
+        if (d.tokenRevoked) setAiToken('');
+      }
+      if (typeof d.token === 'string' && !d.tokenRevoked) {
+        setAiToken(d.token);
+      }
+      if (incomingTokenUpdatedAt > 0) {
+        aiTokenUpdatedAtRef.current = incomingTokenUpdatedAt;
+        setAiTokenUpdatedAt(incomingTokenUpdatedAt);
+      }
+      if (typeof d.enabled === 'boolean') setAiAccessEnabled(d.enabled);
+    }
+    if (typeof d.singleClientLock === 'boolean') setAiSingleClientLock(d.singleClientLock);
+    if ('multiClientWarning' in d) {
+      setAiMultiClientWarning(typeof d.multiClientWarning === 'string' ? d.multiClientWarning : null);
+    }
+    if ('multiStudioWarning' in d) {
+      setAiMultiStudioWarning(typeof d.multiStudioWarning === 'string' ? d.multiStudioWarning : null);
+    }
+    if (typeof d.connectedStudios === 'number') setAiConnectedStudios(d.connectedStudios);
+    if (Array.isArray(d.sessions)) setAiSessions(d.sessions as AiSessionSummary[]);
+    if (Array.isArray(d.sceneEvents)) setAiSceneEvents(d.sceneEvents as SceneCreationEvent[]);
+  }, []);
 
   const ensureAiSessionScene = useCallback(
     (sessionId: string, sceneId: string, sceneName: string) => {
@@ -3154,6 +3221,7 @@ export function StudioWorkspace() {
         }
         setProjects((prev) => prev.map((p) => (p.id === nextProj.id ? nextProj : p)));
         setSaveStatus('unsaved');
+        void dbSaveProject(nextProj).catch(() => {});
       } else if (aiAutoSwitchSessionRef.current && projectRef.current.activeSceneId !== sceneId) {
         updateActiveProject((proj) => ({ ...proj, activeSceneId: sceneId }), false);
       }
@@ -3172,6 +3240,8 @@ export function StudioWorkspace() {
               label: sceneName || 'Claude Session',
               sceneId,
               sceneName: sceneName || 'Claude Session',
+              bound: true,
+              status: 'active',
               createdAt: Date.now(),
               lastActivityAt: Date.now(),
               batchCount: 1,
@@ -3229,43 +3299,88 @@ export function StudioWorkspace() {
         const batch = aiQueueRef.current.shift()!;
         setAiQueueLength(aiQueueRef.current.length + batch.commands.length);
 
-        const targetSceneId = batch.sceneId || sceneRef.current.id;
-        if (batch.sceneId && batch.sessionId) {
+        const hasCreateSession =
+          Boolean(batch.isSessionCreation) || batch.commands.some((c) => c.op === 'create_session');
+
+        if (hasCreateSession && batch.sceneId && batch.sessionId) {
           ensureAiSessionScene(batch.sessionId, batch.sceneId, batch.sceneName ?? batch.source);
         }
 
-        const initialTargetScene =
-          projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? sceneRef.current;
+        const targetSceneId = batch.sceneId || sceneRef.current.id;
+        const initialTargetScene = projectRef.current.scenes.find((s) => s.id === targetSceneId);
+
+        // STRICT GUARD: Never silently fall back to active scene or create an empty scene for non-create_session batches!
+        if (!initialTargetScene) {
+          const errResults = batch.commands.map((c, index) => ({
+            index,
+            op: c.op,
+            ok: false,
+            summary: `Skipped: target scene "${targetSceneId}" does not exist in Studio (refusing to run in wrong scene)`,
+          }));
+          setAiLogs((prev) => [
+            {
+              id: createId('ailog'),
+              timestamp: Date.now(),
+              source: batch.source,
+              sessionId: batch.sessionId,
+              sceneName: batch.sceneName ?? targetSceneId,
+              summary: `Rejected batch: scene "${targetSceneId}" not found in Studio`,
+              status: 'error',
+            },
+            ...prev.slice(0, 59),
+          ]);
+          void fetch('/api/ai/ack', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              batchId: batch.batchId,
+              sessionId: batch.sessionId,
+              sceneId: batch.sceneId,
+              appliedSceneId: null,
+              ok: false,
+              error: `Target scene "${targetSceneId}" does not exist in Studio.`,
+              results: errResults,
+            }),
+          }).catch(() => {});
+          continue;
+        }
+
         if (targetSceneId === sceneRef.current.id) {
           setAiBatchUndoStack((prev) => [cloneScene(initialTargetScene), ...prev].slice(0, 15));
         }
 
-        const results: { op: string; ok: boolean; summary: string }[] = [];
+        const fastBatch = aiStepDelayRef.current === 0 && batch.commands.length > 8;
+        const results: { index: number; op: string; ok: boolean; summary: string }[] = [];
+
         for (let i = 0; i < batch.commands.length; i++) {
           while (aiPausedRef.current) {
             await new Promise((r) => setTimeout(r, 120));
           }
           const cmd = batch.commands[i];
-          setAiQueueLength(
-            aiQueueRef.current.reduce((acc, b) => acc + b.commands.length, 0) + (batch.commands.length - i),
-          );
+          if (!fastBatch || i % 10 === 0) {
+            setAiQueueLength(
+              aiQueueRef.current.reduce((acc, b) => acc + b.commands.length, 0) + (batch.commands.length - i),
+            );
+          }
 
           const logId = createId('ailog');
-          setAiLogs((prev) => [
-            {
-              id: logId,
-              timestamp: Date.now(),
-              source: batch.source,
-              sessionId: batch.sessionId,
-              sceneName: batch.sceneName ?? initialTargetScene.name,
-              summary: `Running ${cmd.op}...`,
-              status: 'running',
-            },
-            ...prev.slice(0, 59),
-          ]);
+          if (!fastBatch) {
+            setAiLogs((prev) => [
+              {
+                id: logId,
+                timestamp: Date.now(),
+                source: batch.source,
+                sessionId: batch.sessionId,
+                sceneName: batch.sceneName ?? initialTargetScene.name,
+                summary: `Running ${cmd.op}...`,
+                status: 'running',
+              },
+              ...prev.slice(0, 59),
+            ]);
+          }
 
           const liveTargetScene =
-            projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? sceneRef.current;
+            projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? initialTargetScene;
           const isViewingThisScene = targetSceneId === sceneRef.current.id;
 
           const res = executeSingleAiCommand(
@@ -3339,32 +3454,54 @@ export function StudioWorkspace() {
               },
             },
             cmd,
-            aiAutoHighlightRef.current && isViewingThisScene,
+            aiAutoHighlightRef.current && isViewingThisScene && !fastBatch,
           );
 
-          results.push({ op: cmd.op, ok: res.ok, summary: res.summary });
-          setAiLogs((prev) =>
-            prev.map((entry) =>
-              entry.id === logId
-                ? {
-                    ...entry,
-                    summary: res.summary,
-                    status: res.ok ? 'applied' : 'error',
-                    timestamp: Date.now(),
-                  }
-                : entry,
-            ),
-          );
+          results.push({ index: i, op: cmd.op, ok: res.ok, summary: res.summary });
+          if (!fastBatch) {
+            setAiLogs((prev) =>
+              prev.map((entry) =>
+                entry.id === logId
+                  ? {
+                      ...entry,
+                      summary: res.summary,
+                      status: res.ok ? 'applied' : 'error',
+                      timestamp: Date.now(),
+                    }
+                  : entry,
+              ),
+            );
+          }
 
           if (aiStepDelayRef.current > 0) {
             await new Promise((r) => setTimeout(r, aiStepDelayRef.current));
-          } else {
-            await new Promise((r) => setTimeout(r, 16));
+          } else if (!fastBatch || i % 20 === 19) {
+            await new Promise((r) => setTimeout(r, 0));
           }
         }
 
+        if (fastBatch) {
+          const okCount = results.filter((r) => r.ok).length;
+          const failCount = results.length - okCount;
+          setAiLogs((prev) => [
+            {
+              id: createId('ailog'),
+              timestamp: Date.now(),
+              source: batch.source,
+              sessionId: batch.sessionId,
+              sceneName: batch.sceneName ?? initialTargetScene.name,
+              summary: `Executed ${results.length} commands (${okCount} ok, ${failCount} failed)`,
+              status: failCount === 0 ? 'applied' : 'error',
+            },
+            ...prev.slice(0, 59),
+          ]);
+        }
+
+        // Immediately persist updated scene to IndexedDB so refresh/close never loses AI work
+        void dbSaveProject(projectRef.current).catch(() => {});
+
         const updatedTargetScene =
-          projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? sceneRef.current;
+          projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? initialTargetScene;
         const latestSnapshot = buildAiSceneSnapshot(
           projectRef.current,
           updatedTargetScene,
@@ -3380,6 +3517,8 @@ export function StudioWorkspace() {
           body: JSON.stringify({
             batchId: batch.batchId,
             sessionId: batch.sessionId,
+            sceneId: batch.sceneId ?? targetSceneId,
+            appliedSceneId: updatedTargetScene.id,
             ok: results.every((r) => r.ok),
             results,
             state: latestSnapshot,
@@ -3408,7 +3547,7 @@ export function StudioWorkspace() {
       commands: AiBridgeCommand[],
       source = 'External AI',
       batchId = createId('localbatch'),
-      meta?: { sessionId?: string; sceneId?: string; sceneName?: string },
+      meta?: { sessionId?: string; sceneId?: string; sceneName?: string; isSessionCreation?: boolean },
     ) => {
       if (commands.length === 0) return;
       if (executedBatchIdsRef.current.has(batchId)) return;
@@ -3422,6 +3561,7 @@ export function StudioWorkspace() {
         sessionId: meta?.sessionId,
         sceneId: meta?.sceneId,
         sceneName: meta?.sceneName,
+        isSessionCreation: meta?.isSessionCreation,
         source,
         commands,
       });
@@ -3431,13 +3571,13 @@ export function StudioWorkspace() {
     [runAiQueue],
   );
 
-  // Connect to SSE (/api/ai/stream) + fetch/restore persisted AI config across Vercel cold starts
+  // Connect to SSE (/api/ai/stream) + fetch/restore persisted AI config across serverless cold starts
   useEffect(() => {
     let active = true;
-    let savedPrefs: { enabled?: boolean; token?: string } = {};
+    let savedPrefs: { enabled?: boolean; token?: string; tokenUpdatedAt?: number; singleClientLock?: boolean } = {};
     try {
       const raw = window.localStorage.getItem('stagecraft_ai_bridge_v1');
-      if (raw) savedPrefs = JSON.parse(raw) as { enabled?: boolean; token?: string };
+      if (raw) savedPrefs = JSON.parse(raw) as typeof savedPrefs;
     } catch {
       // Ignore storage error
     }
@@ -3446,66 +3586,64 @@ export function StudioWorkspace() {
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (!active || !data) return;
-        const effectiveEnabled =
-          typeof savedPrefs.enabled === 'boolean' ? savedPrefs.enabled : Boolean(data.enabled);
-        const effectiveToken =
-          typeof savedPrefs.token === 'string' && savedPrefs.token.trim()
-            ? savedPrefs.token.trim()
-            : typeof data.token === 'string'
-              ? data.token
-              : '';
-        setAiAccessEnabled(effectiveEnabled);
-        if (effectiveToken) setAiToken(effectiveToken);
-        if (typeof data.connectedStudios === 'number') setAiConnectedStudios(data.connectedStudios);
-        if (Array.isArray(data.sessions)) setAiSessions(data.sessions as AiSessionSummary[]);
+        const serverUpdatedAt = typeof data.tokenUpdatedAt === 'number' ? data.tokenUpdatedAt : 0;
+        const savedUpdatedAt = typeof savedPrefs.tokenUpdatedAt === 'number' ? savedPrefs.tokenUpdatedAt : 0;
 
-        if (savedPrefs.enabled || savedPrefs.token) {
+        applyServerBridgeState(data as Record<string, unknown>);
+
+        // Hydrate cold empty server ONLY if server has not rotated/revoked token
+        if (!data.tokenRevoked && serverUpdatedAt === 0 && (savedPrefs.enabled || (savedPrefs.token && savedUpdatedAt === 0))) {
+          const effectiveEnabled =
+            typeof savedPrefs.enabled === 'boolean' ? savedPrefs.enabled : Boolean(data.enabled);
+          const effectiveToken =
+            typeof savedPrefs.token === 'string' && savedPrefs.token.trim()
+              ? savedPrefs.token.trim()
+              : typeof data.token === 'string'
+                ? data.token
+                : '';
+          setAiAccessEnabled(effectiveEnabled);
+          if (effectiveToken) setAiToken(effectiveToken);
           void fetch('/api/ai/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               enabled: effectiveEnabled,
               ...(effectiveToken ? { token: effectiveToken } : {}),
+              ...(typeof savedPrefs.singleClientLock === 'boolean'
+                ? { singleClientLock: savedPrefs.singleClientLock }
+                : {}),
             }),
           })
             .then((r) => (r.ok ? r.json() : null))
             .then((synced) => {
-              if (active && synced && typeof synced.token === 'string') {
-                setAiToken(synced.token);
-              }
+              if (active && synced) applyServerBridgeState(synced as Record<string, unknown>);
             })
             .catch(() => {});
         }
       })
       .catch(() => {});
 
-    const es = new EventSource('/api/ai/stream');
+    const es = new EventSource(`/api/ai/stream?tabId=${encodeURIComponent(studioTabIdRef.current)}`);
     es.addEventListener('ai:connected', (ev) => {
       try {
-        const d = JSON.parse((ev as MessageEvent).data) as {
-          enabled?: boolean;
-          connectedStudios?: number;
-          sessions?: AiSessionSummary[];
-        };
-        if (typeof d.connectedStudios === 'number') setAiConnectedStudios(d.connectedStudios);
-        if (Array.isArray(d.sessions)) setAiSessions(d.sessions);
-        if (typeof savedPrefs.enabled !== 'boolean' && typeof d.enabled === 'boolean') {
-          setAiAccessEnabled(d.enabled);
-        }
+        const d = JSON.parse((ev as MessageEvent).data) as Record<string, unknown>;
+        applyServerBridgeState(d);
       } catch {
         // Ignore parse issue
       }
     });
     es.addEventListener('ai:config', (ev) => {
       try {
-        const d = JSON.parse((ev as MessageEvent).data) as {
-          enabled?: boolean;
-          connectedStudios?: number;
-          sessions?: AiSessionSummary[];
-        };
-        if (typeof d.enabled === 'boolean') setAiAccessEnabled(d.enabled);
-        if (typeof d.connectedStudios === 'number') setAiConnectedStudios(d.connectedStudios);
-        if (Array.isArray(d.sessions)) setAiSessions(d.sessions);
+        const d = JSON.parse((ev as MessageEvent).data) as Record<string, unknown>;
+        applyServerBridgeState(d);
+      } catch {
+        // Ignore parse issue
+      }
+    });
+    es.addEventListener('ai:warning', (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data) as Record<string, unknown>;
+        applyServerBridgeState(d);
       } catch {
         // Ignore parse issue
       }
@@ -3518,6 +3656,7 @@ export function StudioWorkspace() {
           sceneId?: string;
           sceneName?: string;
           source?: string;
+          isSessionCreation?: boolean;
           commands?: AiBridgeCommand[];
         };
         if (Array.isArray(d.commands) && d.commands.length > 0) {
@@ -3525,6 +3664,7 @@ export function StudioWorkspace() {
             sessionId: d.sessionId,
             sceneId: d.sceneId,
             sceneName: d.sceneName,
+            isSessionCreation: d.isSessionCreation,
           });
         }
       } catch {
@@ -3536,27 +3676,44 @@ export function StudioWorkspace() {
       active = false;
       es.close();
     };
-  }, [enqueueAiBatch]);
+  }, [applyServerBridgeState, enqueueAiBatch]);
 
-  // Persist AI Bridge toggle & token locally so Vercel serverless restarts retain the same key
+  // Persist AI Bridge toggle, token state, and lock locally
   useEffect(() => {
-    if (!aiToken) return;
+    if (!aiToken && !aiTokenRevoked) return;
     try {
       window.localStorage.setItem(
         'stagecraft_ai_bridge_v1',
-        JSON.stringify({ enabled: aiAccessEnabled, token: aiToken }),
+        JSON.stringify({
+          enabled: aiAccessEnabled,
+          token: aiTokenRevoked ? '' : aiToken,
+          tokenRevoked: aiTokenRevoked,
+          tokenUpdatedAt: aiTokenUpdatedAt,
+          singleClientLock: aiSingleClientLock,
+        }),
       );
     } catch {
       // Ignore storage error
     }
-  }, [aiAccessEnabled, aiToken]);
+  }, [aiAccessEnabled, aiToken, aiTokenRevoked, aiTokenUpdatedAt, aiSingleClientLock]);
 
-  // Keep server AI snapshot + all per-session isolated scene snapshots synced
+  // Persist bound AI sessions locally so Chrome close/reopen keeps session->scene bindings intact
   useEffect(() => {
-    if (!aiAccessEnabled && !aiBridgeOpen) return;
+    try {
+      const bound = aiSessions.filter((sess) => sess.bound && sess.sceneId);
+      window.localStorage.setItem('stagecraft_ai_sessions_v1', JSON.stringify(bound));
+    } catch {
+      // Ignore storage error
+    }
+  }, [aiSessions]);
+
+  // Keep server AI snapshot + all scene metadata + bound session re-hydration synced
+  useEffect(() => {
+    if (!aiAccessEnabled && !aiBridgeOpen && aiSessionsRef.current.length === 0) return;
     const t = window.setTimeout(() => {
       const sessionSnapshots: Record<string, ReturnType<typeof buildAiSceneSnapshot>> = {};
       for (const sess of aiSessionsRef.current) {
+        if (!sess.sceneId) continue;
         const sc = activeProject.scenes.find((s) => s.id === sess.sceneId);
         if (sc) {
           sessionSnapshots[sess.sessionId] = buildAiSceneSnapshot(
@@ -3571,19 +3728,65 @@ export function StudioWorkspace() {
         }
       }
 
+      const knownScenes = activeProject.scenes.map((sc) => ({
+        sceneId: sc.id,
+        sceneName: sc.name,
+        duration: sc.duration,
+        charactersCount: sc.characters.length,
+        propsCount: (sc.props ?? []).length,
+        state: buildAiSceneSnapshot(
+          activeProject,
+          sc,
+          sc.id === activeScene.id ? currentTime : 0,
+          sc.id === activeScene.id ? isPlaying : false,
+          sc.id === activeScene.id ? selection : { kind: 'none' },
+          rigNodesByInstance,
+        ),
+      }));
+
+      const knownSessionBindings = aiSessionsRef.current
+        .filter((sess) => sess.bound && sess.sceneId && activeProject.scenes.some((sc) => sc.id === sess.sceneId))
+        .map((sess) => ({
+          sessionId: sess.sessionId,
+          label: sess.label,
+          sceneId: sess.sceneId as string,
+          sceneName: sess.sceneName ?? sess.label,
+          createdAt: sess.createdAt,
+          lastActivityAt: sess.lastActivityAt,
+          batchCount: sess.batchCount,
+        }));
+
       void fetch('/api/ai/sync-state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          tabId: studioTabIdRef.current,
           enabled: aiAccessEnabled,
-          token: aiToken,
           state: aiSnapshot,
           sessionSnapshots,
+          knownScenes,
+          knownSessionBindings,
         }),
-      }).catch(() => {});
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (d) applyServerBridgeState(d as Record<string, unknown>);
+        })
+        .catch(() => {});
     }, 240);
     return () => window.clearTimeout(t);
-  }, [aiAccessEnabled, aiBridgeOpen, aiToken, aiSnapshot, activeProject, activeScene.id, currentTime, isPlaying, selection, rigNodesByInstance]);
+  }, [
+    aiAccessEnabled,
+    aiBridgeOpen,
+    aiSnapshot,
+    activeProject,
+    activeScene.id,
+    currentTime,
+    isPlaying,
+    selection,
+    rigNodesByInstance,
+    applyServerBridgeState,
+  ]);
 
   useEffect(() => {
     if (!aiAccessEnabled) return;
@@ -3591,13 +3794,13 @@ export function StudioWorkspace() {
       const params = new URLSearchParams({
         after: String(lastPollMsRef.current),
         enabled: '1',
-        ...(aiToken ? { token: aiToken } : {}),
+        tabId: studioTabIdRef.current,
       });
       void fetch(`/api/ai/poll?${params.toString()}`)
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => {
           if (!d) return;
-          if (Array.isArray(d.sessions)) setAiSessions(d.sessions as AiSessionSummary[]);
+          applyServerBridgeState(d as Record<string, unknown>);
           if (!Array.isArray(d.batches)) return;
           for (const b of d.batches as {
             batchId?: string;
@@ -3605,6 +3808,7 @@ export function StudioWorkspace() {
             sceneId?: string;
             sceneName?: string;
             source?: string;
+            isSessionCreation?: boolean;
             commands?: AiBridgeCommand[];
             createdAt?: number;
           }[]) {
@@ -3616,6 +3820,7 @@ export function StudioWorkspace() {
                 sessionId: b.sessionId,
                 sceneId: b.sceneId,
                 sceneName: b.sceneName,
+                isSessionCreation: b.isSessionCreation,
               });
             }
           }
@@ -3623,7 +3828,7 @@ export function StudioWorkspace() {
         .catch(() => {});
     }, 1200);
     return () => window.clearInterval(pollId);
-  }, [aiAccessEnabled, aiToken, enqueueAiBatch]);
+  }, [aiAccessEnabled, applyServerBridgeState, enqueueAiBatch]);
 
   const handleSaveProjectToCloud = useCallback(async () => {
     const usedAssetIds = new Set<string>();
@@ -4593,6 +4798,17 @@ export function StudioWorkspace() {
                       p.activeSceneId === sceneId ? remaining[0].id : p.activeSceneId,
                   };
                 });
+                setAiSessions((prev) => prev.filter((sess) => sess.sceneId !== sceneId));
+                void fetch('/api/ai/scenes/deleted', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ sceneId }),
+                })
+                  .then((r) => (r.ok ? r.json() : null))
+                  .then((d) => {
+                    if (d) applyServerBridgeState(d as Record<string, unknown>);
+                  })
+                  .catch(() => {});
                 setConfirmState(null);
               },
             });
@@ -6062,6 +6278,11 @@ export function StudioWorkspace() {
         onClose={() => setAiBridgeOpen(false)}
         enabled={aiAccessEnabled}
         token={aiToken}
+        tokenRevoked={aiTokenRevoked}
+        tokenUpdatedAt={aiTokenUpdatedAt}
+        singleClientLock={aiSingleClientLock}
+        multiClientWarning={aiMultiClientWarning}
+        multiStudioWarning={aiMultiStudioWarning}
         connectedStudios={aiConnectedStudios}
         paused={aiPaused}
         stepDelayMs={aiStepDelayMs}
@@ -6069,6 +6290,7 @@ export function StudioWorkspace() {
         autoSwitchSession={aiAutoSwitchSession}
         activeSceneId={activeScene.id}
         sessions={aiSessions}
+        sceneEvents={aiSceneEvents}
         queueLength={aiQueueLength}
         logs={aiLogs}
         snapshot={aiSnapshot}
@@ -6081,10 +6303,7 @@ export function StudioWorkspace() {
             body: JSON.stringify({ enabled: next }),
           })
             .then((r) => r.json())
-            .then((d) => {
-              if (typeof d.token === 'string') setAiToken(d.token);
-              if (Array.isArray(d.sessions)) setAiSessions(d.sessions as AiSessionSummary[]);
-            })
+            .then((d) => applyServerBridgeState(d as Record<string, unknown>))
             .catch(() => {});
         }}
         onRegenerateToken={() => {
@@ -6094,10 +6313,37 @@ export function StudioWorkspace() {
             body: JSON.stringify({ regenerateToken: true }),
           })
             .then((r) => r.json())
-            .then((d) => {
-              if (typeof d.token === 'string') setAiToken(d.token);
-            })
+            .then((d) => applyServerBridgeState(d as Record<string, unknown>))
             .catch(() => {});
+        }}
+        onRevokeToken={() => {
+          void fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ revokeToken: true }),
+          })
+            .then((r) => r.json())
+            .then((d) => applyServerBridgeState(d as Record<string, unknown>))
+            .catch(() => {});
+        }}
+        onToggleSingleClientLock={(next) => {
+          setAiSingleClientLock(next);
+          void fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ singleClientLock: next }),
+          })
+            .then((r) => r.json())
+            .then((d) => applyServerBridgeState(d as Record<string, unknown>))
+            .catch(() => {});
+        }}
+        onDismissMultiClientWarning={() => {
+          setAiMultiClientWarning(null);
+          void fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dismissWarning: true }),
+          }).catch(() => {});
         }}
         onTogglePaused={() => setAiPaused((p) => !p)}
         onChangeStepDelay={setAiStepDelayMs}
@@ -6109,13 +6355,17 @@ export function StudioWorkspace() {
             updateActiveProject((proj) => ({ ...proj, activeSceneId: targetSceneId }), false);
             setSelection({ kind: 'none' });
           } else {
-            const matchedSess = aiSessions.find((s) => s.sceneId === targetSceneId);
-            ensureAiSessionScene(
-              matchedSess?.sessionId ?? '',
-              targetSceneId,
-              matchedSess?.sceneName ?? 'Claude Session',
-            );
+            setNoticeMessage(`Scene "${targetSceneId}" is not in this local project.`);
           }
+        }}
+        onDeleteSession={(sessionId) => {
+          setAiSessions((prev) => prev.filter((s) => s.sessionId !== sessionId));
+          void fetch(`/api/ai/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d) => {
+              if (d) applyServerBridgeState(d as Record<string, unknown>);
+            })
+            .catch(() => {});
         }}
         onUndoLastAiBatch={() => {
           const snap = aiBatchUndoStack[0];

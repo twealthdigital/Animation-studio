@@ -803,16 +803,47 @@ export interface AiBridgeCommand {
   target?: Partial<Vec3>;
   fov?: number;
   speed?: number;
+  force?: boolean;
+}
+
+export type SceneEventCause =
+  | 'new_session'
+  | 'create_session'
+  | 'reconnect'
+  | 'timeout'
+  | 'another_client'
+  | 'rejected_auto_create'
+  | 'scene_deleted'
+  | 'token_rotated'
+  | 'token_revoked'
+  | 'scene_mismatch';
+
+export interface SceneCreationEvent {
+  id: string;
+  timestamp: number;
+  cause: SceneEventCause;
+  sessionId?: string | null;
+  sceneId?: string | null;
+  sceneName?: string | null;
+  clientLabel?: string;
+  clientFingerprint?: string;
+  detail: string;
 }
 
 export interface AiSessionSummary {
   sessionId: string;
   label: string;
-  sceneId: string;
-  sceneName: string;
+  sceneId: string | null;
+  sceneName: string | null;
+  bound: boolean;
+  status?: 'active' | 'idle' | 'disconnected' | 'expired';
   createdAt: number;
   lastActivityAt: number;
+  lastHeartbeatAt?: number;
+  leaseExpiresAt?: number;
   batchCount: number;
+  clientLabel?: string;
+  clientFingerprint?: string;
 }
 
 export interface AiBridgeLogEntry {
