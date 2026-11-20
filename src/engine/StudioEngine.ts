@@ -30,12 +30,20 @@ import { RigVisualizer } from './RigVisualizer';
 export type CameraViewMode = 'editor' | 'scene';
 
 export interface StudioEngineCallbacks {
-  onSelectTarget: (target: SelectionTarget, shiftKey?: boolean) => void;
+  onSelectTarget: (target: SelectionTarget, additive?: boolean) => void;
+  onMarqueeSelect?: (targets: SelectionTarget[], additive?: boolean) => void;
   onPoseModeChange?: (instanceId: string | null, preferredNodeId?: string) => void;
   onHoverChanged?: (hover: HoverTargetInfo | null) => void;
   onContextMenuRequest?: (clientX: number, clientY: number, target: SelectionTarget) => void;
   onCharacterTransformCommit: (instanceId: string, transform: Transform3D) => void;
-  onNodeTransformCommit: (instanceId: string, nodeId: string, nodeName: string, rotation: Vec3, position: Vec3) => void;
+  onNodeTransformCommit: (
+    instanceId: string,
+    nodeId: string,
+    nodeName: string,
+    rotation: Vec3,
+    position: Vec3,
+    scale?: Vec3,
+  ) => void;
   onIkTargetCommit: (instanceId: string, chain: IkChainType, targetPos: Vec3) => void;
   onPropTransformCommit: (propId: string, transform: Transform3D) => void;
   onGroupTransformCommit?: (groupId: string, transform: Transform3D) => void;
@@ -96,6 +104,7 @@ export class StudioEngine {
   private readonly sceneCameraMarker: THREE.Group;
   private readonly selectionBoxHelper: THREE.BoxHelper;
   private readonly hoverBoxHelper: THREE.BoxHelper;
+  private readonly marqueeOverlay: HTMLDivElement;
   private readonly motionPathGroup = new THREE.Group();
   private readonly rigOverlayGroup = new THREE.Group();
   private readonly rigVisualizer: RigVisualizer;
@@ -114,6 +123,7 @@ export class StudioEngine {
   private readonly lightMarkers = new Map<string, THREE.Mesh>();
   private readonly lockedObjects = new Set<string>();
   private readonly lockedCharacterNodes = new Map<string, Set<string>>();
+  private readonly multiSelectedNodeKeys = new Set<string>();
   private readonly waypointNodes = new Map<
     string,
     { ownerId: string; ownerKind: 'character' | 'prop' | 'camera'; pointId: string; kind: 'point' | 'in' | 'out'; mesh: THREE.Mesh }
@@ -152,6 +162,14 @@ export class StudioEngine {
     tangent2D?: THREE.Vector2;
     useCircular?: boolean;
     circularSign?: number;
+    active: boolean;
+  } | null = null;
+  private marqueeDrag: {
+    startClientX: number;
+    startClientY: number;
+    currentClientX: number;
+    currentClientY: number;
+    additive: boolean;
     active: boolean;
   } | null = null;
   private snapRotateRad: number | null = null;
@@ -199,6 +217,9 @@ export class StudioEngine {
 
   constructor(container: HTMLElement, callbacks: StudioEngineCallbacks) {
     this.container = container;
+    if (!this.container.style.position) {
+      this.container.style.position = 'relative';
+    }
     this.callbacks = callbacks;
     this.isSoftwareGl = detectSoftwareWebGL();
 
@@ -217,6 +238,17 @@ export class StudioEngine {
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
     this.container.appendChild(this.renderer.domElement);
+
+    this.marqueeOverlay = document.createElement('div');
+    this.marqueeOverlay.setAttribute('data-testid', 'viewport-marquee-box');
+    this.marqueeOverlay.style.position = 'absolute';
+    this.marqueeOverlay.style.border = '1.5px solid #e8702a';
+    this.marqueeOverlay.style.backgroundColor = 'rgba(232, 112, 42, 0.16)';
+    this.marqueeOverlay.style.borderRadius = '2px';
+    this.marqueeOverlay.style.pointerEvents = 'none';
+    this.marqueeOverlay.style.display = 'none';
+    this.marqueeOverlay.style.zIndex = '25';
+    this.container.appendChild(this.marqueeOverlay);
 
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -294,11 +326,7 @@ export class StudioEngine {
     this.orbitControls.minDistance = 0.7;
     this.orbitControls.maxDistance = 48;
     this.orbitControls.zoomToCursor = true;
-    this.orbitControls.mouseButtons = {
-      LEFT: THREE.MOUSE.ROTATE,
-      MIDDLE: THREE.MOUSE.ROTATE,
-      RIGHT: THREE.MOUSE.PAN,
-    };
+    this.applyMouseButtonsForGizmoMode();
     this.orbitControls.addEventListener('start', () => {
       this.focusAnim = null;
     });
@@ -594,13 +622,45 @@ export class StudioEngine {
     return this.poseModeInstanceId;
   }
 
+  private applyMouseButtonsForGizmoMode(): void {
+    if (this.gizmoMode === 'orbit') {
+      this.orbitControls.mouseButtons = {
+        LEFT: THREE.MOUSE.ROTATE,
+        MIDDLE: THREE.MOUSE.DOLLY,
+        RIGHT: THREE.MOUSE.PAN,
+      };
+      this.renderer.domElement.style.cursor = 'grab';
+    } else if (this.gizmoMode === 'box-select') {
+      this.orbitControls.mouseButtons = {
+        LEFT: null as unknown as THREE.MOUSE,
+        MIDDLE: THREE.MOUSE.ROTATE,
+        RIGHT: THREE.MOUSE.PAN,
+      };
+      this.renderer.domElement.style.cursor = 'crosshair';
+    } else {
+      this.orbitControls.mouseButtons = {
+        LEFT: null as unknown as THREE.MOUSE,
+        MIDDLE: THREE.MOUSE.ROTATE,
+        RIGHT: THREE.MOUSE.PAN,
+      };
+      this.renderer.domElement.style.cursor = 'default';
+    }
+  }
+
+  setMultiSelectedNodeKeys(keys: string[]): void {
+    this.multiSelectedNodeKeys.clear();
+    for (const k of keys) this.multiSelectedNodeKeys.add(k);
+    this.rebuildRigVisuals();
+    this.requestRender();
+  }
+
   setGizmoMode(mode: GizmoMode): void {
     this.gizmoMode = mode;
-    if (mode === 'select') {
+    this.applyMouseButtonsForGizmoMode();
+    if (mode === 'select' || mode === 'box-select' || mode === 'orbit') {
       this.transformControls.detach();
-    } else {
-      this.attachGizmoToSelection();
     }
+    this.attachGizmoToSelection();
     this.requestRender();
   }
 
@@ -978,6 +1038,7 @@ export class StudioEngine {
       ikTargets: targetInstanceId === this.lastRigInstanceId ? this.lastIkTargets : [],
       selection: this.currentSelection,
       hoveredNodeKey: this.hoveredNodeKey,
+      multiSelectedNodeKeys: this.multiSelectedNodeKeys,
       hoveredRingAxis: this.hoveredRingAxis,
       activeRingAxis: this.activeRingAxis,
       lockedNodeIds: lockedSet,
@@ -990,6 +1051,32 @@ export class StudioEngine {
     this.selectionBoxHelper.visible = false;
 
     if (this.viewMode !== 'editor') return;
+    if (this.gizmoMode === 'orbit' || this.gizmoMode === 'box-select') {
+      if (this.currentSelection.kind === 'character') {
+        const adapter = this.adapters.get(this.currentSelection.instanceId);
+        if (adapter) {
+          this.selectionBoxHelper.setFromObject(adapter.rootGroup);
+          this.selectionBoxHelper.visible = true;
+        }
+      } else if (this.currentSelection.kind === 'prop') {
+        const propObj = this.propObjects.get(this.currentSelection.propId);
+        if (propObj) {
+          this.selectionBoxHelper.setFromObject(propObj);
+          this.selectionBoxHelper.visible = true;
+        }
+      } else if (this.currentSelection.kind === 'body-part') {
+        const adapter = this.adapters.get(this.currentSelection.instanceId);
+        const nodeObj =
+          adapter && 'getNodeObject' in adapter && typeof adapter.getNodeObject === 'function'
+            ? adapter.getNodeObject(this.currentSelection.nodeId)
+            : undefined;
+        if (nodeObj) {
+          this.selectionBoxHelper.setFromObject(nodeObj);
+          this.selectionBoxHelper.visible = true;
+        }
+      }
+      return;
+    }
 
     // Allow body-part & IK interaction in Pose Mode even if toolbar gizmoMode is 'select'
     const isBodyOrIk = this.currentSelection.kind === 'body-part' || this.currentSelection.kind === 'ik-handle';
@@ -1037,13 +1124,13 @@ export class StudioEngine {
         this.selectionBoxHelper.setFromObject(nodeObj);
         this.selectionBoxHelper.visible = true;
 
-        // When RigVisualizer is visible for non-root joints, RigVisualizer renders clean
-        // arrowhead X/Y/Z rings directly on the socket without overlapping TransformControls!
-        if (!isRootNode && this.showRigOverlay) {
+        // Give every component (even tiny parts and component groups) full Move (G) & Scale (S) gizmos,
+        // and clean RigVisualizer X/Y/Z arrowhead rings for Rotate (R) / Select (Q).
+        if (!isRootNode && this.showRigOverlay && (this.gizmoMode === 'select' || this.gizmoMode === 'rotate')) {
           return;
         }
         const effectiveMode =
-          isRootNode && tcMode !== 'scale' ? tcMode : 'rotate';
+          tcMode === 'translate' || tcMode === 'scale' ? tcMode : isRootNode ? tcMode : 'rotate';
         this.transformControls.setMode(effectiveMode);
         this.transformControls.setSpace('local');
         this.transformControls.attach(nodeObj);
@@ -1237,13 +1324,16 @@ export class StudioEngine {
         adapter && 'getNodeDeltaRotation' in adapter && typeof adapter.getNodeDeltaRotation === 'function'
           ? adapter.getNodeDeltaRotation(nodeId, obj.rotation)
           : { x: obj.rotation.x, y: obj.rotation.y, z: obj.rotation.z };
-      const isRootNode = nodeId === 'node_0';
       const deltaPos =
-        isRootNode && adapter && 'getNodeDeltaPosition' in adapter && typeof adapter.getNodeDeltaPosition === 'function'
+        adapter && 'getNodeDeltaPosition' in adapter && typeof adapter.getNodeDeltaPosition === 'function'
           ? adapter.getNodeDeltaPosition(nodeId, obj.position)
           : { x: 0, y: 0, z: 0 };
+      const deltaScale =
+        adapter && 'getNodeDeltaScale' in adapter && typeof adapter.getNodeDeltaScale === 'function'
+          ? adapter.getNodeDeltaScale(nodeId, obj.scale)
+          : { x: 1, y: 1, z: 1 };
 
-      this.callbacks.onNodeTransformCommit(instanceId, nodeId, nodeName, deltaRot, deltaPos);
+      this.callbacks.onNodeTransformCommit(instanceId, nodeId, nodeName, deltaRot, deltaPos, deltaScale);
     } else if (this.currentSelection.kind === 'ik-handle') {
       const adapter = this.adapters.get(this.currentSelection.instanceId);
       if (adapter) {
@@ -1343,7 +1433,7 @@ export class StudioEngine {
   private inspectRayTarget(
     clientX: number,
     clientY: number,
-    options?: { preferBodyPart?: boolean; ignoreFilter?: boolean },
+    options?: { preferBodyPart?: boolean; ignoreFilter?: boolean; ignoreGroups?: boolean },
   ): {
     target: SelectionTarget;
     hitMesh: THREE.Object3D | null;
@@ -1431,7 +1521,7 @@ export class StudioEngine {
       }
     }
 
-    // 3. Visible Rig Joint Sockets (only pick individual sockets on hover, in Pose Mode, body-part filter, or Alt-click)
+    // 3. Visible Rig Joint Sockets (pick individual sockets on hover, in Pose Mode, body-part filter, or Alt-click)
     const canPickRigSockets =
       Boolean(options?.preferBodyPart) ||
       this.selectionFilter === 'body-part' ||
@@ -1501,15 +1591,28 @@ export class StudioEngine {
       };
     }
 
-    // Walk ancestors for prop / character
+    // Walk ancestors for prop / character & component group
     let cur: THREE.Object3D | null = hitObj;
     let propId: string | null = null;
     let propName = 'Prop';
     let charId: string | null = null;
+    let nearestRigNodeId: string | null = null;
+    let nearestRigNodeName: string | null = null;
+    let componentGroupId: string | null = null;
+    let componentGroupName: string | null = null;
+
     while (cur) {
       if (!propId && typeof cur.userData.propId === 'string') {
         propId = cur.userData.propId;
         propName = String(cur.userData.propName || propId);
+      }
+      if (!componentGroupId && cur.userData.isComponentGroup === true && typeof cur.userData.rigNodeId === 'string') {
+        componentGroupId = cur.userData.rigNodeId;
+        componentGroupName = String(cur.userData.rigNodeName || componentGroupId);
+      }
+      if (!nearestRigNodeId && typeof cur.userData.rigNodeId === 'string') {
+        nearestRigNodeId = cur.userData.rigNodeId;
+        nearestRigNodeName = typeof cur.userData.rigNodeName === 'string' ? cur.userData.rigNodeName : null;
       }
       if (!charId && typeof cur.userData.characterInstanceId === 'string') {
         charId = cur.userData.characterInstanceId;
@@ -1519,7 +1622,7 @@ export class StudioEngine {
 
     if (propId) {
       const grpId = this.memberToGroup.get(propId);
-      if (grpId && !options?.preferBodyPart && this.currentSelection.kind !== 'prop') {
+      if (grpId && !options?.preferBodyPart && !options?.ignoreGroups && this.currentSelection.kind !== 'prop') {
         const gMeta = this.groupMeta.get(grpId);
         return {
           target: { kind: 'group', groupId: grpId },
@@ -1541,40 +1644,28 @@ export class StudioEngine {
     }
 
     if (charId) {
-      const rawNodeId = typeof hitObj.userData.rigNodeId === 'string' ? hitObj.userData.rigNodeId : null;
+      const rawNodeId =
+        (!options?.ignoreGroups && componentGroupId) ||
+        (typeof hitObj.userData.rigNodeId === 'string' ? hitObj.userData.rigNodeId : nearestRigNodeId);
       const adapter = this.adapters.get(charId);
       const allNodes =
         adapter && 'getRigNodes' in adapter && typeof adapter.getRigNodes === 'function'
           ? adapter.getRigNodes()
           : [];
-      const rawNode = rawNodeId ? allNodes.find((n) => n.nodeId === rawNodeId) : undefined;
-
-      // Resolve auxiliary facial/decorative sub-parts (eyes, mouth, collar) to their parent articulable joint
-      let effectiveNode = rawNode;
-      const isExplicitlySelectedAux =
-        this.currentSelection.kind === 'body-part' &&
-        this.currentSelection.instanceId === charId &&
-        this.currentSelection.nodeId === rawNodeId;
-      if (effectiveNode?.isAuxiliary && !isExplicitlySelectedAux) {
-        while (effectiveNode?.isAuxiliary && effectiveNode.parentId) {
-          const parent = allNodes.find((n) => n.nodeId === effectiveNode!.parentId);
-          if (!parent) break;
-          effectiveNode = parent;
-        }
-      }
+      const effectiveNode = rawNodeId ? allNodes.find((n) => n.nodeId === rawNodeId) : undefined;
 
       const rigNodeId = effectiveNode?.nodeId ?? rawNodeId;
-      const rigNodeName = effectiveNode?.name ?? String(hitObj.userData.rigNodeName || rigNodeId || 'Part');
-      const displayTitle =
-        rawNode && effectiveNode && rawNode.nodeId !== effectiveNode.nodeId
-          ? `${effectiveNode.name} • ${rawNode.name}`
-          : rigNodeName;
+      const rigNodeName =
+        effectiveNode?.name ??
+        (!options?.ignoreGroups && componentGroupName ? componentGroupName : null) ??
+        nearestRigNodeName ??
+        String(hitObj.userData.rigNodeName || rigNodeId || 'Part');
       const nodeObj =
         rigNodeId && adapter && 'getNodeObject' in adapter && typeof adapter.getNodeObject === 'function'
           ? adapter.getNodeObject(rigNodeId)
           : undefined;
 
-      // Return body-part info if hovering/picking in Pose Mode, body-part filter, or Alt held
+      // Return exact penetrated body-part / tiny component / component group if hovering or in Pose Mode / body-part filter
       if (
         rigNodeId &&
         (options?.preferBodyPart ||
@@ -1586,14 +1677,14 @@ export class StudioEngine {
           target: { kind: 'body-part', instanceId: charId, nodeId: rigNodeId, nodeName: rigNodeName },
           hitMesh: nodeObj ?? hitObj,
           worldPoint: hits[0].point,
-          title: displayTitle,
-          description: effectiveNode?.description || `Rotate ${rigNodeName} around locked joint`,
+          title: rigNodeName,
+          description: effectiveNode?.description || `Control ${rigNodeName} directly (Ctrl+Click to multi-select)`,
           locked: lockedNode || this.lockedObjects.has(charId),
         };
       }
 
       const grpId = this.memberToGroup.get(charId);
-      if (grpId && this.currentSelection.kind !== 'character' && this.currentSelection.kind !== 'body-part') {
+      if (grpId && !options?.ignoreGroups && this.currentSelection.kind !== 'character' && this.currentSelection.kind !== 'body-part') {
         const gMeta = this.groupMeta.get(grpId);
         return {
           target: { kind: 'group', groupId: grpId },
@@ -1609,9 +1700,9 @@ export class StudioEngine {
         target: { kind: 'character', instanceId: charId },
         hitMesh: rigNodeId && effectiveNode ? (nodeObj ?? hitObj) : (adapter?.rootGroup ?? hitObj),
         worldPoint: hits[0].point,
-        title: effectiveNode ? displayTitle : 'Character',
+        title: effectiveNode ? rigNodeName : 'Character',
         description: effectiveNode
-          ? `${effectiveNode.description ?? 'Select part'} • Double-click to pose`
+          ? `${effectiveNode.description ?? 'Select part'} • Double-click to pose component`
           : 'Click to transform • Double-click to pose joints',
         locked: this.lockedObjects.has(charId),
       };
@@ -1620,8 +1711,188 @@ export class StudioEngine {
     return null;
   }
 
+  private updateMarqueeOverlay(drag: NonNullable<typeof this.marqueeDrag>): void {
+    const rect = this.container.getBoundingClientRect();
+    const x0 = Math.max(0, Math.min(drag.startClientX, drag.currentClientX) - rect.left);
+    const y0 = Math.max(0, Math.min(drag.startClientY, drag.currentClientY) - rect.top);
+    const x1 = Math.min(rect.width, Math.max(drag.startClientX, drag.currentClientX) - rect.left);
+    const y1 = Math.min(rect.height, Math.max(drag.startClientY, drag.currentClientY) - rect.top);
+    this.marqueeOverlay.style.left = `${x0}px`;
+    this.marqueeOverlay.style.top = `${y0}px`;
+    this.marqueeOverlay.style.width = `${Math.max(1, x1 - x0)}px`;
+    this.marqueeOverlay.style.height = `${Math.max(1, y1 - y0)}px`;
+    this.marqueeOverlay.style.display = 'block';
+  }
+
+  private hideMarqueeOverlay(): void {
+    this.marqueeOverlay.style.display = 'none';
+  }
+
+  private projectBoxIntersectsScreenRect(
+    box: THREE.Box3,
+    cam: THREE.Camera,
+    domRect: DOMRect,
+    minX: number,
+    maxX: number,
+    minY: number,
+    maxY: number,
+  ): boolean {
+    if (box.isEmpty()) return false;
+    const { min, max } = box;
+    const corners = [
+      new THREE.Vector3(min.x, min.y, min.z),
+      new THREE.Vector3(min.x, min.y, max.z),
+      new THREE.Vector3(min.x, max.y, min.z),
+      new THREE.Vector3(min.x, max.y, max.z),
+      new THREE.Vector3(max.x, min.y, min.z),
+      new THREE.Vector3(max.x, min.y, max.z),
+      new THREE.Vector3(max.x, max.y, min.z),
+      new THREE.Vector3(max.x, max.y, max.z),
+    ];
+    let bx0 = Infinity;
+    let by0 = Infinity;
+    let bx1 = -Infinity;
+    let by1 = -Infinity;
+    let anyInFront = false;
+    for (const c of corners) {
+      c.project(cam);
+      if (c.z >= -1.05 && c.z <= 1.02) anyInFront = true;
+      const sx = domRect.left + (c.x * 0.5 + 0.5) * domRect.width;
+      const sy = domRect.top + (-c.y * 0.5 + 0.5) * domRect.height;
+      if (sx < bx0) bx0 = sx;
+      if (sx > bx1) bx1 = sx;
+      if (sy < by0) by0 = sy;
+      if (sy > by1) by1 = sy;
+    }
+    if (!anyInFront) return false;
+    return bx1 >= minX && bx0 <= maxX && by1 >= minY && by0 <= maxY;
+  }
+
+  private getDirectNodeBox3(nodeObj: THREE.Object3D, nodeId: string): THREE.Box3 {
+    const box = new THREE.Box3();
+    if (nodeObj.userData?.isComponentGroup) {
+      return box.setFromObject(nodeObj);
+    }
+    nodeObj.updateMatrixWorld(true);
+    const mesh = nodeObj as THREE.Mesh;
+    if (mesh.isMesh && mesh.geometry) {
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      if (mesh.geometry.boundingBox) {
+        box.copy(mesh.geometry.boundingBox).applyMatrix4(nodeObj.matrixWorld);
+        return box;
+      }
+    }
+    for (const child of nodeObj.children) {
+      const cMesh = child as THREE.Mesh;
+      if (cMesh.isMesh && cMesh.visible && cMesh.geometry && child.userData?.rigNodeId === nodeId) {
+        if (!cMesh.geometry.boundingBox) cMesh.geometry.computeBoundingBox();
+        if (cMesh.geometry.boundingBox) {
+          box.union(cMesh.geometry.boundingBox.clone().applyMatrix4(cMesh.matrixWorld));
+        }
+      }
+    }
+    if (box.isEmpty()) {
+      const wp = new THREE.Vector3();
+      nodeObj.getWorldPosition(wp);
+      box.setFromCenterAndSize(wp, new THREE.Vector3(0.14, 0.14, 0.14));
+    }
+    return box;
+  }
+
+  private isInsideComponentGroup(obj: THREE.Object3D, rootStop: THREE.Object3D): boolean {
+    let p = obj.parent;
+    while (p && p !== rootStop) {
+      if (p.userData?.isComponentGroup === true) return true;
+      p = p.parent;
+    }
+    return false;
+  }
+
+  private collectMarqueeTargets(drag: NonNullable<typeof this.marqueeDrag>): SelectionTarget[] {
+    const minX = Math.min(drag.startClientX, drag.currentClientX);
+    const maxX = Math.max(drag.startClientX, drag.currentClientX);
+    const minY = Math.min(drag.startClientY, drag.currentClientY);
+    const maxY = Math.max(drag.startClientY, drag.currentClientY);
+    const domRect = this.renderer.domElement.getBoundingClientRect();
+    const cam = this.getActiveEditorCamera();
+    cam.updateMatrixWorld();
+
+    const results: SelectionTarget[] = [];
+
+    if (this.poseModeInstanceId || this.selectionFilter === 'body-part') {
+      const charIds = this.poseModeInstanceId ? [this.poseModeInstanceId] : [...this.adapters.keys()];
+      for (const charId of charIds) {
+        const adapter = this.adapters.get(charId);
+        if (!adapter || !adapter.rootGroup.visible) continue;
+        if (!('getRigNodes' in adapter) || typeof adapter.getRigNodes !== 'function') continue;
+        if (!('getNodeObject' in adapter) || typeof adapter.getNodeObject !== 'function') continue;
+        adapter.rootGroup.updateMatrixWorld(true);
+        const nodes = adapter.getRigNodes();
+        for (const node of nodes) {
+          if (node.nodeId === 'node_0') continue;
+          const nodeObj = adapter.getNodeObject(node.nodeId);
+          if (!nodeObj || !nodeObj.visible) continue;
+          if (!nodeObj.userData?.isComponentGroup && this.isInsideComponentGroup(nodeObj, adapter.rootGroup)) {
+            continue;
+          }
+          const box = this.getDirectNodeBox3(nodeObj, node.nodeId);
+          if (this.projectBoxIntersectsScreenRect(box, cam, domRect, minX, maxX, minY, maxY)) {
+            results.push({
+              kind: 'body-part',
+              instanceId: charId,
+              nodeId: node.nodeId,
+              nodeName: node.name,
+            });
+          }
+        }
+      }
+      return results;
+    }
+
+    const allowChars = this.selectionFilter === 'all' || this.selectionFilter === 'character' || this.selectionFilter === 'group';
+    const allowProps = this.selectionFilter === 'all' || this.selectionFilter === 'prop' || this.selectionFilter === 'group';
+
+    if (allowChars) {
+      for (const [charId, adapter] of this.adapters.entries()) {
+        if (!adapter.rootGroup.visible) continue;
+        const box = new THREE.Box3().setFromObject(adapter.rootGroup);
+        if (this.projectBoxIntersectsScreenRect(box, cam, domRect, minX, maxX, minY, maxY)) {
+          results.push({ kind: 'character', instanceId: charId });
+        }
+      }
+    }
+    if (allowProps) {
+      for (const [propId, propObj] of this.propObjects.entries()) {
+        if (!propObj.visible) continue;
+        const box = new THREE.Box3().setFromObject(propObj);
+        if (this.projectBoxIntersectsScreenRect(box, cam, domRect, minX, maxX, minY, maxY)) {
+          results.push({ kind: 'prop', propId });
+        }
+      }
+    }
+    return results;
+  }
+
   private handlePointerMove = (e: PointerEvent) => {
     if (this.disposed || this.viewMode !== 'editor') return;
+
+    if (this.marqueeDrag) {
+      const drag = this.marqueeDrag;
+      drag.currentClientX = e.clientX;
+      drag.currentClientY = e.clientY;
+      const dx = drag.currentClientX - drag.startClientX;
+      const dy = drag.currentClientY - drag.startClientY;
+      if (!drag.active && Math.hypot(dx, dy) > 4) {
+        drag.active = true;
+        this.suppressNextDblClickUntilMs = performance.now() + 350;
+        this.focusAnim = null;
+        this.orbitControls.enabled = false;
+      }
+      if (drag.active) {
+        this.updateMarqueeOverlay(drag);
+      }
+      return;
+    }
 
     // Live camera-aligned or axis-ring limb rotation drag in Articulated Pose Mode
     if (this.directLimbDrag) {
@@ -1846,9 +2117,11 @@ export class StudioEngine {
   };
 
   private handlePointerCancel = (e: PointerEvent) => {
-    if (this.directLimbDrag || this.directObjectDrag) {
+    if (this.directLimbDrag || this.directObjectDrag || this.marqueeDrag) {
       this.directLimbDrag = null;
       this.directObjectDrag = null;
+      this.marqueeDrag = null;
+      this.hideMarqueeOverlay();
       this.activeRingAxis = null;
       this.orbitControls.enabled = this.viewMode === 'editor';
       try {
@@ -1962,18 +2235,46 @@ export class StudioEngine {
     const activeTcAxis = (this.transformControls as unknown as { axis?: string | null }).axis;
     this.gizmoPointerDown = Boolean(activeTcAxis);
 
+    if (this.gizmoMode === 'orbit') {
+      return;
+    }
+
     if (
       e.button === 0 &&
       this.viewMode === 'editor' &&
       !activeTcAxis
     ) {
-      const hit = this.inspectRayTarget(e.clientX, e.clientY, { preferBodyPart: true });
+      const additive = e.ctrlKey || e.metaKey || e.shiftKey;
+
+      if (this.gizmoMode === 'box-select') {
+        this.marqueeDrag = {
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+          currentClientX: e.clientX,
+          currentClientY: e.clientY,
+          additive,
+          active: false,
+        };
+        this.orbitControls.enabled = false;
+        try {
+          this.renderer.domElement.setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore pointer capture failure in synthetic environments
+        }
+        return;
+      }
+
+      const hit = this.inspectRayTarget(e.clientX, e.clientY, {
+        preferBodyPart: e.altKey || this.selectionFilter === 'body-part' || Boolean(this.poseModeInstanceId),
+        ignoreGroups: e.altKey,
+      });
       const canDragRing = Boolean(hit?.ringAxis);
       const canDragLimb =
         hit &&
         hit.target.kind === 'body-part' &&
         hit.target.instanceId === this.poseModeInstanceId &&
-        hit.target.nodeId !== 'node_0';
+        hit.target.nodeId !== 'node_0' &&
+        (this.gizmoMode === 'select' || this.gizmoMode === 'rotate');
 
       if (hit && hit.target.kind === 'body-part' && (canDragRing || canDragLimb) && !hit.locked) {
         const adapter = this.adapters.get(hit.target.instanceId);
@@ -2070,7 +2371,10 @@ export class StudioEngine {
       }
 
       // Direct click-and-drag / trackpad double-click-and-drag on any stage object
-      const objHit = this.inspectRayTarget(e.clientX, e.clientY, { preferBodyPart: false });
+      const objHit = this.inspectRayTarget(e.clientX, e.clientY, {
+        preferBodyPart: false,
+        ignoreGroups: e.altKey,
+      });
       if (objHit && !objHit.locked) {
         const resolved = this.resolveDraggableObject(objHit.target);
         if (resolved) {
@@ -2095,12 +2399,53 @@ export class StudioEngine {
           } catch {
             // Ignore pointer capture failure in synthetic environments
           }
+          return;
+        }
+      }
+
+      // Dragging starting outside any object (empty viewport) draws the Marquee Highlight Box!
+      if (!hit && !objHit) {
+        this.marqueeDrag = {
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+          currentClientX: e.clientX,
+          currentClientY: e.clientY,
+          additive,
+          active: false,
+        };
+        this.orbitControls.enabled = false;
+        try {
+          this.renderer.domElement.setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore pointer capture failure in synthetic environments
         }
       }
     }
   };
 
   private handlePointerUp = (e: PointerEvent) => {
+    const additive = e.ctrlKey || e.metaKey || e.shiftKey;
+
+    if (this.marqueeDrag) {
+      const drag = this.marqueeDrag;
+      this.marqueeDrag = null;
+      this.hideMarqueeOverlay();
+      this.orbitControls.enabled = this.viewMode === 'editor';
+      try {
+        if (this.renderer.domElement.hasPointerCapture(e.pointerId)) {
+          this.renderer.domElement.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // Ignore capture release errors
+      }
+      if (drag.active) {
+        const targets = this.collectMarqueeTargets(drag);
+        this.callbacks.onMarqueeSelect?.(targets, drag.additive);
+        this.requestRender();
+        return;
+      }
+    }
+
     if (this.directLimbDrag) {
       const drag = this.directLimbDrag;
       this.directLimbDrag = null;
@@ -2119,11 +2464,19 @@ export class StudioEngine {
           adapter && 'getNodeDeltaRotation' in adapter && typeof adapter.getNodeDeltaRotation === 'function'
             ? adapter.getNodeDeltaRotation(drag.nodeId, drag.nodeObj.rotation)
             : { x: drag.nodeObj.rotation.x, y: drag.nodeObj.rotation.y, z: drag.nodeObj.rotation.z };
+        const deltaPos =
+          adapter && 'getNodeDeltaPosition' in adapter && typeof adapter.getNodeDeltaPosition === 'function'
+            ? adapter.getNodeDeltaPosition(drag.nodeId, drag.nodeObj.position)
+            : { x: 0, y: 0, z: 0 };
+        const deltaScale =
+          adapter && 'getNodeDeltaScale' in adapter && typeof adapter.getNodeDeltaScale === 'function'
+            ? adapter.getNodeDeltaScale(drag.nodeId, drag.nodeObj.scale)
+            : { x: 1, y: 1, z: 1 };
         this.callbacks.onSelectTarget(
           { kind: 'body-part', instanceId: drag.instanceId, nodeId: drag.nodeId, nodeName: drag.nodeName },
-          e.shiftKey,
+          additive,
         );
-        this.callbacks.onNodeTransformCommit(drag.instanceId, drag.nodeId, drag.nodeName, deltaRot, { x: 0, y: 0, z: 0 });
+        this.callbacks.onNodeTransformCommit(drag.instanceId, drag.nodeId, drag.nodeName, deltaRot, deltaPos, deltaScale);
         this.rebuildRigVisuals();
         this.requestRender();
         return;
@@ -2152,7 +2505,7 @@ export class StudioEngine {
           this.poseModeInstanceId = null;
           this.callbacks.onPoseModeChange?.(null);
         }
-        this.callbacks.onSelectTarget(drag.target, e.shiftKey);
+        this.callbacks.onSelectTarget(drag.target, additive);
         this.commitObjectDragTransform(drag.target, drag.obj);
         this.requestRender();
         return;
@@ -2164,11 +2517,13 @@ export class StudioEngine {
       return;
     }
     if (this.transformControls.dragging || this.viewMode !== 'editor' || e.button !== 0) return;
+    if (this.gizmoMode === 'orbit') return;
     const dist = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
     if (dist > 5) return;
 
     const hit = this.inspectRayTarget(e.clientX, e.clientY, {
       preferBodyPart: e.altKey || this.selectionFilter === 'body-part' || Boolean(this.poseModeInstanceId),
+      ignoreGroups: e.altKey,
     });
 
     if (hit) {
@@ -2183,9 +2538,11 @@ export class StudioEngine {
         this.poseModeInstanceId = null;
         this.callbacks.onPoseModeChange?.(null);
       }
-      this.callbacks.onSelectTarget(hit.target, e.shiftKey);
+      this.callbacks.onSelectTarget(hit.target, additive);
       return;
     }
+
+    if (additive) return;
 
     if (this.poseModeInstanceId) {
       this.poseModeInstanceId = null;
@@ -2195,9 +2552,13 @@ export class StudioEngine {
   };
 
   private handleDoubleClick = (e: MouseEvent) => {
-    if (this.viewMode !== 'editor') return;
+    if (this.viewMode !== 'editor' || this.gizmoMode === 'orbit') return;
     if (performance.now() < this.suppressNextDblClickUntilMs) return;
-    const hit = this.inspectRayTarget(e.clientX, e.clientY, { preferBodyPart: true, ignoreFilter: true });
+    const hit = this.inspectRayTarget(e.clientX, e.clientY, {
+      preferBodyPart: true,
+      ignoreFilter: true,
+      ignoreGroups: e.altKey,
+    });
     if (!hit) return;
 
     if (hit.target.kind === 'body-part') {
@@ -2261,6 +2622,10 @@ export class StudioEngine {
   };
 
   private handleContextMenu = (e: MouseEvent) => {
+    if (e.ctrlKey && e.button === 0) {
+      e.preventDefault();
+      return;
+    }
     e.preventDefault();
     if (this.viewMode !== 'editor') return;
     const hit = this.inspectRayTarget(e.clientX, e.clientY, { preferBodyPart: Boolean(this.poseModeInstanceId) });
@@ -2452,6 +2817,7 @@ export class StudioEngine {
     (this.floorMesh.material as THREE.Material).dispose();
     this.gridHelper.dispose();
     this.renderer.dispose();
+    this.marqueeOverlay.remove();
     dom.remove();
   }
 }

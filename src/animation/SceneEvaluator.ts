@@ -34,6 +34,7 @@ export interface EvaluatedCharacterState {
   transform: Transform3D;
   nodeRotations: Record<string, Vec3>;
   nodePositions: Record<string, Vec3>;
+  nodeScales: Record<string, Vec3>;
   slotDeltaRotations: Partial<Record<HumanoidSlot, Vec3>>;
   activeActions: ActionClip[];
   activeMood: string;
@@ -227,6 +228,7 @@ export function evaluateSceneAtTime(scene: SceneData, time: number): EvaluatedSc
     // Evaluate per-node / bone keyframe tracks
     const nodeRotations: Record<string, Vec3> = {};
     const nodePositions: Record<string, Vec3> = {};
+    const nodeScales: Record<string, Vec3> = {};
     for (const track of char.nodeTracks ?? []) {
       if (track.rotationKeyframes.length > 0) {
         nodeRotations[track.nodeId] = evaluateVec3Track(
@@ -241,6 +243,14 @@ export function evaluateSceneAtTime(scene: SceneData, time: number): EvaluatedSc
           track.positionKeyframes,
           time,
           { x: 0, y: 0, z: 0 },
+          false,
+        );
+      }
+      if (track.scaleKeyframes && track.scaleKeyframes.length > 0) {
+        nodeScales[track.nodeId] = evaluateVec3Track(
+          track.scaleKeyframes,
+          time,
+          { x: 1, y: 1, z: 1 },
           false,
         );
       }
@@ -357,6 +367,7 @@ export function evaluateSceneAtTime(scene: SceneData, time: number): EvaluatedSc
       transform: finalTransform,
       nodeRotations,
       nodePositions,
+      nodeScales,
       slotDeltaRotations: presetDelta.slotRotations,
       activeActions,
       activeMood,

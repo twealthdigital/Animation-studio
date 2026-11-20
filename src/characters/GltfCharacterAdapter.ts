@@ -1,8 +1,22 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import type { FacialState, RigNodeInfo, Transform3D, Vec3 } from '../core/types';
+import type {
+  CharacterNodeGroup,
+  FacialState,
+  NodeMaterialOverride,
+  RigNodeInfo,
+  Transform3D,
+  Vec3,
+} from '../core/types';
 import type { CharacterActionDescriptor, CharacterCapabilities, ICharacterAdapter } from './CharacterAdapter';
 import { autoMapHumanoidSlots } from '../animation/RigMapper';
+import {
+  applyCharacterNodeMaterialOverrides,
+  type BaseNodeSnapshot,
+  type MaterialBaseSnapshot,
+  readNodeMaterialSnapshot,
+  reconcileCharacterNodeGroups,
+} from './RigNodeOperations';
 
 /**
  * Native GLB/GLTF Character Adapter with skeletal AnimationMixer playback,
@@ -22,9 +36,17 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
   private speed = 1;
   private clipLocalTime = 0;
 
+  private modelRoot: THREE.Group | null = null;
+  private baseRigNodes: RigNodeInfo[] = [];
   private rigNodes: RigNodeInfo[] = [];
   private nodeObjectMap = new Map<string, THREE.Object3D>();
-  private nodeBaseTransform = new Map<string, { pos: THREE.Vector3; rot: THREE.Euler }>();
+  private nodeBaseTransform = new Map<string, { pos: THREE.Vector3; rot: THREE.Euler; scale: THREE.Vector3 }>();
+  private originalNodeSnapshots = new Map<string, BaseNodeSnapshot>();
+  private activeGroupPivots = new Map<string, THREE.Group>();
+  private hiddenGroupIds = new Set<string>();
+  private baseMaterialSnapshots = new WeakMap<THREE.Mesh, MaterialBaseSnapshot[]>();
+  private lastGroupsSig = '';
+  private lastMaterialSig = '';
   private morphMeshes: THREE.Mesh[] = [];
 
   constructor(instanceId: string, assetId: string, binaryData: ArrayBuffer) {
@@ -59,9 +81,16 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
     );
 
     const model = gltf.scene;
+    this.modelRoot = model;
+    this.baseRigNodes = [];
     this.rigNodes = [];
     this.nodeObjectMap.clear();
     this.nodeBaseTransform.clear();
+    this.originalNodeSnapshots.clear();
+    this.activeGroupPivots.clear();
+    this.hiddenGroupIds.clear();
+    this.lastGroupsSig = '';
+    this.lastMaterialSig = '';
     this.morphMeshes = [];
 
     const pathByObj = new Map<THREE.Object3D, string>();
@@ -113,8 +142,17 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
       this.nodeBaseTransform.set(nodeId, {
         pos: obj.position.clone(),
         rot: obj.rotation.clone(),
+        scale: obj.scale.clone(),
+      });
+      this.originalNodeSnapshots.set(nodeId, {
+        parent: obj.parent,
+        pos: obj.position.clone(),
+        rot: obj.rotation.clone(),
+        scale: obj.scale.clone(),
       });
     });
+
+    this.baseRigNodes = this.rigNodes.map((n) => ({ ...n, childIds: [...n.childIds] }));
 
     const hasBones = this.rigNodes.some((n) => n.type === 'bone');
 
@@ -137,11 +175,25 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
       }
     }
 
-    // Ground model flush at y=0
+    // Ground model flush at y=0 and refresh root snapshot if shifted
     model.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(model);
     if (Number.isFinite(box.min.y)) {
       model.position.y -= box.min.y;
+    }
+    const modelNodeId = pathByObj.get(model);
+    if (modelNodeId) {
+      this.nodeBaseTransform.set(modelNodeId, {
+        pos: model.position.clone(),
+        rot: model.rotation.clone(),
+        scale: model.scale.clone(),
+      });
+      this.originalNodeSnapshots.set(modelNodeId, {
+        parent: model.parent,
+        pos: model.position.clone(),
+        rot: model.rotation.clone(),
+        scale: model.scale.clone(),
+      });
     }
 
     this.rootGroup.add(model);
@@ -213,15 +265,79 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
     };
   }
 
+  getNodeDeltaScale(nodeId: string, currentScale: { x: number; y: number; z: number }): Vec3 {
+    const base = this.nodeBaseTransform.get(nodeId);
+    if (!base) return { x: currentScale.x, y: currentScale.y, z: currentScale.z };
+    const sx = Math.abs(base.scale.x) > 1e-4 ? base.scale.x : 1;
+    const sy = Math.abs(base.scale.y) > 1e-4 ? base.scale.y : 1;
+    const sz = Math.abs(base.scale.z) > 1e-4 ? base.scale.z : 1;
+    return {
+      x: currentScale.x / sx,
+      y: currentScale.y / sy,
+      z: currentScale.z / sz,
+    };
+  }
+
+  syncNodeGroups(groups: CharacterNodeGroup[]): void {
+    const sig = JSON.stringify(
+      groups.map((g) => ({ id: g.id, name: g.name, members: g.memberNodeIds, visible: g.visible !== false })),
+    );
+    this.hiddenGroupIds.clear();
+    for (const g of groups) {
+      if (g.visible === false) this.hiddenGroupIds.add(g.id);
+    }
+    if (sig === this.lastGroupsSig || !this.modelRoot) {
+      for (const [gid, pivot] of this.activeGroupPivots.entries()) {
+        pivot.visible = !this.hiddenGroupIds.has(gid);
+      }
+      return;
+    }
+    this.lastGroupsSig = sig;
+    this.rigNodes = reconcileCharacterNodeGroups({
+      instanceId: this.instanceId,
+      rootContainer: this.modelRoot,
+      baseRigNodes: this.baseRigNodes,
+      nodeObjectMap: this.nodeObjectMap,
+      nodeBaseTransform: this.nodeBaseTransform,
+      originalSnapshots: this.originalNodeSnapshots,
+      activeGroupPivots: this.activeGroupPivots,
+      groups,
+    });
+    this.capabilities = {
+      ...this.capabilities,
+      rigNodes: this.rigNodes,
+    };
+  }
+
+  applyNodeMaterialOverrides(overrides: Record<string, NodeMaterialOverride>): void {
+    const sig = JSON.stringify(overrides);
+    if (sig === this.lastMaterialSig || !this.modelRoot) return;
+    this.lastMaterialSig = sig;
+    applyCharacterNodeMaterialOverrides(
+      this.modelRoot,
+      this.nodeObjectMap,
+      overrides,
+      this.baseMaterialSnapshots,
+    );
+  }
+
+  getNodeMaterialInfo(nodeId: string): NodeMaterialOverride | null {
+    return readNodeMaterialSnapshot(this.nodeObjectMap.get(nodeId));
+  }
+
   setNodeVisibilityOverrides(hiddenNodeIds: string[]): void {
     const hiddenSet = new Set(hiddenNodeIds);
     for (const [nodeId, obj] of this.nodeObjectMap.entries()) {
       if (obj === this.rootGroup) continue;
-      obj.visible = !hiddenSet.has(nodeId);
+      obj.visible = !hiddenSet.has(nodeId) && !this.hiddenGroupIds.has(nodeId);
     }
   }
 
-  applyNodeOverrides(rotations: Record<string, Vec3>, positions?: Record<string, Vec3>): void {
+  applyNodeOverrides(
+    rotations: Record<string, Vec3>,
+    positions?: Record<string, Vec3>,
+    scales?: Record<string, Vec3>,
+  ): void {
     // Reset to base if no mixer clip active, otherwise layer cleanly
     if (!this.activeClipId) {
       for (const [nodeId, base] of this.nodeBaseTransform.entries()) {
@@ -229,6 +345,7 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
         if (obj) {
           obj.rotation.copy(base.rot);
           obj.position.copy(base.pos);
+          obj.scale.copy(base.scale);
         }
       }
     }
@@ -243,6 +360,12 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
       const base = this.nodeBaseTransform.get(nodeId);
       if (!obj || !base) continue;
       obj.position.set(base.pos.x + pos.x, base.pos.y + pos.y, base.pos.z + pos.z);
+    }
+    for (const [nodeId, sc] of Object.entries(scales ?? {})) {
+      const obj = this.nodeObjectMap.get(nodeId);
+      const base = this.nodeBaseTransform.get(nodeId);
+      if (!obj || !base) continue;
+      obj.scale.set(base.scale.x * sc.x, base.scale.y * sc.y, base.scale.z * sc.z);
     }
   }
 

@@ -2,6 +2,7 @@ import React from 'react';
 import {
   AlignCenterHorizontal,
   Bone,
+  BoxSelect,
   Camera,
   Crosshair,
   Expand,
@@ -10,6 +11,7 @@ import {
   Layers,
   Magnet,
   Maximize2,
+  Mouse,
   MousePointer,
   Move,
   RotateCcw,
@@ -42,6 +44,7 @@ interface CenterViewportProps {
   selectionFilter: SelectionFilter;
   showRigOverlay: boolean;
   multiSelectedCount: number;
+  multiSelectedNodeCount?: number;
   hoverInfo: HoverTargetInfo | null;
   poseModeInstanceId: string | null;
   poseModeCharName?: string | null;
@@ -115,6 +118,7 @@ export function CenterViewport({
   selectionFilter,
   showRigOverlay,
   multiSelectedCount,
+  multiSelectedNodeCount = 0,
   hoverInfo,
   poseModeInstanceId,
   poseModeCharName,
@@ -152,7 +156,7 @@ export function CenterViewport({
         <div className="flex items-center gap-1 shrink-0">
           <IconButton
             label="Select Tool"
-            note="Pick objects · Double-click character to pose joints"
+            note="Pick object or part · Drag outside object to marquee highlight · Double-click character to pose"
             shortcut="Q"
             active={gizmoMode === 'select'}
             onClick={() => onChangeGizmoMode('select')}
@@ -160,8 +164,26 @@ export function CenterViewport({
             <MousePointer className="h-3.5 w-3.5" aria-hidden="true" />
           </IconButton>
           <IconButton
+            label="Box Highlight Tool"
+            note="Drag a highlight box anywhere to select multiple objects or body components"
+            shortcut="B"
+            active={gizmoMode === 'box-select'}
+            onClick={() => onChangeGizmoMode('box-select')}
+          >
+            <BoxSelect className="h-3.5 w-3.5" aria-hidden="true" />
+          </IconButton>
+          <IconButton
+            label="Camera Orbit Mouse"
+            note="Orbit camera freely with left-click drag without accidentally moving or highlighting parts"
+            shortcut="H"
+            active={gizmoMode === 'orbit'}
+            onClick={() => onChangeGizmoMode('orbit')}
+          >
+            <Mouse className="h-3.5 w-3.5" aria-hidden="true" />
+          </IconButton>
+          <IconButton
             label="Move Gizmo"
-            note="Translate selected object or group in 3D space"
+            note="Translate selected object, part, or group in 3D space"
             shortcut="G"
             active={gizmoMode === 'translate'}
             onClick={() => onChangeGizmoMode('translate')}
@@ -170,7 +192,7 @@ export function CenterViewport({
           </IconButton>
           <IconButton
             label="Rotate Gizmo"
-            note="Rotate object or child joint around locked socket"
+            note="Rotate object, component, or child joint around locked socket"
             shortcut="R"
             active={gizmoMode === 'rotate'}
             onClick={() => onChangeGizmoMode('rotate')}
@@ -179,7 +201,7 @@ export function CenterViewport({
           </IconButton>
           <IconButton
             label="Scale Gizmo"
-            note="Resize selected object or group"
+            note="Resize selected object, component, or group"
             shortcut="S"
             active={gizmoMode === 'scale'}
             onClick={() => onChangeGizmoMode('scale')}
@@ -262,35 +284,45 @@ export function CenterViewport({
             </IconButton>
           )}
 
-          {multiSelectedCount >= 2 && (
+          {(multiSelectedCount >= 2 || multiSelectedNodeCount >= 2) && (
             <div className="flex items-center gap-1 ml-1 rounded border border-[#e8702a] bg-[#2e221b] px-1.5 py-0.5">
               <Layers className="h-3 w-3 text-[#e8702a]" aria-hidden="true" />
-              <span className="text-[10px] font-semibold text-[#f7be97]">{multiSelectedCount}</span>
+              <span className="text-[10px] font-semibold text-[#f7be97]">
+                {multiSelectedNodeCount >= 2 ? `${multiSelectedNodeCount} parts` : multiSelectedCount}
+              </span>
               <button
                 type="button"
-                data-studio-note="Combine selected items into a logical group"
+                data-studio-note={
+                  multiSelectedNodeCount >= 2
+                    ? 'Lock selected components into an editable part group without detaching'
+                    : 'Combine selected items into a logical group'
+                }
                 data-studio-shortcut="Ctrl+G"
                 onClick={onGroupSelection}
                 className="rounded bg-[#e8702a] px-1.5 py-0.5 text-[10px] font-semibold text-[#121316] hover:bg-[#f07f3c]"
               >
-                Group
+                {multiSelectedNodeCount >= 2 ? 'Group Parts' : 'Group'}
               </button>
-              <button
-                type="button"
-                data-studio-note="Align selected items on X axis"
-                onClick={() => onAlignMultiSelection('align-x')}
-                className="rounded px-1 text-[10px] text-[#e6e8ec] hover:bg-[#383e49]"
-              >
-                <AlignCenterHorizontal className="h-3 w-3" aria-hidden="true" />
-              </button>
-              <button
-                type="button"
-                data-studio-note="Snap selected items to Floor Y=0"
-                onClick={() => onAlignMultiSelection('ground-y')}
-                className="rounded px-1 text-[10px] text-[#e6e8ec] hover:bg-[#383e49]"
-              >
-                <Grid3x3 className="h-3 w-3" aria-hidden="true" />
-              </button>
+              {multiSelectedCount >= 2 && (
+                <>
+                  <button
+                    type="button"
+                    data-studio-note="Align selected items on X axis"
+                    onClick={() => onAlignMultiSelection('align-x')}
+                    className="rounded px-1 text-[10px] text-[#e6e8ec] hover:bg-[#383e49]"
+                  >
+                    <AlignCenterHorizontal className="h-3 w-3" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    data-studio-note="Snap selected items to Floor Y=0"
+                    onClick={() => onAlignMultiSelection('ground-y')}
+                    className="rounded px-1 text-[10px] text-[#e6e8ec] hover:bg-[#383e49]"
+                  >
+                    <Grid3x3 className="h-3 w-3" aria-hidden="true" />
+                  </button>
+                </>
+              )}
             </div>
           )}
 
@@ -383,7 +415,13 @@ export function CenterViewport({
         <div
           ref={mountRef}
           data-testid="viewport-canvas-host"
-          className="h-full w-full"
+          className={`h-full w-full ${
+            gizmoMode === 'orbit'
+              ? 'cursor-grab'
+              : gizmoMode === 'box-select'
+                ? 'cursor-crosshair'
+                : ''
+          }`}
         />
 
         {/* Pose Mode Floating Banner */}

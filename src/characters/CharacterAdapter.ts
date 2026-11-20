@@ -1,4 +1,11 @@
-import type { FacialState, RigNodeInfo, Transform3D, Vec3 } from '../core/types';
+import type {
+  CharacterNodeGroup,
+  FacialState,
+  NodeMaterialOverride,
+  RigNodeInfo,
+  Transform3D,
+  Vec3,
+} from '../core/types';
 
 export type CharacterImportMode = 'native-three-extraction' | 'isolated-iframe' | 'gltf-native';
 
@@ -46,9 +53,17 @@ export interface ICharacterAdapter {
   update(deltaSeconds: number, timelineSeconds: number): void;
 
   getRigNodes?(): RigNodeInfo[];
-  applyNodeOverrides?(rotations: Record<string, Vec3>, positions?: Record<string, Vec3>): void;
+  applyNodeOverrides?(
+    rotations: Record<string, Vec3>,
+    positions?: Record<string, Vec3>,
+    scales?: Record<string, Vec3>,
+  ): void;
   applyFacialState?(facial: FacialState): void;
   getNodeDeltaRotation?(nodeId: string, currentEuler: { x: number; y: number; z: number }): Vec3;
   getNodeDeltaPosition?(nodeId: string, currentPos: { x: number; y: number; z: number }): Vec3;
+  getNodeDeltaScale?(nodeId: string, currentScale: { x: number; y: number; z: number }): Vec3;
   setNodeVisibilityOverrides?(hiddenNodeIds: string[]): void;
+  syncNodeGroups?(groups: CharacterNodeGroup[]): void;
+  applyNodeMaterialOverrides?(overrides: Record<string, NodeMaterialOverride>): void;
+  getNodeMaterialInfo?(nodeId: string): NodeMaterialOverride | null;
 }

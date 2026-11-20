@@ -8,6 +8,7 @@ export interface RigVisualState {
   ikTargets: readonly IkTargetData[];
   selection: SelectionTarget;
   hoveredNodeKey: string | null; // `${instanceId}:${nodeId}`
+  multiSelectedNodeKeys?: ReadonlySet<string>;
   hoveredRingAxis?: 'x' | 'y' | 'z' | null;
   activeRingAxis?: 'x' | 'y' | 'z' | null;
   lockedNodeIds: ReadonlySet<string>;
@@ -202,10 +203,11 @@ export class RigVisualizer {
         ? state.selection.nodeId
         : null;
 
-    // 1. Draw parent -> child tapered octahedral bone prisms (skipping auxiliary facial clutter)
+    // 1. Draw parent -> child tapered octahedral bone prisms (skipping auxiliary facial clutter unless selected/multi-selected)
     for (const node of nodes) {
       if (!node.parentId) continue;
-      const isNodeSelected = selectedNodeId === node.nodeId;
+      const nodeKey = `${state.instanceId}:${node.nodeId}`;
+      const isNodeSelected = selectedNodeId === node.nodeId || Boolean(state.multiSelectedNodeKeys?.has(nodeKey));
       if (node.isAuxiliary && !isNodeSelected) continue;
 
       const parentPos = posByNode.get(node.parentId);
@@ -215,7 +217,7 @@ export class RigVisualizer {
       if (len < 0.04) continue;
 
       const isBranchActive =
-        selectedNodeId !== null && (selectedNodeId === node.nodeId || selectedNodeId === node.parentId);
+        isNodeSelected || (selectedNodeId !== null && selectedNodeId === node.parentId);
 
       const boneColor = isBranchActive ? 0xe8702a : inPoseMode ? 0x38bdf8 : 0x64748b;
       const linkMat = this.trackMat(
@@ -248,12 +250,14 @@ export class RigVisualizer {
     for (const node of nodes) {
       const nodeKey = `${state.instanceId}:${node.nodeId}`;
       const isSelected = selectedNodeId === node.nodeId;
+      const isMultiSelected = Boolean(state.multiSelectedNodeKeys?.has(nodeKey));
       const isHovered = state.hoveredNodeKey === nodeKey;
       const isLocked = state.lockedNodeIds.has(node.nodeId);
+      const isComponentGroup = node.type === 'group' && node.nodeId.startsWith('cgrp_');
 
-      // Keep face & minor decorative sub-parts clean unless explicitly selected/hovered
-      if (node.isAuxiliary && !isSelected && !isHovered) continue;
-      if (node.type === 'mesh' && !node.slot && !inPoseMode && !isSelected && !isHovered) continue;
+      // Keep face & minor decorative sub-parts clean unless explicitly selected, multi-selected, hovered, or component-grouped
+      if (node.isAuxiliary && !isSelected && !isMultiSelected && !isHovered && !isComponentGroup) continue;
+      if (node.type === 'mesh' && !node.slot && !inPoseMode && !isSelected && !isMultiSelected && !isHovered) continue;
 
       const wp = posByNode.get(node.nodeId);
       const wq = quatByNode.get(node.nodeId);
@@ -264,11 +268,15 @@ export class RigVisualizer {
         ? 0xef4444
         : isSelected
           ? 0xe8702a
-          : isHovered
-            ? 0x67e8f9
-            : node.slot
-              ? 0x38bdf8
-              : 0x94a3b8;
+          : isMultiSelected
+            ? 0x38bdf8
+            : isHovered
+              ? 0x67e8f9
+              : isComponentGroup
+                ? 0xf59e0b
+                : node.slot
+                  ? 0x38bdf8
+                  : 0x94a3b8;
 
       if (isRoot) {
         // Subtle floor/origin anchor ring for Character Root rather than a floating center ball
@@ -325,7 +333,7 @@ export class RigVisualizer {
           locked: isLocked,
         };
 
-        const scaleMul = isSelected ? 1.32 : isHovered ? 1.24 : node.slot ? 1.0 : 0.78;
+        const scaleMul = isSelected || isMultiSelected ? 1.32 : isHovered ? 1.24 : node.slot || isComponentGroup ? 1.0 : 0.78;
         this.group.add(jointMesh);
         this.rigNodeHandles.set(nodeKey, jointMesh);
         this.liveNodeAnchors.push({
@@ -336,13 +344,23 @@ export class RigVisualizer {
           copyQuat: true,
         });
 
-        // Socket collar ring around mapped / active / hovered joints
-        if (isSelected || isHovered || isLocked || (inPoseMode && node.slot)) {
+        // Socket collar ring around mapped / active / multi-selected / hovered / component-group joints
+        if (isSelected || isMultiSelected || isHovered || isLocked || isComponentGroup || (inPoseMode && node.slot)) {
           const collarMat = this.trackMat(
             new THREE.MeshBasicMaterial({
-              color: isLocked ? 0xf87171 : isSelected ? 0xfdba74 : isHovered ? 0xa5f3fc : 0x7dd3fc,
+              color: isLocked
+                ? 0xf87171
+                : isSelected
+                  ? 0xfdba74
+                  : isMultiSelected
+                    ? 0x38bdf8
+                    : isComponentGroup
+                      ? 0xfbbf24
+                      : isHovered
+                        ? 0xa5f3fc
+                        : 0x7dd3fc,
               transparent: true,
-              opacity: isSelected || isHovered ? 0.96 : 0.58,
+              opacity: isSelected || isMultiSelected || isHovered ? 0.96 : 0.58,
               depthTest: false,
             }),
           );
@@ -355,7 +373,7 @@ export class RigVisualizer {
             obj: collar,
             nodeId: node.nodeId,
             worldPos: wp.clone(),
-            baseScale: isSelected ? 1.18 : 1.0,
+            baseScale: isSelected || isMultiSelected ? 1.2 : 1.0,
             copyQuat: true,
           });
         }
@@ -483,7 +501,7 @@ export class RigVisualizer {
     const camPos = camera.position;
     for (const item of this.liveNodeAnchors) {
       const dist = camPos.distanceTo(item.worldPos);
-      const factor = THREE.MathUtils.clamp(dist / 7.5, 0.42, 2.2) * item.baseScale;
+      const factor = THREE.MathUtils.clamp(dist / 7.5, 0.28, 2.2) * item.baseScale;
       item.obj.scale.setScalar(factor);
     }
     for (const item of this.ikScalables) {

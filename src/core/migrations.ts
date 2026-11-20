@@ -197,10 +197,22 @@ export function migrateProjectData(raw: ProjectData): ProjectData {
         lockedProperties: ch.lockedProperties ?? { transform: false, keys: false },
         lockedNodes: Array.isArray(ch.lockedNodes) ? ch.lockedNodes : [],
         hiddenNodes: Array.isArray(ch.hiddenNodes) ? ch.hiddenNodes : [],
+        nodeGroups: Array.isArray(ch.nodeGroups) ? ch.nodeGroups : [],
+        nodeMaterialOverrides:
+          ch.nodeMaterialOverrides && typeof ch.nodeMaterialOverrides === 'object'
+            ? ch.nodeMaterialOverrides
+            : {},
         positionKeyframes: Array.isArray(ch.positionKeyframes) ? ch.positionKeyframes : [],
         rotationKeyframes: Array.isArray(ch.rotationKeyframes) ? ch.rotationKeyframes : [],
         scaleKeyframes: Array.isArray(ch.scaleKeyframes) ? ch.scaleKeyframes : [],
-        nodeTracks: Array.isArray(ch.nodeTracks) ? ch.nodeTracks : [],
+        nodeTracks: Array.isArray(ch.nodeTracks)
+          ? ch.nodeTracks.map((nt) => ({
+              ...nt,
+              positionKeyframes: Array.isArray(nt.positionKeyframes) ? nt.positionKeyframes : [],
+              rotationKeyframes: Array.isArray(nt.rotationKeyframes) ? nt.rotationKeyframes : [],
+              scaleKeyframes: Array.isArray(nt.scaleKeyframes) ? nt.scaleKeyframes : [],
+            }))
+          : [],
         boneMap: (ch.boneMap ?? {}) as Partial<Record<HumanoidSlot, string>>,
         ikTargets: Array.isArray(ch.ikTargets) ? ch.ikTargets : [],
         savedPoses: Array.isArray(ch.savedPoses) ? ch.savedPoses : [],

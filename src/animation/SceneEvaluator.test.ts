@@ -207,3 +207,54 @@ test('evaluateSceneAtTime composes animated SceneGroupData transforms onto membe
   assert.equal(at2.props.get('p1')?.visible, false);
 });
 
+test('evaluateSceneAtTime interpolates nodeTracks positionKeyframes and scaleKeyframes cleanly', () => {
+  const scene: SceneData = {
+    id: 'sc_node_scale',
+    name: 'Node Scale Eval',
+    duration: 10,
+    backgroundColor: '#16181c',
+    showGrid: true,
+    transition: 'cut',
+    camera: { pose: createDefaultCameraPose(), keyframes: [] },
+    characters: [
+      {
+        id: 'c1',
+        assetId: 'a1',
+        name: 'Bot',
+        visible: true,
+        includeStageProps: false,
+        transform: createDefaultTransform(0, 0, 0),
+        positionKeyframes: [],
+        rotationKeyframes: [],
+        scaleKeyframes: [],
+        nodeTracks: [
+          {
+            nodeId: 'cgrp_1',
+            nodeName: 'Part Group 1',
+            rotationKeyframes: [],
+            positionKeyframes: [
+              { id: 'np1', time: 0, value: { x: 0, y: 0, z: 0 }, easing: 'linear' },
+              { id: 'np2', time: 4, value: { x: 2, y: 0, z: 0 }, easing: 'linear' },
+            ],
+            scaleKeyframes: [
+              { id: 'ns1', time: 0, value: { x: 1, y: 1, z: 1 }, easing: 'linear' },
+              { id: 'ns2', time: 4, value: { x: 3, y: 3, z: 3 }, easing: 'linear' },
+            ],
+          },
+        ],
+        motionPath: createDefaultMotionPath(),
+        actionClips: [],
+        currentMood: 'neutral',
+        audioProfile: { voiceLabel: 'Bot', defaultVolume: 1, muted: false, pan: 0 },
+      },
+    ],
+    audioClips: [],
+  };
+
+  const at2 = evaluateSceneAtTime(scene, 2);
+  const c1 = at2.characters.get('c1');
+  assert.ok(Math.abs((c1?.nodePositions.cgrp_1?.x ?? 0) - 1) < 1e-5);
+  assert.ok(Math.abs((c1?.nodeScales.cgrp_1?.x ?? 0) - 2) < 1e-5);
+  assert.ok(Math.abs((c1?.nodeScales.cgrp_1?.y ?? 0) - 2) < 1e-5);
+});
+

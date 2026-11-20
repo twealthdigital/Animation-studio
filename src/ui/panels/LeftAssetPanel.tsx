@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import type {
   AssetRecord,
+  MultiSelectedNodeRef,
   PanelCollapseState,
   PropGeometryKind,
   RigNodeInfo,
@@ -56,9 +57,10 @@ interface LeftAssetPanelProps {
   scenes: SceneData[];
   selection: SelectionTarget;
   multiSelectedIds: string[];
+  multiSelectedNodes?: MultiSelectedNodeRef[];
   isolatedIds: string[];
   rigNodesByInstance: Record<string, RigNodeInfo[]>;
-  onSelectTarget: (target: SelectionTarget, shiftKey?: boolean) => void;
+  onSelectTarget: (target: SelectionTarget, additive?: boolean) => void;
   onOpenImport: () => void;
   onLoadWorkspaceSample: (sampleUrl: string, label: string) => void;
   onAddCharacterToScene: (asset: AssetRecord) => void;
@@ -81,6 +83,7 @@ interface LeftAssetPanelProps {
   onRemoveLightFromScene: (lightId: string) => void;
   onGroupSelection: () => void;
   onUngroupGroup: (groupId: string) => void;
+  onUngroupNodeGroup?: (instanceId: string, groupId: string) => void;
   onDuplicateGroup: (groupId: string) => void;
   onRenameGroup: (groupId: string, name: string) => void;
   onSelectGroupMembers: (groupId: string) => void;
@@ -106,6 +109,7 @@ export function LeftAssetPanel({
   scenes,
   selection,
   multiSelectedIds,
+  multiSelectedNodes = [],
   isolatedIds,
   rigNodesByInstance,
   onSelectTarget,
@@ -131,6 +135,7 @@ export function LeftAssetPanel({
   onRemoveLightFromScene,
   onGroupSelection,
   onUngroupGroup,
+  onUngroupNodeGroup,
   onDuplicateGroup,
   onRenameGroup,
   onSelectGroupMembers,
@@ -147,7 +152,7 @@ export function LeftAssetPanel({
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedCharRigs, setExpandedCharRigs] = useState<Record<string, boolean>>({});
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
-  const [showAuxNodes, setShowAuxNodes] = useState(false);
+  const [showAuxNodes, setShowAuxNodes] = useState(true);
   const [renamingAssetId, setRenamingAssetId] = useState<string | null>(null);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
@@ -266,7 +271,10 @@ export function LeftAssetPanel({
   const sceneProps = activeScene.props ?? [];
   const sceneGroups = activeScene.groups ?? [];
   const canGroupNow =
-    multiSelectedIds.length >= 1 || selection.kind === 'character' || selection.kind === 'prop';
+    multiSelectedIds.length >= 1 ||
+    multiSelectedNodes.length >= 2 ||
+    selection.kind === 'character' ||
+    selection.kind === 'prop';
 
   return (
     <aside
@@ -571,11 +579,15 @@ export function LeftAssetPanel({
               <StudioButton
                 size="xs"
                 disabled={!canGroupNow}
-                note="Group selected characters/props cleanly (Ctrl+G)"
+                note={
+                  multiSelectedNodes.length >= 2
+                    ? 'Group selected body components cleanly without detaching (Ctrl+G)'
+                    : 'Group selected characters/props cleanly (Ctrl+G)'
+                }
                 onClick={onGroupSelection}
               >
                 <Group className="h-3 w-3" aria-hidden="true" />
-                <span>Group</span>
+                <span>{multiSelectedNodes.length >= 2 ? 'Group Parts' : 'Group'}</span>
               </StudioButton>
             </div>
 
@@ -901,7 +913,10 @@ export function LeftAssetPanel({
                             <button
                               type="button"
                               onClick={(e) =>
-                                onSelectTarget({ kind: 'character', instanceId: char.id }, e.shiftKey)
+                                onSelectTarget(
+                                  { kind: 'character', instanceId: char.id },
+                                  e.shiftKey || e.ctrlKey || e.metaKey,
+                                )
                               }
                               onDoubleClick={() => onEnterPoseMode(char.id)}
                               className="flex min-w-0 flex-1 items-center gap-1.5 px-1 py-0.5 text-left"
@@ -952,9 +967,13 @@ export function LeftAssetPanel({
                                 .filter((n) => !q || n.name.toLowerCase().includes(q))
                                 .map((node) => {
                                   const isNodeSel =
-                                    selection.kind === 'body-part' &&
-                                    selection.instanceId === char.id &&
-                                    selection.nodeId === node.nodeId;
+                                    (selection.kind === 'body-part' &&
+                                      selection.instanceId === char.id &&
+                                      selection.nodeId === node.nodeId) ||
+                                    multiSelectedNodes.some(
+                                      (m) => m.instanceId === char.id && m.nodeId === node.nodeId,
+                                    );
+                                  const isPartGroup = node.nodeId.startsWith('cgrp_');
                                   const nLocked = lockedNodeSet.has(node.nodeId);
                                   const nHidden = hiddenNodeSet.has(node.nodeId);
                                   return (
@@ -962,31 +981,57 @@ export function LeftAssetPanel({
                                       key={node.nodeId}
                                       className={`flex items-center justify-between gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors ${
                                         isNodeSel
-                                          ? 'bg-[#2e221b] text-[#f7be97] font-medium'
+                                          ? 'bg-[#2e221b] text-[#f7be97] font-medium border border-[#e8702a]/50'
                                           : 'text-[#98a0ad] hover:bg-[#22262e] hover:text-[#e6e8ec]'
                                       }`}
                                     >
                                       <button
                                         type="button"
-                                        data-studio-note={node.description ?? `Pose ${node.name}`}
-                                        onClick={() =>
-                                          onSelectTarget({
-                                            kind: 'body-part',
-                                            instanceId: char.id,
-                                            nodeId: node.nodeId,
-                                            nodeName: node.name,
-                                          })
+                                        data-studio-note={
+                                          node.description ??
+                                          `Click to edit ${node.name} · Ctrl+Click to multi-select parts for Ctrl+G group`
+                                        }
+                                        onClick={(e) =>
+                                          onSelectTarget(
+                                            {
+                                              kind: 'body-part',
+                                              instanceId: char.id,
+                                              nodeId: node.nodeId,
+                                              nodeName: node.name,
+                                            },
+                                            e.shiftKey || e.ctrlKey || e.metaKey,
+                                          )
                                         }
                                         className="flex min-w-0 flex-1 items-center gap-1.5 py-0.5 text-left"
                                       >
-                                        <Bone className="h-3 w-3 shrink-0" aria-hidden="true" />
+                                        {isPartGroup ? (
+                                          <Group className="h-3 w-3 shrink-0 text-[#e8702a]" aria-hidden="true" />
+                                        ) : (
+                                          <Bone className="h-3 w-3 shrink-0" aria-hidden="true" />
+                                        )}
                                         <span className="truncate">{node.name}</span>
+                                        {isPartGroup && (
+                                          <span className="shrink-0 rounded bg-[#2e221b] px-1 text-[9px] text-[#f5a16a]">
+                                            Group
+                                          </span>
+                                        )}
                                       </button>
                                       <div className="flex items-center gap-0.5 shrink-0">
+                                        {isPartGroup && onUngroupNodeGroup && (
+                                          <button
+                                            type="button"
+                                            aria-label={`Ungroup ${node.name}`}
+                                            data-studio-note="Ungroup parts back to original joints (Ctrl+Shift+G)"
+                                            onClick={() => onUngroupNodeGroup(char.id, node.nodeId)}
+                                            className="rounded p-0.5 text-[#f5a16a] hover:bg-[#2a2e36]"
+                                          >
+                                            <Ungroup className="h-2.5 w-2.5" />
+                                          </button>
+                                        )}
                                         <button
                                           type="button"
                                           aria-label={nLocked ? `Unlock ${node.name}` : `Lock ${node.name}`}
-                                          data-studio-note={nLocked ? 'Unlock bone rotation' : 'Lock bone rotation'}
+                                          data-studio-note={nLocked ? 'Unlock part transform' : 'Lock part transform'}
                                           onClick={() => onToggleNodeLock(char.id, node.nodeId)}
                                           className={`rounded p-0.5 ${nLocked ? 'text-[#e8702a]' : 'text-[#6b7280] hover:text-[#e6e8ec]'}`}
                                         >
@@ -1032,7 +1077,12 @@ export function LeftAssetPanel({
                     >
                       <button
                         type="button"
-                        onClick={(e) => onSelectTarget({ kind: 'prop', propId: prop.id }, e.shiftKey)}
+                        onClick={(e) =>
+                          onSelectTarget(
+                            { kind: 'prop', propId: prop.id },
+                            e.shiftKey || e.ctrlKey || e.metaKey,
+                          )
+                        }
                         className="flex min-w-0 flex-1 items-center gap-1.5 px-1 text-left"
                       >
                         <Shapes className="h-3.5 w-3.5 shrink-0 text-[#e8702a]" aria-hidden="true" />

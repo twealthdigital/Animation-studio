@@ -35,6 +35,8 @@ import type {
   IkChainType,
   MotionPathCurveType,
   MotionPathData,
+  MultiSelectedNodeRef,
+  NodeMaterialOverride,
   PanelCollapseState,
   RigNodeInfo,
   SceneCameraItem,
@@ -91,6 +93,8 @@ interface RightInspectorProps {
   selectedCharacterCaps: CharacterCapabilities | null;
   evaluatedTransform: Transform3D | null;
   evaluatedNodeRotations: Record<string, Vec3>;
+  evaluatedNodePositions?: Record<string, Vec3>;
+  evaluatedNodeScales?: Record<string, Vec3>;
   evaluatedFacial: FacialState | null;
   evaluatedCameraPose: CameraPose;
   selectedProp: ScenePropData | null;
@@ -103,13 +107,31 @@ interface RightInspectorProps {
   selectedAudioAsset: AssetRecord | null;
   selectedActionClip: ActionClip | null;
   rigNodesByInstance: Record<string, RigNodeInfo[]>;
+  multiSelectedNodes?: MultiSelectedNodeRef[];
+  getLiveNodeMaterial?: (instanceId: string, nodeId: string) => NodeMaterialOverride | null;
   onSelectTarget: (target: SelectionTarget) => void;
   onEnterPoseMode: (instanceId: string) => void;
+  onGroupSelection?: () => void;
   onUpdateCharacterMeta: (instanceId: string, patch: Partial<CharacterInstanceData>) => void;
   onUpdateCharacterTransform: (instanceId: string, transform: Transform3D) => void;
   onKeyCharacterTransform: (instanceId: string, easing: EasingType) => void;
   onUpdateNodeRotation: (instanceId: string, nodeId: string, nodeName: string, rot: Vec3) => void;
+  onUpdateNodePosition?: (instanceId: string, nodeId: string, nodeName: string, pos: Vec3) => void;
+  onUpdateNodeScale?: (instanceId: string, nodeId: string, nodeName: string, scale: Vec3) => void;
   onKeyNodeRotation: (instanceId: string, nodeId: string, nodeName: string, rot: Vec3, easing: EasingType) => void;
+  onKeyNodeTransform?: (
+    instanceId: string,
+    nodeId: string,
+    nodeName: string,
+    rot: Vec3,
+    pos: Vec3,
+    scale: Vec3,
+    easing: EasingType,
+  ) => void;
+  onUpdateNodeMaterial?: (instanceId: string, nodeId: string, patch: NodeMaterialOverride) => void;
+  onResetNodeMaterial?: (instanceId: string, nodeId: string) => void;
+  onRenameNodeGroup?: (instanceId: string, groupId: string, name: string) => void;
+  onUngroupNodeGroup?: (instanceId: string, groupId: string) => void;
   onResetNodeRotation: (instanceId: string, nodeId: string) => void;
   onToggleNodeLock: (instanceId: string, nodeId: string) => void;
   onToggleNodeVisibility: (instanceId: string, nodeId: string) => void;
@@ -198,6 +220,8 @@ export function RightInspector({
   selectedCharacterCaps,
   evaluatedTransform,
   evaluatedNodeRotations,
+  evaluatedNodePositions = {},
+  evaluatedNodeScales = {},
   evaluatedFacial,
   evaluatedCameraPose,
   selectedProp,
@@ -210,13 +234,23 @@ export function RightInspector({
   selectedAudioAsset,
   selectedActionClip,
   rigNodesByInstance,
+  multiSelectedNodes = [],
+  getLiveNodeMaterial,
   onSelectTarget,
   onEnterPoseMode,
+  onGroupSelection,
   onUpdateCharacterMeta,
   onUpdateCharacterTransform,
   onKeyCharacterTransform,
   onUpdateNodeRotation,
+  onUpdateNodePosition,
+  onUpdateNodeScale,
   onKeyNodeRotation,
+  onKeyNodeTransform,
+  onUpdateNodeMaterial,
+  onResetNodeMaterial,
+  onRenameNodeGroup,
+  onUngroupNodeGroup,
   onResetNodeRotation,
   onToggleNodeLock,
   onToggleNodeVisibility,
@@ -1781,23 +1815,51 @@ export function RightInspector({
   let body: React.ReactNode;
   if (selection.kind === 'body-part' && selectedCharacter) {
     const nodeInfo = selectedCharRigNodes.find((n) => n.nodeId === selection.nodeId);
+    const nodeGroup = (selectedCharacter.nodeGroups ?? []).find((g) => g.id === selection.nodeId) ?? null;
+    const liveMaterial = getLiveNodeMaterial ? getLiveNodeMaterial(selectedCharacter.id, selection.nodeId) : null;
+    const nodeMaterial = selectedCharacter.nodeMaterialOverrides?.[selection.nodeId];
     body = (
-      <BodyPartInspector
-        char={selectedCharacter}
-        nodeId={selection.nodeId}
-        nodeName={selection.nodeName}
-        nodeInfo={nodeInfo}
-        currentTime={currentTime}
-        rotation={evaluatedNodeRotations[selection.nodeId] ?? { x: 0, y: 0, z: 0 }}
-        onUpdateNodeRotation={onUpdateNodeRotation}
-        onKeyNodeRotation={onKeyNodeRotation}
-        onResetNode={onResetNodeRotation}
-        onToggleNodeLock={onToggleNodeLock}
-        onToggleNodeVisibility={onToggleNodeVisibility}
-        onBackToCharacter={() =>
-          onSelectTarget({ kind: 'character', instanceId: selectedCharacter.id })
-        }
-      />
+      <div className="space-y-3">
+        {multiSelectedNodes.length >= 2 && onGroupSelection && (
+          <div className="flex items-center justify-between gap-2 rounded border border-[#e8702a] bg-[#2e221b] px-2.5 py-1.5">
+            <span className="text-[11px] font-medium text-[#f7be97]">
+              {multiSelectedNodes.length} parts picked
+            </span>
+            <StudioButton size="xs" variant="primary" shortcut="Ctrl+G" onClick={onGroupSelection}>
+              <Group className="h-3 w-3" aria-hidden="true" />
+              <span>Group Parts</span>
+            </StudioButton>
+          </div>
+        )}
+        <BodyPartInspector
+          char={selectedCharacter}
+          nodeId={selection.nodeId}
+          nodeName={selection.nodeName}
+          nodeInfo={nodeInfo}
+          currentTime={currentTime}
+          rotation={evaluatedNodeRotations[selection.nodeId] ?? { x: 0, y: 0, z: 0 }}
+          position={evaluatedNodePositions[selection.nodeId] ?? { x: 0, y: 0, z: 0 }}
+          scale={evaluatedNodeScales[selection.nodeId] ?? { x: 1, y: 1, z: 1 }}
+          nodeMaterial={nodeMaterial}
+          liveMaterial={liveMaterial}
+          nodeGroup={nodeGroup}
+          onUpdateNodeRotation={onUpdateNodeRotation}
+          onUpdateNodePosition={onUpdateNodePosition}
+          onUpdateNodeScale={onUpdateNodeScale}
+          onKeyNodeRotation={onKeyNodeRotation}
+          onKeyNodeTransform={onKeyNodeTransform}
+          onUpdateNodeMaterial={onUpdateNodeMaterial}
+          onResetNodeMaterial={onResetNodeMaterial}
+          onRenameNodeGroup={onRenameNodeGroup}
+          onUngroupNodeGroup={onUngroupNodeGroup}
+          onResetNode={onResetNodeRotation}
+          onToggleNodeLock={onToggleNodeLock}
+          onToggleNodeVisibility={onToggleNodeVisibility}
+          onBackToCharacter={() =>
+            onSelectTarget({ kind: 'character', instanceId: selectedCharacter.id })
+          }
+        />
+      </div>
     );
   } else if (selection.kind === 'group' && selectedGroup) {
     body = renderGroupInspector(selectedGroup);

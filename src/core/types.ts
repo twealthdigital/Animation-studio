@@ -122,6 +122,30 @@ export interface NodeKeyframeTrack {
   nodeName: string;
   rotationKeyframes: Vec3Keyframe[];
   positionKeyframes: Vec3Keyframe[];
+  scaleKeyframes?: Vec3Keyframe[];
+}
+
+export interface NodeMaterialOverride {
+  color?: string;
+  emissive?: string;
+  emissiveIntensity?: number;
+  roughness?: number;
+  metalness?: number;
+  opacity?: number;
+}
+
+export interface CharacterNodeGroup {
+  id: string;
+  name: string;
+  memberNodeIds: string[];
+  locked?: boolean;
+  visible?: boolean;
+}
+
+export interface MultiSelectedNodeRef {
+  instanceId: string;
+  nodeId: string;
+  nodeName: string;
 }
 
 export type IkChainType = 'leftArm' | 'rightArm' | 'leftLeg' | 'rightLeg' | 'lookAt';
@@ -219,6 +243,8 @@ export interface CharacterInstanceData {
   lockedProperties?: { transform?: boolean; keys?: boolean };
   lockedNodes?: string[];
   hiddenNodes?: string[];
+  nodeGroups?: CharacterNodeGroup[];
+  nodeMaterialOverrides?: Record<string, NodeMaterialOverride>;
   positionKeyframes: Vec3Keyframe[];
   rotationKeyframes: Vec3Keyframe[];
   scaleKeyframes: Vec3Keyframe[];
@@ -416,7 +442,7 @@ export type SaveStatus = 'idle' | 'unsaved' | 'saving' | 'saved' | 'error';
 
 export type StudioMode = 'beginner' | 'advanced';
 
-export type GizmoMode = 'select' | 'translate' | 'rotate' | 'scale';
+export type GizmoMode = 'select' | 'box-select' | 'translate' | 'rotate' | 'scale' | 'orbit';
 export type GizmoSpace = 'world' | 'local';
 export type AxisConstraint = 'all' | 'x' | 'y' | 'z';
 export type SelectionFilter =

@@ -2,26 +2,31 @@ import { useState } from 'react';
 import {
   Bone,
   FlipHorizontal2,
+  Group,
   Key,
   Layers,
   MessageSquarePlus,
+  Palette,
   Play,
   Plus,
   RotateCcw,
   Smile,
   Sparkles,
   Trash2,
+  Ungroup,
   Volume2,
   VolumeX,
   Wand2,
 } from 'lucide-react';
 import type {
   CharacterInstanceData,
+  CharacterNodeGroup,
   EasingType,
   FacialState,
   HumanoidSlot,
   IkChainType,
   IkTargetData,
+  NodeMaterialOverride,
   RigCompatibilityReport,
   RigNodeInfo,
   SavedPoseData,
@@ -105,7 +110,7 @@ export function RigAndIkSection({
 }: RigTabProps) {
   const [poseName, setPoseName] = useState('Pose A');
   const [blendAlpha, setBlendAlpha] = useState(0.5);
-  const [showAux, setShowAux] = useState(false);
+  const [showAux, setShowAux] = useState(true);
   const visibleNodes = showAux ? rigNodes : rigNodes.filter((n) => !n.isAuxiliary);
   const [slotNodeId, setSlotNodeId] = useState<string>(visibleNodes[0]?.nodeId ?? rigNodes[0]?.nodeId ?? '');
   const [slotTarget, setSlotTarget] = useState<HumanoidSlot | ''>('');
@@ -192,13 +197,18 @@ export function RigAndIkSection({
               <button
                 key={n.nodeId}
                 type="button"
-                data-studio-note={n.description ?? `Select ${n.name} to rotate around parent socket`}
+                data-studio-note={n.description ?? `Select ${n.name} to move, rotate, scale or recolor`}
                 onClick={() => onSelectNode(n.nodeId, n.name)}
                 className="flex w-full items-center justify-between rounded px-2 py-1 text-left text-[11px] text-[#e6e8ec] hover:bg-[#252932]"
               >
-                <span className="truncate">{n.name}</span>
+                <span className="truncate flex items-center gap-1.5">
+                  {n.nodeId.startsWith('cgrp_') && (
+                    <Group className="h-3 w-3 shrink-0 text-[#e8702a]" aria-hidden="true" />
+                  )}
+                  <span className="truncate">{n.name}</span>
+                </span>
                 <span className="ml-2 shrink-0 rounded bg-[#22262e] px-1.5 py-0.5 font-mono-code text-[9px] text-[#98a0ad]">
-                  {n.slot ?? n.type}
+                  {n.nodeId.startsWith('cgrp_') ? 'group' : n.slot ?? n.type}
                 </span>
               </button>
             ))
@@ -736,8 +746,20 @@ export function BodyPartInspector({
   nodeInfo,
   currentTime,
   rotation,
+  position = { x: 0, y: 0, z: 0 },
+  scale = { x: 1, y: 1, z: 1 },
+  nodeMaterial,
+  liveMaterial,
+  nodeGroup,
   onUpdateNodeRotation,
+  onUpdateNodePosition,
+  onUpdateNodeScale,
   onKeyNodeRotation,
+  onKeyNodeTransform,
+  onUpdateNodeMaterial,
+  onResetNodeMaterial,
+  onRenameNodeGroup,
+  onUngroupNodeGroup,
   onResetNode,
   onToggleNodeLock,
   onToggleNodeVisibility,
@@ -749,8 +771,28 @@ export function BodyPartInspector({
   nodeInfo?: RigNodeInfo;
   currentTime: number;
   rotation: Vec3;
+  position?: Vec3;
+  scale?: Vec3;
+  nodeMaterial?: NodeMaterialOverride;
+  liveMaterial?: NodeMaterialOverride | null;
+  nodeGroup?: CharacterNodeGroup | null;
   onUpdateNodeRotation: (instanceId: string, nodeId: string, nodeName: string, rot: Vec3) => void;
+  onUpdateNodePosition?: (instanceId: string, nodeId: string, nodeName: string, pos: Vec3) => void;
+  onUpdateNodeScale?: (instanceId: string, nodeId: string, nodeName: string, scale: Vec3) => void;
   onKeyNodeRotation: (instanceId: string, nodeId: string, nodeName: string, rot: Vec3, easing: EasingType) => void;
+  onKeyNodeTransform?: (
+    instanceId: string,
+    nodeId: string,
+    nodeName: string,
+    rot: Vec3,
+    pos: Vec3,
+    scale: Vec3,
+    easing: EasingType,
+  ) => void;
+  onUpdateNodeMaterial?: (instanceId: string, nodeId: string, patch: NodeMaterialOverride) => void;
+  onResetNodeMaterial?: (instanceId: string, nodeId: string) => void;
+  onRenameNodeGroup?: (instanceId: string, groupId: string, name: string) => void;
+  onUngroupNodeGroup?: (instanceId: string, groupId: string) => void;
   onResetNode: (instanceId: string, nodeId: string) => void;
   onToggleNodeLock: (instanceId: string, nodeId: string) => void;
   onToggleNodeVisibility: (instanceId: string, nodeId: string) => void;
@@ -765,20 +807,33 @@ export function BodyPartInspector({
   const degY = rotation.y * RAD_TO_DEG;
   const degZ = rotation.z * RAD_TO_DEG;
 
+  const effectiveMat: NodeMaterialOverride = {
+    color: nodeMaterial?.color ?? liveMaterial?.color ?? '#e8702a',
+    emissive: nodeMaterial?.emissive ?? liveMaterial?.emissive ?? '#000000',
+    emissiveIntensity: nodeMaterial?.emissiveIntensity ?? liveMaterial?.emissiveIntensity ?? 0,
+    roughness: nodeMaterial?.roughness ?? liveMaterial?.roughness ?? 0.65,
+    metalness: nodeMaterial?.metalness ?? liveMaterial?.metalness ?? 0.1,
+    opacity: nodeMaterial?.opacity ?? liveMaterial?.opacity ?? 1,
+  };
+  const hasMatOverride = Boolean(nodeMaterial);
+
   return (
     <div className="space-y-3.5">
       <div className="flex items-center justify-between border-b border-[#2a2e36] pb-2">
         <div className="min-w-0">
           <div className="truncate text-[10px] text-[#98a0ad]">
-            {char.name} · {nodeInfo?.slot ?? 'Joint'}
+            {char.name} · {nodeGroup ? 'Part Group' : nodeInfo?.slot ?? nodeInfo?.type ?? 'Component'}
           </div>
-          <div className="truncate font-semibold text-[#e6e8ec]">{nodeName}</div>
+          <div className="truncate font-semibold text-[#e6e8ec] flex items-center gap-1.5">
+            {nodeGroup && <Group className="h-3.5 w-3.5 shrink-0 text-[#e8702a]" aria-hidden="true" />}
+            <span className="truncate">{nodeName}</span>
+          </div>
         </div>
         <div className="flex items-center gap-1 shrink-0">
           <StudioButton
             size="xs"
             variant={isLocked ? 'selected' : 'default'}
-            note={isLocked ? 'Unlock joint rotation' : 'Lock joint rotation'}
+            note={isLocked ? 'Unlock part transform' : 'Lock part transform'}
             onClick={() => onToggleNodeLock(char.id, nodeId)}
           >
             {isLocked ? 'Locked' : 'Lock'}
@@ -797,6 +852,40 @@ export function BodyPartInspector({
         </div>
       </div>
 
+      {/* Component Group Management Card */}
+      {nodeGroup && (
+        <div className="space-y-2 rounded border border-[#e8702a]/50 bg-[#1c1714] p-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] font-semibold text-[#f7be97]">
+              Locked Part Group ({nodeGroup.memberNodeIds.length})
+            </span>
+            {onUngroupNodeGroup && (
+              <StudioButton
+                size="xs"
+                shortcut="Ctrl+Shift+G"
+                note="Ungroup parts back to their original hierarchy positions"
+                onClick={() => onUngroupNodeGroup(char.id, nodeGroup.id)}
+              >
+                <Ungroup className="h-3 w-3" aria-hidden="true" />
+                <span>Ungroup</span>
+              </StudioButton>
+            )}
+          </div>
+          {onRenameNodeGroup && (
+            <input
+              type="text"
+              value={nodeGroup.name}
+              onChange={(e) => onRenameNodeGroup(char.id, nodeGroup.id, e.target.value)}
+              aria-label="Component group name"
+              className="h-6 w-full rounded border border-[#383e49] bg-[#14161a] px-2 text-xs text-[#e6e8ec] focus:border-[#e8702a] focus:outline-none"
+            />
+          )}
+          <div className="text-[10px] text-[#cbd5e1]">
+            Parts stay locked together as one editable assembly without detaching.
+          </div>
+        </div>
+      )}
+
       {/* Parent Joint Lock Indicator */}
       <div
         data-studio-note={
@@ -807,15 +896,15 @@ export function BodyPartInspector({
         className="flex items-center justify-between rounded border border-[#2a2e36] bg-[#14161a] px-2.5 py-1 text-[10px] text-[#98a0ad]"
       >
         <span>{nodeInfo?.parentId ? 'Socket-locked to parent' : 'Character root joint'}</span>
-        <span className="font-mono-code text-[#e8702a]">Drag rings or mesh</span>
+        <span className="font-mono-code text-[#e8702a]">G Move · R Rotate · S Scale</span>
       </div>
 
       {/* Smooth Drag Sliders + Precise Degree Inputs */}
       <div className="space-y-2">
         <div className="flex items-center justify-between text-[11px] text-[#98a0ad]">
-          <span>Joint Rotation (deg)</span>
+          <span>Rotation (deg)</span>
           <span className="font-mono-code text-[10px] text-[#e8702a]">
-            {track?.rotationKeyframes.length ?? 0} keys
+            {track?.rotationKeyframes.length ?? 0}R / {track?.positionKeyframes.length ?? 0}P / {track?.scaleKeyframes?.length ?? 0}S
           </span>
         </div>
 
@@ -855,7 +944,7 @@ export function BodyPartInspector({
 
         <div className="grid grid-cols-3 gap-1.5 pt-1">
           <NumericInput
-            label="X"
+            label="Rx"
             step={5}
             decimals={1}
             disabled={isLocked}
@@ -863,7 +952,7 @@ export function BodyPartInspector({
             onChange={(x) => onUpdateNodeRotation(char.id, nodeId, nodeName, { ...rotation, x: x * DEG_TO_RAD })}
           />
           <NumericInput
-            label="Y"
+            label="Ry"
             step={5}
             decimals={1}
             disabled={isLocked}
@@ -871,7 +960,7 @@ export function BodyPartInspector({
             onChange={(y) => onUpdateNodeRotation(char.id, nodeId, nodeName, { ...rotation, y: y * DEG_TO_RAD })}
           />
           <NumericInput
-            label="Z"
+            label="Rz"
             step={5}
             decimals={1}
             disabled={isLocked}
@@ -880,6 +969,70 @@ export function BodyPartInspector({
           />
         </div>
       </div>
+
+      {/* Per-Component Position Offset & Scale */}
+      {onUpdateNodePosition && onUpdateNodeScale && (
+        <div className="space-y-2 border-t border-[#2a2e36] pt-2.5">
+          <div className="text-[11px] text-[#98a0ad]">Offset Position</div>
+          <div className="grid grid-cols-3 gap-1.5">
+            <NumericInput
+              label="X"
+              step={0.05}
+              decimals={2}
+              disabled={isLocked}
+              value={position.x}
+              onChange={(x) => onUpdateNodePosition(char.id, nodeId, nodeName, { ...position, x })}
+            />
+            <NumericInput
+              label="Y"
+              step={0.05}
+              decimals={2}
+              disabled={isLocked}
+              value={position.y}
+              onChange={(y) => onUpdateNodePosition(char.id, nodeId, nodeName, { ...position, y })}
+            />
+            <NumericInput
+              label="Z"
+              step={0.05}
+              decimals={2}
+              disabled={isLocked}
+              value={position.z}
+              onChange={(z) => onUpdateNodePosition(char.id, nodeId, nodeName, { ...position, z })}
+            />
+          </div>
+
+          <div className="text-[11px] text-[#98a0ad]">Scale Multiplier</div>
+          <div className="grid grid-cols-3 gap-1.5">
+            <NumericInput
+              label="Sx"
+              min={0.05}
+              step={0.05}
+              decimals={2}
+              disabled={isLocked}
+              value={scale.x}
+              onChange={(x) => onUpdateNodeScale(char.id, nodeId, nodeName, { ...scale, x })}
+            />
+            <NumericInput
+              label="Sy"
+              min={0.05}
+              step={0.05}
+              decimals={2}
+              disabled={isLocked}
+              value={scale.y}
+              onChange={(y) => onUpdateNodeScale(char.id, nodeId, nodeName, { ...scale, y })}
+            />
+            <NumericInput
+              label="Sz"
+              min={0.05}
+              step={0.05}
+              decimals={2}
+              disabled={isLocked}
+              value={scale.z}
+              onChange={(z) => onUpdateNodeScale(char.id, nodeId, nodeName, { ...scale, z })}
+            />
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-1.5">
         <CustomSelect
@@ -895,7 +1048,11 @@ export function BodyPartInspector({
         />
         <StudioButton
           variant="primary"
-          onClick={() => onKeyNodeRotation(char.id, nodeId, nodeName, rotation, easing)}
+          onClick={() =>
+            onKeyNodeTransform
+              ? onKeyNodeTransform(char.id, nodeId, nodeName, rotation, position, scale, easing)
+              : onKeyNodeRotation(char.id, nodeId, nodeName, rotation, easing)
+          }
         >
           <Key className="h-3.5 w-3.5" aria-hidden="true" />
           <span>Key @ {currentTime.toFixed(1)}s</span>
@@ -904,8 +1061,111 @@ export function BodyPartInspector({
 
       <StudioButton className="w-full" onClick={() => onResetNode(char.id, nodeId)}>
         <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
-        <span>Reset Joint Pose</span>
+        <span>Reset Part Transform</span>
       </StudioButton>
+
+      {/* Per-Component Color & Material Editor */}
+      {onUpdateNodeMaterial && (
+        <div className="space-y-2 border-t border-[#2a2e36] pt-2.5">
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5 font-semibold text-[#e6e8ec]">
+              <Palette className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
+              <span>Part Color &amp; Material</span>
+            </span>
+            {hasMatOverride && onResetNodeMaterial && (
+              <button
+                type="button"
+                onClick={() => onResetNodeMaterial(char.id, nodeId)}
+                className="text-[10px] text-[#f5a16a] hover:underline"
+              >
+                Reset Color
+              </button>
+            )}
+          </div>
+          <div className="text-[10px] text-[#98a0ad]">
+            Changes affect only “{nodeName}”.
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="flex items-center justify-between rounded border border-[#2a2e36] bg-[#14161a] px-2 py-1 text-[11px]">
+              <span className="text-[#98a0ad]">Color</span>
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono-code text-[10px] text-[#cbd5e1]">{effectiveMat.color}</span>
+                <input
+                  type="color"
+                  aria-label={`${nodeName} color`}
+                  value={effectiveMat.color ?? '#e8702a'}
+                  onChange={(e) =>
+                    onUpdateNodeMaterial(char.id, nodeId, { ...effectiveMat, color: e.target.value })
+                  }
+                  className="h-5 w-7 cursor-pointer rounded border border-[#2e333d] bg-transparent p-0"
+                />
+              </div>
+            </label>
+
+            <label className="flex items-center justify-between rounded border border-[#2a2e36] bg-[#14161a] px-2 py-1 text-[11px]">
+              <span className="text-[#98a0ad]">Glow</span>
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono-code text-[10px] text-[#cbd5e1]">{effectiveMat.emissive}</span>
+                <input
+                  type="color"
+                  aria-label={`${nodeName} emissive color`}
+                  value={effectiveMat.emissive ?? '#000000'}
+                  onChange={(e) =>
+                    onUpdateNodeMaterial(char.id, nodeId, { ...effectiveMat, emissive: e.target.value })
+                  }
+                  className="h-5 w-7 cursor-pointer rounded border border-[#2e333d] bg-transparent p-0"
+                />
+              </div>
+            </label>
+          </div>
+
+          <StudioSlider
+            label="Glow Intensity"
+            min={0}
+            max={2}
+            step={0.05}
+            value={effectiveMat.emissiveIntensity ?? 0}
+            displayValue={(effectiveMat.emissiveIntensity ?? 0).toFixed(2)}
+            onChange={(emissiveIntensity) =>
+              onUpdateNodeMaterial(char.id, nodeId, { ...effectiveMat, emissiveIntensity })
+            }
+          />
+          <StudioSlider
+            label="Roughness"
+            min={0}
+            max={1}
+            step={0.05}
+            value={effectiveMat.roughness ?? 0.65}
+            displayValue={(effectiveMat.roughness ?? 0.65).toFixed(2)}
+            onChange={(roughness) =>
+              onUpdateNodeMaterial(char.id, nodeId, { ...effectiveMat, roughness })
+            }
+          />
+          <StudioSlider
+            label="Metalness"
+            min={0}
+            max={1}
+            step={0.05}
+            value={effectiveMat.metalness ?? 0.1}
+            displayValue={(effectiveMat.metalness ?? 0.1).toFixed(2)}
+            onChange={(metalness) =>
+              onUpdateNodeMaterial(char.id, nodeId, { ...effectiveMat, metalness })
+            }
+          />
+          <StudioSlider
+            label="Opacity"
+            min={0.05}
+            max={1}
+            step={0.05}
+            value={effectiveMat.opacity ?? 1}
+            displayValue={`${Math.round((effectiveMat.opacity ?? 1) * 100)}%`}
+            onChange={(opacity) =>
+              onUpdateNodeMaterial(char.id, nodeId, { ...effectiveMat, opacity })
+            }
+          />
+        </div>
+      )}
 
       {/* Structure & Materials */}
       {nodeInfo && (

@@ -1,7 +1,22 @@
 import * as THREE from 'three';
-import type { FacialState, HumanoidSlot, RigNodeInfo, Transform3D, Vec3 } from '../core/types';
+import type {
+  CharacterNodeGroup,
+  FacialState,
+  HumanoidSlot,
+  NodeMaterialOverride,
+  RigNodeInfo,
+  Transform3D,
+  Vec3,
+} from '../core/types';
 import type { CharacterCapabilities, ICharacterAdapter } from './CharacterAdapter';
 import { analyzeHtmlCharacter } from './HtmlCharacterAnalyzer';
+import {
+  applyCharacterNodeMaterialOverrides,
+  type BaseNodeSnapshot,
+  type MaterialBaseSnapshot,
+  readNodeMaterialSnapshot,
+  reconcileCharacterNodeGroups,
+} from './RigNodeOperations';
 
 interface VirtualDomElement {
   id: string;
@@ -158,12 +173,20 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
   private includeStageProps = false;
   private loaded = false;
 
+  private baseRigNodes: RigNodeInfo[] = [];
   private rigNodes: RigNodeInfo[] = [];
   private nodeObjectMap = new Map<string, THREE.Object3D>();
-  private nodeBaseTransform = new Map<string, { pos: THREE.Vector3; rot: THREE.Euler }>();
+  private nodeBaseTransform = new Map<string, { pos: THREE.Vector3; rot: THREE.Euler; scale: THREE.Vector3 }>();
+  private originalNodeSnapshots = new Map<string, BaseNodeSnapshot>();
+  private activeGroupPivots = new Map<string, THREE.Group>();
+  private hiddenGroupIds = new Set<string>();
+  private baseMaterialSnapshots = new WeakMap<THREE.Mesh, MaterialBaseSnapshot[]>();
   private pendingNodeRotOverrides: Record<string, Vec3> = {};
   private pendingNodePosOverrides: Record<string, Vec3> = {};
+  private pendingNodeScaleOverrides: Record<string, Vec3> = {};
   private previouslyOverriddenNodes = new Set<string>();
+  private lastGroupsSig = '';
+  private lastMaterialSig = '';
   private pendingFacial: FacialState | null = null;
   private morphMeshes: THREE.Mesh[] = [];
 
@@ -455,9 +478,15 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
    * inferring semantic humanoid labels even when procedural HTML scripts create unnamed Groups.
    */
   private discoverRigHierarchy(root: THREE.Object3D): void {
+    this.baseRigNodes = [];
     this.rigNodes = [];
     this.nodeObjectMap.clear();
     this.nodeBaseTransform.clear();
+    this.originalNodeSnapshots.clear();
+    this.activeGroupPivots.clear();
+    this.hiddenGroupIds.clear();
+    this.lastGroupsSig = '';
+    this.lastMaterialSig = '';
     this.morphMeshes = [];
 
     // Reverse lookup for explicit SDK node bindings
@@ -541,6 +570,22 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
           return { name: 'Mouth', description: 'Mouth, teeth & tongue assembly', isAuxiliary: true };
         }
       }
+      if (parentName === 'Antenna' && isMesh) {
+        if (geoType.includes('Sphere')) return { name: 'Antenna Bulb', description: 'Tip bulb of antenna', isAuxiliary: true };
+        if (py < 0.08) return { name: 'Antenna Base', description: 'Antenna base mount', isAuxiliary: true };
+        return { name: 'Antenna Stem', description: 'Antenna mast stem', isAuxiliary: true };
+      }
+      if (parentSlot === 'leftEye' || parentSlot === 'rightEye') {
+        const side = parentSlot === 'leftEye' ? 'Left' : 'Right';
+        if (isMesh) {
+          return pz > 0.06
+            ? { name: `${side} Pupil`, description: `${side.toLowerCase()} eye pupil`, isAuxiliary: true }
+            : { name: `${side} Eyeball`, description: `${side.toLowerCase()} eyeball sphere`, isAuxiliary: true };
+        }
+      }
+      if (parentName === 'Mouth' && isMesh) {
+        return { name: `Mouth Part (${this.rigNodes.length})`, description: 'Mouth sub-component', isAuxiliary: true };
+      }
       if (parentName === 'Orbit Ring' && (obj as THREE.Group).isGroup) {
         return { name: 'Orbit Ring Spin', description: 'Spin satellite along orbital ring', isAuxiliary: true };
       }
@@ -608,13 +653,20 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
         }
       }
 
+      const shortGeo = geoType.replace(/Geometry$/i, '');
       const typeLabel = (obj as THREE.Bone).isBone
         ? 'Bone'
         : isMesh
-          ? 'Mesh'
+          ? shortGeo || 'Mesh'
           : 'Part';
-      const fallbackName = `${typeLabel} (${this.rigNodes.length})`;
-      return { name: fallbackName, description: describeSlot(undefined, fallbackName) };
+      const fallbackName = parentName && isMesh && parentName !== 'Character Root'
+        ? `${parentName} ${shortGeo || 'Part'} (${this.rigNodes.length})`
+        : `${typeLabel} (${this.rigNodes.length})`;
+      return {
+        name: fallbackName,
+        description: describeSlot(undefined, fallbackName),
+        isAuxiliary: isMesh && obj.children.length === 0 ? true : undefined,
+      };
     };
 
     const visit = (
@@ -625,23 +677,10 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       parentName: string | undefined,
       depth: number,
     ) => {
-      if (depth > 5) return; // keep hierarchy concise & responsive
+      if (depth > 16) return; // deep penetration across every sub-component
       const isMesh = Boolean((obj as THREE.Mesh).isMesh);
       const isBone = Boolean((obj as THREE.Bone).isBone);
       const isGroup = Boolean((obj as THREE.Group).isGroup) || obj.children.length > 0;
-
-      // Skip tiny decorative meshes nested deep inside head/ring unless named
-      if (isMesh && !obj.name && depth >= 2 && obj.children.length === 0) {
-        obj.castShadow = true;
-        obj.receiveShadow = true;
-        obj.userData.characterInstanceId = this.instanceId;
-        if (parentId) {
-          obj.userData.rigNodeId = parentId;
-          obj.userData.rigNodeName =
-            this.rigNodes.find((n) => n.nodeId === parentId)?.name ?? 'Part';
-        }
-        return;
-      }
 
       const nodeId = path;
       const inferred = inferSlotFromProceduralGroup(obj, parentSlot, parentName);
@@ -686,6 +725,13 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
         this.nodeBaseTransform.set(nodeId, {
           pos: obj.position.clone(),
           rot: obj.rotation.clone(),
+          scale: obj.scale.clone(),
+        });
+        this.originalNodeSnapshots.set(nodeId, {
+          parent: obj.parent,
+          pos: obj.position.clone(),
+          rot: obj.rotation.clone(),
+          scale: obj.scale.clone(),
         });
       }
 
@@ -699,6 +745,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     };
 
     visit(root, 'node_0', null, undefined, undefined, 0);
+    this.baseRigNodes = this.rigNodes.map((n) => ({ ...n, childIds: [...n.childIds] }));
   }
 
   getRigNodes(): RigNodeInfo[] {
@@ -729,17 +776,87 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     };
   }
 
+  getNodeDeltaScale(nodeId: string, currentScale: { x: number; y: number; z: number }): Vec3 {
+    const base = this.nodeBaseTransform.get(nodeId);
+    if (!base) return { x: currentScale.x, y: currentScale.y, z: currentScale.z };
+    const sx = Math.abs(base.scale.x) > 1e-4 ? base.scale.x : 1;
+    const sy = Math.abs(base.scale.y) > 1e-4 ? base.scale.y : 1;
+    const sz = Math.abs(base.scale.z) > 1e-4 ? base.scale.z : 1;
+    return {
+      x: currentScale.x / sx,
+      y: currentScale.y / sy,
+      z: currentScale.z / sz,
+    };
+  }
+
+  syncNodeGroups(groups: CharacterNodeGroup[]): void {
+    const sig = JSON.stringify(
+      groups.map((g) => ({ id: g.id, name: g.name, members: g.memberNodeIds, visible: g.visible !== false })),
+    );
+    this.hiddenGroupIds.clear();
+    for (const g of groups) {
+      if (g.visible === false) this.hiddenGroupIds.add(g.id);
+    }
+    if (sig === this.lastGroupsSig || !this.characterGroup) {
+      for (const [gid, pivot] of this.activeGroupPivots.entries()) {
+        pivot.visible = !this.hiddenGroupIds.has(gid);
+      }
+      return;
+    }
+    this.lastGroupsSig = sig;
+    this.rigNodes = reconcileCharacterNodeGroups({
+      instanceId: this.instanceId,
+      rootContainer: this.characterGroup,
+      baseRigNodes: this.baseRigNodes,
+      nodeObjectMap: this.nodeObjectMap,
+      nodeBaseTransform: this.nodeBaseTransform,
+      originalSnapshots: this.originalNodeSnapshots,
+      activeGroupPivots: this.activeGroupPivots,
+      groups,
+    });
+    this.capabilities = {
+      ...this.capabilities,
+      rigNodes: this.rigNodes,
+    };
+    this.applyPendingNodeTransforms();
+  }
+
+  applyNodeMaterialOverrides(overrides: Record<string, NodeMaterialOverride>): void {
+    const sig = JSON.stringify(overrides);
+    if (sig === this.lastMaterialSig || !this.characterGroup) return;
+    this.lastMaterialSig = sig;
+    applyCharacterNodeMaterialOverrides(
+      this.characterGroup,
+      this.nodeObjectMap,
+      overrides,
+      this.baseMaterialSnapshots,
+    );
+  }
+
+  getNodeMaterialInfo(nodeId: string): NodeMaterialOverride | null {
+    return readNodeMaterialSnapshot(this.nodeObjectMap.get(nodeId));
+  }
+
   setNodeVisibilityOverrides(hiddenNodeIds: string[]): void {
     const hiddenSet = new Set(hiddenNodeIds);
     for (const [nodeId, obj] of this.nodeObjectMap.entries()) {
       if (nodeId === 'node_0') continue;
-      obj.visible = !hiddenSet.has(nodeId);
+      obj.visible = !hiddenSet.has(nodeId) && !this.hiddenGroupIds.has(nodeId);
     }
   }
 
-  applyNodeOverrides(rotations: Record<string, Vec3>, positions?: Record<string, Vec3>): void {
+  applyNodeOverrides(
+    rotations: Record<string, Vec3>,
+    positions?: Record<string, Vec3>,
+    scales?: Record<string, Vec3>,
+  ): void {
     const nextPositions = positions ?? {};
-    const nextActive = new Set<string>([...Object.keys(rotations), ...Object.keys(nextPositions)]);
+    const nextScales = scales ?? {};
+    const nextActive = new Set<string>([
+      ...Object.keys(rotations),
+      ...Object.keys(nextPositions),
+      ...Object.keys(nextScales),
+    ]);
 
     // Snap any previously overridden nodes back to their rest transform so smoothed HTML loops don't leave ghost poses on Undo/Reset
     for (const prevId of this.previouslyOverriddenNodes) {
@@ -749,6 +866,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
         if (obj && base) {
           obj.rotation.copy(base.rot);
           obj.position.copy(base.pos);
+          obj.scale.copy(base.scale);
         }
       }
     }
@@ -756,6 +874,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     this.previouslyOverriddenNodes = nextActive;
     this.pendingNodeRotOverrides = rotations;
     this.pendingNodePosOverrides = nextPositions;
+    this.pendingNodeScaleOverrides = nextScales;
     this.applyPendingNodeTransforms();
   }
 
@@ -804,6 +923,12 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       const base = this.nodeBaseTransform.get(nodeId);
       if (!obj || !base) continue;
       obj.position.set(base.pos.x + pos.x, base.pos.y + pos.y, base.pos.z + pos.z);
+    }
+    for (const [nodeId, sc] of Object.entries(this.pendingNodeScaleOverrides)) {
+      const obj = this.nodeObjectMap.get(nodeId);
+      const base = this.nodeBaseTransform.get(nodeId);
+      if (!obj || !base) continue;
+      obj.scale.set(base.scale.x * sc.x, base.scale.y * sc.y, base.scale.z * sc.z);
     }
   }
 

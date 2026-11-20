@@ -15,6 +15,8 @@ import type {
   HoverTargetInfo,
   MotionPathData,
   MotionPathPoint,
+  MultiSelectedNodeRef,
+  NodeMaterialOverride,
   PanelCollapseState,
   ProjectData,
   PropGeometryKind,
@@ -283,9 +285,11 @@ export function StudioWorkspace() {
 
   const [selection, setSelection] = useState<SelectionTarget>({ kind: 'none' });
   const [multiSelectedIds, setMultiSelectedIds] = useState<string[]>([]);
+  const [multiSelectedNodes, setMultiSelectedNodes] = useState<MultiSelectedNodeRef[]>([]);
   const [isolatedIds, setIsolatedIds] = useState<string[]>([]);
   const [poseModeInstanceId, setPoseModeInstanceId] = useState<string | null>(null);
   const [hoverInfo, setHoverInfo] = useState<HoverTargetInfo | null>(null);
+  const lastNodeGroupsSigRef = useRef<Map<string, string>>(new Map());
 
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -608,6 +612,21 @@ export function StudioWorkspace() {
         adapter.setVisible(isObjVisible(char.id, char.visible));
         adapter.setTransform(charEval.transform);
 
+        const groupSig = JSON.stringify(char.nodeGroups ?? []);
+        if (lastNodeGroupsSigRef.current.get(char.id) !== groupSig) {
+          lastNodeGroupsSigRef.current.set(char.id, groupSig);
+          if ('syncNodeGroups' in adapter && typeof adapter.syncNodeGroups === 'function') {
+            adapter.syncNodeGroups(char.nodeGroups ?? []);
+            const updatedNodes =
+              'getRigNodes' in adapter && typeof adapter.getRigNodes === 'function'
+                ? adapter.getRigNodes()
+                : [];
+            window.queueMicrotask(() => {
+              setRigNodesByInstance((prev) => ({ ...prev, [char.id]: updatedNodes }));
+            });
+          }
+        }
+
         if ('setNodeVisibilityOverrides' in adapter && typeof adapter.setNodeVisibilityOverrides === 'function') {
           adapter.setNodeVisibilityOverrides(char.hiddenNodes ?? []);
         }
@@ -644,7 +663,8 @@ export function StudioWorkspace() {
             charEval.activeMood,
             charEval.isTalking,
           );
-          adapter.applyNodeOverrides(charEval.nodeRotations, charEval.nodePositions);
+          adapter.applyNodeOverrides(charEval.nodeRotations, charEval.nodePositions, charEval.nodeScales);
+          adapter.applyNodeMaterialOverrides(char.nodeMaterialOverrides ?? {});
           adapter.applyFacialState(facialWithAudio);
           adapter.update(dt);
         } else if (adapter instanceof GltfCharacterAdapter) {
@@ -654,7 +674,8 @@ export function StudioWorkspace() {
             firstClip ? Math.max(0, time - firstClip.startTime) : 0,
             firstClip?.speed ?? 1,
           );
-          adapter.applyNodeOverrides(charEval.nodeRotations, charEval.nodePositions);
+          adapter.applyNodeOverrides(charEval.nodeRotations, charEval.nodePositions, charEval.nodeScales);
+          adapter.applyNodeMaterialOverrides(char.nodeMaterialOverrides ?? {});
           adapter.applyFacialState(facialWithAudio);
         } else if (adapter instanceof HtmlIframeAdapter) {
           adapter.setMood(charEval.activeMood);
@@ -690,6 +711,13 @@ export function StudioWorkspace() {
     }
     engine.setLockStates(lockedObjIds, lockedNodes);
   }, [activeScene]);
+
+  // Sync multi-selected rig component highlights into StudioEngine
+  useEffect(() => {
+    engineRef.current?.setMultiSelectedNodeKeys(
+      multiSelectedNodes.map((n) => `${n.instanceId}:${n.nodeId}`),
+    );
+  }, [multiSelectedNodes]);
 
   // Selection derived entities
   const selectedCharacter = useMemo(() => {
@@ -893,15 +921,135 @@ export function StudioWorkspace() {
     [commitSceneMutation, poseModeInstanceId],
   );
 
+  const handleSelectTargetWithModifier = useCallback(
+    (target: SelectionTarget, additive?: boolean) => {
+      if (target.kind === 'body-part') {
+        setMultiSelectedIds([]);
+        if (additive) {
+          setMultiSelectedNodes((prev) => {
+            const sameChar = prev.filter((p) => p.instanceId === target.instanceId);
+            const curSel = selectionRef.current;
+            const seeded =
+              sameChar.length === 0 &&
+              curSel.kind === 'body-part' &&
+              curSel.instanceId === target.instanceId
+                ? [{ instanceId: curSel.instanceId, nodeId: curSel.nodeId, nodeName: curSel.nodeName }]
+                : sameChar;
+            const exists = seeded.some((p) => p.nodeId === target.nodeId);
+            return exists
+              ? seeded.filter((p) => p.nodeId !== target.nodeId)
+              : [...seeded, { instanceId: target.instanceId, nodeId: target.nodeId, nodeName: target.nodeName }];
+          });
+        } else {
+          setMultiSelectedNodes([
+            { instanceId: target.instanceId, nodeId: target.nodeId, nodeName: target.nodeName },
+          ]);
+        }
+        setSelection(target);
+        setInspectorCharTab('rig');
+        return;
+      }
+
+      if (target.kind === 'character' || target.kind === 'prop') {
+        setMultiSelectedNodes([]);
+        const id = target.kind === 'character' ? target.instanceId : target.propId;
+        if (additive) {
+          setMultiSelectedIds((prev) => {
+            const curSel = selectionRef.current;
+            const curId =
+              curSel.kind === 'character'
+                ? curSel.instanceId
+                : curSel.kind === 'prop'
+                  ? curSel.propId
+                  : null;
+            const seeded = curId && !prev.includes(curId) ? [...prev, curId] : prev;
+            return seeded.includes(id) ? seeded.filter((x) => x !== id) : [...seeded, id];
+          });
+        } else {
+          setMultiSelectedIds([id]);
+        }
+        setSelection(target);
+        return;
+      }
+
+      if (!additive) {
+        setMultiSelectedIds([]);
+        setMultiSelectedNodes([]);
+      }
+      setSelection(target);
+    },
+    [],
+  );
+
   const handleGroupSelection = useCallback(() => {
     const sc = sceneRef.current;
+
+    // 1. Group multi-selected character components/parts cleanly without detaching
+    if (multiSelectedNodes.length >= 2) {
+      const instanceId = multiSelectedNodes[0].instanceId;
+      const char = sc.characters.find((c) => c.id === instanceId);
+      if (char) {
+        const existingGroups = char.nodeGroups ?? [];
+        const expandedMemberIds = new Set<string>();
+        const subsumedGroupIds = new Set<string>();
+        for (const ref of multiSelectedNodes) {
+          if (ref.instanceId !== instanceId) continue;
+          const existingGrp = existingGroups.find((g) => g.id === ref.nodeId);
+          if (existingGrp) {
+            subsumedGroupIds.add(existingGrp.id);
+            for (const mId of existingGrp.memberNodeIds) expandedMemberIds.add(mId);
+          } else {
+            expandedMemberIds.add(ref.nodeId);
+          }
+        }
+        const memberNodeIds = Array.from(expandedMemberIds);
+        if (memberNodeIds.length >= 2) {
+          const newGroupId = createId('cgrp');
+          const groupName = `Part Group ${existingGroups.length + 1}`;
+          commitSceneMutation(`Group ${memberNodeIds.length} Parts`, (s) => ({
+            ...s,
+            characters: s.characters.map((c) => {
+              if (c.id !== instanceId) return c;
+              const keptGroups = (c.nodeGroups ?? [])
+                .filter((g) => !subsumedGroupIds.has(g.id))
+                .map((g) => ({
+                  ...g,
+                  memberNodeIds: g.memberNodeIds.filter((id) => !expandedMemberIds.has(id)),
+                }))
+                .filter((g) => g.memberNodeIds.length > 0);
+              return {
+                ...c,
+                nodeGroups: [
+                  ...keptGroups,
+                  {
+                    id: newGroupId,
+                    name: groupName,
+                    memberNodeIds,
+                    visible: true,
+                    locked: false,
+                  },
+                ],
+              };
+            }),
+          }));
+          setPoseModeInstanceId(instanceId);
+          engineRef.current?.setPoseMode(instanceId);
+          setMultiSelectedNodes([{ instanceId, nodeId: newGroupId, nodeName: groupName }]);
+          setSelection({ kind: 'body-part', instanceId, nodeId: newGroupId, nodeName: groupName });
+          setInspectorCharTab('rig');
+          return;
+        }
+      }
+    }
+
+    // 2. Group multi-selected stage objects (characters / props)
     let candidateIds = [...multiSelectedIds];
     if (candidateIds.length === 0) {
       if (selectionRef.current.kind === 'character') candidateIds = [selectionRef.current.instanceId];
       else if (selectionRef.current.kind === 'prop') candidateIds = [selectionRef.current.propId];
     }
     if (candidateIds.length === 0) {
-      setNoticeMessage('Select one or more characters/props (Shift+Click) to create a logical group.');
+      setNoticeMessage('Ctrl+Click or drag a highlight box over 2+ parts or objects to group.');
       return;
     }
 
@@ -917,7 +1065,48 @@ export function StudioWorkspace() {
       setMultiSelectedIds([]);
       setLeftTab('hierarchy');
     }
-  }, [commitSceneMutation, multiSelectedIds]);
+  }, [commitSceneMutation, multiSelectedIds, multiSelectedNodes]);
+
+  const handleUngroupNodeGroup = useCallback(
+    (instanceId: string, groupId: string) => {
+      const char = sceneRef.current.characters.find((c) => c.id === instanceId);
+      const grp = char?.nodeGroups?.find((g) => g.id === groupId);
+      if (!char || !grp) return;
+      const firstMemberId = grp.memberNodeIds[0];
+      const firstMemberName =
+        rigNodesRef.current[instanceId]?.find((n) => n.nodeId === firstMemberId)?.name ??
+        firstMemberId;
+
+      commitSceneMutation(`Ungroup ${grp.name}`, (s) => ({
+        ...s,
+        characters: s.characters.map((c) =>
+          c.id === instanceId
+            ? {
+                ...c,
+                nodeGroups: (c.nodeGroups ?? []).filter((g) => g.id !== groupId),
+                nodeTracks: (c.nodeTracks ?? []).filter((nt) => nt.nodeId !== groupId),
+              }
+            : c,
+        ),
+      }));
+
+      if (firstMemberId) {
+        setMultiSelectedNodes([
+          { instanceId, nodeId: firstMemberId, nodeName: firstMemberName },
+        ]);
+        setSelection({
+          kind: 'body-part',
+          instanceId,
+          nodeId: firstMemberId,
+          nodeName: firstMemberName,
+        });
+      } else {
+        setMultiSelectedNodes([]);
+        setSelection({ kind: 'character', instanceId });
+      }
+    },
+    [commitSceneMutation],
+  );
 
   const handleUngroupGroup = useCallback(
     (groupId: string) => {
@@ -1072,8 +1261,24 @@ export function StudioWorkspace() {
           });
           if (target.kind === 'body-part') {
             const nodeId = target.nodeId;
+            if (multiSelectedNodes.length >= 2) {
+              items.push({
+                label: `Group ${multiSelectedNodes.length} Picked Parts`,
+                shortcut: 'Ctrl+G',
+                dividerAbove: true,
+                onClick: handleGroupSelection,
+              });
+            }
+            if (nodeId.startsWith('cgrp_')) {
+              items.push({
+                label: `Ungroup "${target.nodeName}"`,
+                shortcut: 'Ctrl+Shift+G',
+                dividerAbove: true,
+                onClick: () => handleUngroupNodeGroup(ch.id, nodeId),
+              });
+            }
             items.push({
-              label: `Reset ${target.nodeName} Pose`,
+              label: `Reset ${target.nodeName} Transform`,
               dividerAbove: true,
               onClick: () =>
                 commitSceneMutation(`Reset ${target.nodeName}`, (s) => ({
@@ -1219,7 +1424,9 @@ export function StudioWorkspace() {
       handleSelectGroupMembers,
       handleToggleIsolate,
       handleUngroupGroup,
+      handleUngroupNodeGroup,
       isolatedIds,
+      multiSelectedNodes.length,
       poseModeInstanceId,
     ],
   );
@@ -1239,20 +1446,56 @@ export function StudioWorkspace() {
     if (!mount) return;
 
     const engine = new StudioEngine(mount, {
-      onSelectTarget: (target, shiftKey) => {
-        if (shiftKey && (target.kind === 'character' || target.kind === 'prop')) {
-          const id = target.kind === 'character' ? target.instanceId : target.propId;
-          setMultiSelectedIds((prev) =>
-            prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-          );
-        } else {
-          if (target.kind === 'character') setMultiSelectedIds([target.instanceId]);
-          else if (target.kind === 'prop') setMultiSelectedIds([target.propId]);
-          else setMultiSelectedIds([]);
-        }
-        setSelection(target);
-        if (target.kind === 'body-part') {
+      onSelectTarget: (target, additive) => {
+        handleSelectTargetWithModifier(target, additive);
+      },
+      onMarqueeSelect: (targets, additive) => {
+        const bodyParts = targets.filter(
+          (t): t is Extract<SelectionTarget, { kind: 'body-part' }> => t.kind === 'body-part',
+        );
+        const objTargets = targets.filter(
+          (t) => t.kind === 'character' || t.kind === 'prop',
+        );
+
+        if (bodyParts.length > 0) {
+          const instId = poseModeInstanceId ?? bodyParts[0].instanceId;
+          const matching = bodyParts.filter((b) => b.instanceId === instId);
+          const nextRefs: MultiSelectedNodeRef[] = matching.map((b) => ({
+            instanceId: b.instanceId,
+            nodeId: b.nodeId,
+            nodeName: b.nodeName,
+          }));
+          setMultiSelectedIds([]);
+          setMultiSelectedNodes((prev) => {
+            if (!additive) return nextRefs;
+            const base = prev.filter((p) => p.instanceId === instId);
+            const seen = new Set(base.map((p) => p.nodeId));
+            return [...base, ...nextRefs.filter((n) => !seen.has(n.nodeId))];
+          });
+          setPoseModeInstanceId(instId);
+          engine.setPoseMode(instId);
+          const last = matching[matching.length - 1];
+          setSelection(last);
           setInspectorCharTab('rig');
+          return;
+        }
+
+        if (objTargets.length > 0) {
+          const ids = objTargets.map((t) => (t.kind === 'character' ? t.instanceId : t.propId));
+          setMultiSelectedNodes([]);
+          setMultiSelectedIds((prev) => {
+            if (!additive) return ids;
+            const seen = new Set(prev);
+            return [...prev, ...ids.filter((id) => !seen.has(id))];
+          });
+          setSelection(objTargets[0]);
+          return;
+        }
+
+        if (!additive) {
+          setMultiSelectedIds([]);
+          setMultiSelectedNodes([]);
+          setSelection({ kind: 'none' });
         }
       },
       onPoseModeChange: (instId, preferredNodeId) => {
@@ -1263,6 +1506,8 @@ export function StudioWorkspace() {
             const nodeName =
               rigNodesRef.current[instId]?.find((n) => n.nodeId === preferredNodeId)?.name ??
               preferredNodeId;
+            setMultiSelectedIds([]);
+            setMultiSelectedNodes([{ instanceId: instId, nodeId: preferredNodeId, nodeName }]);
             setSelection({
               kind: 'body-part',
               instanceId: instId,
@@ -1270,6 +1515,8 @@ export function StudioWorkspace() {
               nodeName,
             });
           }
+        } else {
+          setMultiSelectedNodes([]);
         }
       },
       onHoverChanged: (hover) => {
@@ -1313,10 +1560,10 @@ export function StudioWorkspace() {
           }),
         }));
       },
-      onNodeTransformCommit: (instanceId, nodeId, nodeName, rotation, _pos) => {
+      onNodeTransformCommit: (instanceId, nodeId, nodeName, rotation, pos, scale) => {
         const tNow = timeRef.current;
         commitSceneMutationRef.current(
-          `Rotate ${nodeName}`,
+          `Transform ${nodeName}`,
           (s) => ({
             ...s,
             characters: s.characters.map((c) => {
@@ -1324,10 +1571,40 @@ export function StudioWorkspace() {
               const tracks = [...(c.nodeTracks ?? [])];
               const idx = tracks.findIndex((nt) => nt.nodeId === nodeId);
               const existing =
-                idx >= 0 ? tracks[idx] : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [] };
+                idx >= 0
+                  ? tracks[idx]
+                  : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [], scaleKeyframes: [] };
+              const hasPos =
+                Boolean(pos) &&
+                (Math.abs(pos!.x) > 1e-4 ||
+                  Math.abs(pos!.y) > 1e-4 ||
+                  Math.abs(pos!.z) > 1e-4 ||
+                  existing.positionKeyframes.length > 0);
+              const hasScale =
+                Boolean(scale) &&
+                (Math.abs(scale!.x - 1) > 1e-4 ||
+                  Math.abs(scale!.y - 1) > 1e-4 ||
+                  Math.abs(scale!.z - 1) > 1e-4 ||
+                  (existing.scaleKeyframes?.length ?? 0) > 0);
               const updatedTrack = {
                 ...existing,
-                rotationKeyframes: upsertVec3Key(existing.rotationKeyframes, tNow, rotation, 'smooth'),
+                rotationKeyframes:
+                  !hasPos && !hasScale
+                    ? upsertVec3Key(existing.rotationKeyframes, tNow, rotation, 'smooth')
+                    : Math.abs(rotation.x) > 1e-4 ||
+                        Math.abs(rotation.y) > 1e-4 ||
+                        Math.abs(rotation.z) > 1e-4 ||
+                        existing.rotationKeyframes.length > 0
+                      ? upsertVec3Key(existing.rotationKeyframes, tNow, rotation, 'smooth')
+                      : existing.rotationKeyframes,
+                positionKeyframes:
+                  hasPos && pos
+                    ? upsertVec3Key(existing.positionKeyframes, tNow, pos, 'smooth')
+                    : existing.positionKeyframes,
+                scaleKeyframes:
+                  hasScale && scale
+                    ? upsertVec3Key(existing.scaleKeyframes ?? [], tNow, scale, 'smooth')
+                    : existing.scaleKeyframes ?? [],
               };
               if (idx >= 0) tracks[idx] = updatedTrack;
               else tracks.push(updatedTrack);
@@ -1583,6 +1860,11 @@ export function StudioWorkspace() {
           }
           engine.registerCharacterAdapter(adapter);
           setCapabilitiesMap((prev) => ({ ...prev, [char.id]: adapter.capabilities }));
+
+          if ('syncNodeGroups' in adapter && typeof adapter.syncNodeGroups === 'function') {
+            lastNodeGroupsSigRef.current.set(char.id, JSON.stringify(char.nodeGroups ?? []));
+            adapter.syncNodeGroups(char.nodeGroups ?? []);
+          }
 
           const nodes =
             'getRigNodes' in adapter && typeof adapter.getRigNodes === 'function'
@@ -1895,6 +2177,11 @@ export function StudioWorkspace() {
         if (e.shiftKey) {
           if (selectionRef.current.kind === 'group') {
             handleUngroupGroup(selectionRef.current.groupId);
+          } else if (
+            selectionRef.current.kind === 'body-part' &&
+            selectionRef.current.nodeId.startsWith('cgrp_')
+          ) {
+            handleUngroupNodeGroup(selectionRef.current.instanceId, selectionRef.current.nodeId);
           } else if (selectionRef.current.kind === 'character') {
             const grp = findMemberGroup(sceneRef.current, selectionRef.current.instanceId);
             if (grp) handleUngroupGroup(grp.id);
@@ -1924,6 +2211,12 @@ export function StudioWorkspace() {
       } else if (lower === 'q') {
         setGizmoMode('select');
         engineRef.current?.setGizmoMode('select');
+      } else if (lower === 'b' && !mod) {
+        setGizmoMode('box-select');
+        engineRef.current?.setGizmoMode('box-select');
+      } else if (lower === 'h' && !mod) {
+        setGizmoMode('orbit');
+        engineRef.current?.setGizmoMode('orbit');
       } else if (lower === 'g' && !mod) {
         setGizmoMode('translate');
         engineRef.current?.setGizmoMode('translate');
@@ -1948,7 +2241,12 @@ export function StudioWorkspace() {
           handleKeyCamera('smooth');
         }
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selectionRef.current.kind === 'character') {
+        if (
+          selectionRef.current.kind === 'body-part' &&
+          selectionRef.current.nodeId.startsWith('cgrp_')
+        ) {
+          handleUngroupNodeGroup(selectionRef.current.instanceId, selectionRef.current.nodeId);
+        } else if (selectionRef.current.kind === 'character') {
           handleRemoveCharacter(selectionRef.current.instanceId);
         } else if (selectionRef.current.kind === 'prop') {
           const propId = selectionRef.current.propId;
@@ -2010,6 +2308,7 @@ export function StudioWorkspace() {
     handleTogglePlay,
     handleUndo,
     handleUngroupGroup,
+    handleUngroupNodeGroup,
     poseModeInstanceId,
     tabHudOpen,
     tabPredictions.length,
@@ -2149,6 +2448,8 @@ export function StudioWorkspace() {
         lockedProperties: { transform: false, keys: false },
         lockedNodes: [],
         hiddenNodes: [],
+        nodeGroups: [],
+        nodeMaterialOverrides: {},
         positionKeyframes: [],
         rotationKeyframes: [],
         scaleKeyframes: [],
@@ -2679,22 +2980,10 @@ export function StudioWorkspace() {
           scenes={activeProject.scenes}
           selection={selection}
           multiSelectedIds={multiSelectedIds}
+          multiSelectedNodes={multiSelectedNodes}
           isolatedIds={isolatedIds}
           rigNodesByInstance={rigNodesByInstance}
-          onSelectTarget={(t, shift) => {
-            if (shift && (t.kind === 'character' || t.kind === 'prop')) {
-              const id = t.kind === 'character' ? t.instanceId : t.propId;
-              setMultiSelectedIds((prev) =>
-                prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-              );
-            } else {
-              if (t.kind === 'character') setMultiSelectedIds([t.instanceId]);
-              else if (t.kind === 'prop') setMultiSelectedIds([t.propId]);
-              else setMultiSelectedIds([]);
-            }
-            setSelection(t);
-            if (t.kind === 'body-part') setInspectorCharTab('rig');
-          }}
+          onSelectTarget={handleSelectTargetWithModifier}
           onOpenImport={() => setImportOpen(true)}
           onLoadWorkspaceSample={(url, label) => void handleLoadWorkspaceSample(url, label)}
           onAddCharacterToScene={handleAddCharacterToScene}
@@ -2897,6 +3186,7 @@ export function StudioWorkspace() {
           }}
           onGroupSelection={handleGroupSelection}
           onUngroupGroup={handleUngroupGroup}
+          onUngroupNodeGroup={handleUngroupNodeGroup}
           onDuplicateGroup={handleDuplicateGroup}
           onRenameGroup={handleRenameGroup}
           onSelectGroupMembers={handleSelectGroupMembers}
@@ -3010,6 +3300,7 @@ export function StudioWorkspace() {
           selectionFilter={selectionFilter}
           showRigOverlay={showRigOverlay}
           multiSelectedCount={multiSelectedIds.length}
+          multiSelectedNodeCount={multiSelectedNodes.length}
           hoverInfo={hoverInfo}
           poseModeInstanceId={poseModeInstanceId}
           poseModeCharName={poseModeCharName}
@@ -3125,6 +3416,12 @@ export function StudioWorkspace() {
           evaluatedNodeRotations={
             selectedCharacter ? evalSnapshot.characters.get(selectedCharacter.id)?.nodeRotations ?? {} : {}
           }
+          evaluatedNodePositions={
+            selectedCharacter ? evalSnapshot.characters.get(selectedCharacter.id)?.nodePositions ?? {} : {}
+          }
+          evaluatedNodeScales={
+            selectedCharacter ? evalSnapshot.characters.get(selectedCharacter.id)?.nodeScales ?? {} : {}
+          }
           evaluatedFacial={
             selectedCharacter ? evalSnapshot.characters.get(selectedCharacter.id)?.facial ?? null : null
           }
@@ -3147,11 +3444,17 @@ export function StudioWorkspace() {
           selectedAudioAsset={selectedAudioAsset}
           selectedActionClip={selectedActionClip}
           rigNodesByInstance={rigNodesByInstance}
-          onSelectTarget={(t) => {
-            setSelection(t);
-            if (t.kind === 'body-part') setInspectorCharTab('rig');
+          multiSelectedNodes={multiSelectedNodes}
+          getLiveNodeMaterial={(instanceId, nodeId) => {
+            const adp = engineRef.current?.getAdapter(instanceId);
+            if (adp && 'getNodeMaterialInfo' in adp && typeof adp.getNodeMaterialInfo === 'function') {
+              return adp.getNodeMaterialInfo(nodeId);
+            }
+            return null;
           }}
+          onSelectTarget={(t) => handleSelectTargetWithModifier(t, false)}
           onEnterPoseMode={handleEnterPoseMode}
+          onGroupSelection={handleGroupSelection}
           onUpdateCharacterMeta={(instanceId, patch) =>
             commitSceneMutation(
               'Update Character Property',
@@ -3202,7 +3505,9 @@ export function StudioWorkspace() {
                   const tracks = [...(c.nodeTracks ?? [])];
                   const idx = tracks.findIndex((nt) => nt.nodeId === nodeId);
                   const existing =
-                    idx >= 0 ? tracks[idx] : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [] };
+                    idx >= 0
+                      ? tracks[idx]
+                      : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [], scaleKeyframes: [] };
                   const updated = {
                     ...existing,
                     rotationKeyframes: upsertVec3Key(existing.rotationKeyframes, currentTime, rot, 'smooth'),
@@ -3215,6 +3520,56 @@ export function StudioWorkspace() {
               `node:${instanceId}:${nodeId}`,
             );
           }}
+          onUpdateNodePosition={(instanceId, nodeId, nodeName, pos) => {
+            commitSceneMutation(
+              `Move ${nodeName}`,
+              (s) => ({
+                ...s,
+                characters: s.characters.map((c) => {
+                  if (c.id !== instanceId) return c;
+                  const tracks = [...(c.nodeTracks ?? [])];
+                  const idx = tracks.findIndex((nt) => nt.nodeId === nodeId);
+                  const existing =
+                    idx >= 0
+                      ? tracks[idx]
+                      : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [], scaleKeyframes: [] };
+                  const updated = {
+                    ...existing,
+                    positionKeyframes: upsertVec3Key(existing.positionKeyframes, currentTime, pos, 'smooth'),
+                  };
+                  if (idx >= 0) tracks[idx] = updated;
+                  else tracks.push(updated);
+                  return { ...c, nodeTracks: tracks };
+                }),
+              }),
+              `nodepos:${instanceId}:${nodeId}`,
+            );
+          }}
+          onUpdateNodeScale={(instanceId, nodeId, nodeName, scale) => {
+            commitSceneMutation(
+              `Scale ${nodeName}`,
+              (s) => ({
+                ...s,
+                characters: s.characters.map((c) => {
+                  if (c.id !== instanceId) return c;
+                  const tracks = [...(c.nodeTracks ?? [])];
+                  const idx = tracks.findIndex((nt) => nt.nodeId === nodeId);
+                  const existing =
+                    idx >= 0
+                      ? tracks[idx]
+                      : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [], scaleKeyframes: [] };
+                  const updated = {
+                    ...existing,
+                    scaleKeyframes: upsertVec3Key(existing.scaleKeyframes ?? [], currentTime, scale, 'smooth'),
+                  };
+                  if (idx >= 0) tracks[idx] = updated;
+                  else tracks.push(updated);
+                  return { ...c, nodeTracks: tracks };
+                }),
+              }),
+              `nodescale:${instanceId}:${nodeId}`,
+            );
+          }}
           onKeyNodeRotation={(instanceId, nodeId, nodeName, rot, easing) => {
             commitSceneMutation(`Key ${nodeName}`, (s) => ({
               ...s,
@@ -3223,7 +3578,9 @@ export function StudioWorkspace() {
                 const tracks = [...(c.nodeTracks ?? [])];
                 const idx = tracks.findIndex((nt) => nt.nodeId === nodeId);
                 const existing =
-                  idx >= 0 ? tracks[idx] : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [] };
+                  idx >= 0
+                    ? tracks[idx]
+                    : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [], scaleKeyframes: [] };
                 const updated = {
                   ...existing,
                   rotationKeyframes: upsertVec3Key(existing.rotationKeyframes, currentTime, rot, easing),
@@ -3234,8 +3591,94 @@ export function StudioWorkspace() {
               }),
             }));
           }}
+          onKeyNodeTransform={(instanceId, nodeId, nodeName, rot, pos, scale, easing) => {
+            commitSceneMutation(`Key ${nodeName}`, (s) => ({
+              ...s,
+              characters: s.characters.map((c) => {
+                if (c.id !== instanceId) return c;
+                const tracks = [...(c.nodeTracks ?? [])];
+                const idx = tracks.findIndex((nt) => nt.nodeId === nodeId);
+                const existing =
+                  idx >= 0
+                    ? tracks[idx]
+                    : { nodeId, nodeName, rotationKeyframes: [], positionKeyframes: [], scaleKeyframes: [] };
+                const updated = {
+                  ...existing,
+                  rotationKeyframes: upsertVec3Key(existing.rotationKeyframes, currentTime, rot, easing),
+                  positionKeyframes:
+                    Math.abs(pos.x) > 1e-4 ||
+                    Math.abs(pos.y) > 1e-4 ||
+                    Math.abs(pos.z) > 1e-4 ||
+                    existing.positionKeyframes.length > 0
+                      ? upsertVec3Key(existing.positionKeyframes, currentTime, pos, easing)
+                      : existing.positionKeyframes,
+                  scaleKeyframes:
+                    Math.abs(scale.x - 1) > 1e-4 ||
+                    Math.abs(scale.y - 1) > 1e-4 ||
+                    Math.abs(scale.z - 1) > 1e-4 ||
+                    (existing.scaleKeyframes?.length ?? 0) > 0
+                      ? upsertVec3Key(existing.scaleKeyframes ?? [], currentTime, scale, easing)
+                      : existing.scaleKeyframes ?? [],
+                };
+                if (idx >= 0) tracks[idx] = updated;
+                else tracks.push(updated);
+                return { ...c, nodeTracks: tracks };
+              }),
+            }));
+          }}
+          onUpdateNodeMaterial={(instanceId, nodeId, patch: NodeMaterialOverride) => {
+            commitSceneMutation(
+              'Recolor Part',
+              (s) => ({
+                ...s,
+                characters: s.characters.map((c) =>
+                  c.id === instanceId
+                    ? {
+                        ...c,
+                        nodeMaterialOverrides: {
+                          ...(c.nodeMaterialOverrides ?? {}),
+                          [nodeId]: patch,
+                        },
+                      }
+                    : c,
+                ),
+              }),
+              `mat:${instanceId}:${nodeId}`,
+            );
+          }}
+          onResetNodeMaterial={(instanceId, nodeId) => {
+            commitSceneMutation('Reset Part Material', (s) => ({
+              ...s,
+              characters: s.characters.map((c) => {
+                if (c.id !== instanceId) return c;
+                const next = { ...(c.nodeMaterialOverrides ?? {}) };
+                delete next[nodeId];
+                return { ...c, nodeMaterialOverrides: next };
+              }),
+            }));
+          }}
+          onRenameNodeGroup={(instanceId, groupId, name) => {
+            commitSceneMutation(
+              'Rename Part Group',
+              (s) => ({
+                ...s,
+                characters: s.characters.map((c) =>
+                  c.id === instanceId
+                    ? {
+                        ...c,
+                        nodeGroups: (c.nodeGroups ?? []).map((g) =>
+                          g.id === groupId ? { ...g, name } : g,
+                        ),
+                      }
+                    : c,
+                ),
+              }),
+              `rename-cgrp:${groupId}`,
+            );
+          }}
+          onUngroupNodeGroup={handleUngroupNodeGroup}
           onResetNodeRotation={(instanceId, nodeId) => {
-            commitSceneMutation('Reset Joint Pose', (s) => ({
+            commitSceneMutation('Reset Part Transform', (s) => ({
               ...s,
               characters: s.characters.map((c) =>
                 c.id === instanceId
