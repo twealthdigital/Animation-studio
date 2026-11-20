@@ -81,6 +81,10 @@ interface LeftAssetPanelProps {
   onRemoveLightFromScene: (lightId: string) => void;
   onGroupSelection: () => void;
   onUngroupGroup: (groupId: string) => void;
+  onDuplicateGroup: (groupId: string) => void;
+  onRenameGroup: (groupId: string, name: string) => void;
+  onSelectGroupMembers: (groupId: string) => void;
+  onEnterPoseMode: (instanceId: string) => void;
   onToggleGroupVisibility: (groupId: string) => void;
   onToggleGroupLock: (groupId: string) => void;
   onToggleIsolate: (id: string) => void;
@@ -127,6 +131,10 @@ export function LeftAssetPanel({
   onRemoveLightFromScene,
   onGroupSelection,
   onUngroupGroup,
+  onDuplicateGroup,
+  onRenameGroup,
+  onSelectGroupMembers,
+  onEnterPoseMode,
   onToggleGroupVisibility,
   onToggleGroupLock,
   onToggleIsolate,
@@ -139,7 +147,9 @@ export function LeftAssetPanel({
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedCharRigs, setExpandedCharRigs] = useState<Record<string, boolean>>({});
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const [showAuxNodes, setShowAuxNodes] = useState(false);
   const [renamingAssetId, setRenamingAssetId] = useState<string | null>(null);
+  const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
   const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
@@ -240,6 +250,15 @@ export function LeftAssetPanel({
   const openCtxMenu = (e: React.MouseEvent, items: ContextMenuItem[]) => {
     e.preventDefault();
     setCtxMenu({ x: e.clientX, y: e.clientY, items });
+  };
+
+  const handleRowShiftF10 = (e: React.KeyboardEvent, items: ContextMenuItem[]) => {
+    if (e.shiftKey && e.key === 'F10') {
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      setCtxMenu({ x: rect.left + 28, y: rect.bottom + 2, items });
+    }
   };
 
   const sceneCameras = activeScene.cameras ?? [];
@@ -378,28 +397,30 @@ export function LeftAssetPanel({
                 </p>
               ) : (
                 <div className="space-y-2">
-                  {characterAssets.map((asset) => (
+                  {characterAssets.map((asset) => {
+                    const assetCtxItems: ContextMenuItem[] = [
+                      { label: 'Add to Active Scene', onClick: () => onAddCharacterToScene(asset) },
+                      {
+                        label: 'Add as Scene Prop',
+                        onClick: () => onAddGlbPropToScene(asset),
+                        disabled: asset.kind !== 'character-glb' && asset.kind !== 'prop-glb',
+                      },
+                      {
+                        label: 'Rename Asset',
+                        onClick: () => {
+                          setRenamingAssetId(asset.id);
+                          setRenameDraft(asset.name);
+                        },
+                      },
+                      { label: 'Delete Asset', danger: true, onClick: () => onDeleteAsset(asset.id) },
+                    ];
+                    return (
                     <div
                       key={asset.id}
-                      onContextMenu={(e) =>
-                        openCtxMenu(e, [
-                          { label: 'Add to Active Scene', onClick: () => onAddCharacterToScene(asset) },
-                          {
-                            label: 'Add as Scene Prop',
-                            onClick: () => onAddGlbPropToScene(asset),
-                            disabled: asset.kind !== 'character-glb' && asset.kind !== 'prop-glb',
-                          },
-                          {
-                            label: 'Rename Asset',
-                            onClick: () => {
-                              setRenamingAssetId(asset.id);
-                              setRenameDraft(asset.name);
-                            },
-                          },
-                          { label: 'Delete Asset', danger: true, onClick: () => onDeleteAsset(asset.id) },
-                        ])
-                      }
-                      className="rounded border border-[#2a2e36] bg-[#1e2127] p-2"
+                      tabIndex={0}
+                      onContextMenu={(e) => openCtxMenu(e, assetCtxItems)}
+                      onKeyDown={(e) => handleRowShiftF10(e, assetCtxItems)}
+                      className="rounded border border-[#2a2e36] bg-[#1e2127] p-2 focus:border-[#e8702a] focus:outline-none"
                     >
                       <div className="flex items-start gap-2">
                         <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded bg-[#262a33] text-[#e8702a]">
@@ -462,7 +483,8 @@ export function LeftAssetPanel({
                         </IconButton>
                       </div>
                     </div>
-                  ))}
+                  );
+                  })}
                 </div>
               )}
             </div>
@@ -565,11 +587,45 @@ export function LeftAssetPanel({
                   const sel = selection.kind === 'group' && selection.groupId === grp.id;
                   const expanded = expandedGroups[grp.id] ?? true;
                   const isolated = isolatedIds.includes(grp.id);
+                  const grpCtxItems: ContextMenuItem[] = [
+                    { label: 'Select All Members', onClick: () => onSelectGroupMembers(grp.id) },
+                    {
+                      label: 'Rename Group',
+                      onClick: () => {
+                        setRenamingGroupId(grp.id);
+                        setRenameDraft(grp.name);
+                      },
+                    },
+                    { label: 'Duplicate Group', shortcut: 'Ctrl+D', onClick: () => onDuplicateGroup(grp.id) },
+                    {
+                      label: isolated ? 'Clear Isolation' : 'Isolate Group',
+                      dividerAbove: true,
+                      onClick: () => onToggleIsolate(grp.id),
+                    },
+                    {
+                      label: grp.locked ? 'Unlock Group' : 'Lock Group',
+                      onClick: () => onToggleGroupLock(grp.id),
+                    },
+                    {
+                      label: grp.visible ? 'Hide Group' : 'Show Group',
+                      onClick: () => onToggleGroupVisibility(grp.id),
+                    },
+                    {
+                      label: 'Ungroup',
+                      shortcut: 'Ctrl+Shift+G',
+                      danger: true,
+                      dividerAbove: true,
+                      onClick: () => onUngroupGroup(grp.id),
+                    },
+                  ];
                   return (
                     <div key={grp.id} className="space-y-1">
                       <div
-                        className={`flex items-center gap-1 rounded border p-1.5 ${
-                          sel ? 'border-[#e8702a] bg-[#2a211c]' : 'border-[#2a2e36] bg-[#1e2127]'
+                        tabIndex={0}
+                        onContextMenu={(e) => openCtxMenu(e, grpCtxItems)}
+                        onKeyDown={(e) => handleRowShiftF10(e, grpCtxItems)}
+                        className={`flex items-center gap-1 rounded border p-1.5 focus:outline-none ${
+                          sel ? 'border-[#e8702a] bg-[#2e221b]' : 'border-[#2a2e36] bg-[#1e2127] hover:border-[#383e49]'
                         }`}
                       >
                         <button
@@ -580,14 +636,46 @@ export function LeftAssetPanel({
                         >
                           {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => onSelectTarget({ kind: 'group', groupId: grp.id })}
-                          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                        {renamingGroupId === grp.id ? (
+                          <input
+                            type="text"
+                            autoFocus
+                            value={renameDraft}
+                            onChange={(e) => setRenameDraft(e.target.value)}
+                            onBlur={() => {
+                              if (renameDraft.trim()) onRenameGroup(grp.id, renameDraft.trim());
+                              setRenamingGroupId(null);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                if (renameDraft.trim()) onRenameGroup(grp.id, renameDraft.trim());
+                                setRenamingGroupId(null);
+                              }
+                              if (e.key === 'Escape') setRenamingGroupId(null);
+                            }}
+                            className="h-6 min-w-0 flex-1 rounded border border-[#e8702a] bg-[#14161a] px-1.5 text-xs text-[#e6e8ec] focus:outline-none"
+                          />
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => onSelectTarget({ kind: 'group', groupId: grp.id })}
+                            onDoubleClick={() => {
+                              setRenamingGroupId(grp.id);
+                              setRenameDraft(grp.name);
+                            }}
+                            className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                          >
+                            <Group className="h-3.5 w-3.5 shrink-0 text-[#e8702a]" aria-hidden="true" />
+                            <span className="truncate font-medium text-[#e6e8ec]">{grp.name}</span>
+                          </button>
+                        )}
+                        <IconButton
+                          label={`Duplicate ${grp.name}`}
+                          note="Duplicate group and all members"
+                          onClick={() => onDuplicateGroup(grp.id)}
                         >
-                          <Group className="h-3.5 w-3.5 shrink-0 text-[#e8702a]" aria-hidden="true" />
-                          <span className="truncate font-medium text-[#e6e8ec]">{grp.name}</span>
-                        </button>
+                          <Copy className="h-3 w-3" aria-hidden="true" />
+                        </IconButton>
                         <IconButton
                           label={`Isolate ${grp.name}`}
                           active={isolated}
@@ -610,7 +698,8 @@ export function LeftAssetPanel({
                         </IconButton>
                         <IconButton
                           label={`Ungroup ${grp.name}`}
-                          note="Ungroup keeping member world positions (Ctrl+Shift+G)"
+                          note="Ungroup keeping member world positions"
+                          shortcut="Ctrl+Shift+G"
                           onClick={() => onUngroupGroup(grp.id)}
                         >
                           <Ungroup className="h-3 w-3" aria-hidden="true" />
@@ -704,7 +793,19 @@ export function LeftAssetPanel({
 
             {/* Characters & Expandable Rig Node Trees */}
             <div className="space-y-1">
-              <div className="text-[11px] text-[#98a0ad]">Characters &amp; Rig Bones</div>
+              <div className="flex items-center justify-between text-[11px] text-[#98a0ad]">
+                <span>Characters &amp; Rig</span>
+                <button
+                  type="button"
+                  data-studio-note="Include decorative sub-parts (eyes, mouth, collars) in bone tree"
+                  onClick={() => setShowAuxNodes((v) => !v)}
+                  className={`rounded px-1.5 py-0.5 text-[10px] ${
+                    showAuxNodes ? 'bg-[#2e221b] text-[#f5a16a]' : 'text-[#6b7280] hover:text-[#e6e8ec]'
+                  }`}
+                >
+                  {showAuxNodes ? 'All Parts' : 'Joints Only'}
+                </button>
+              </div>
               {activeScene.characters.length === 0 ? (
                 <div className="rounded border border-dashed border-[#2a2e36] p-2.5 text-center text-[11px] text-[#6b7280]">
                   No characters yet. Add from Assets.
@@ -717,42 +818,67 @@ export function LeftAssetPanel({
                       const selected =
                         (selection.kind === 'character' && selection.instanceId === char.id) ||
                         multiSelectedIds.includes(char.id);
-                      const nodes = rigNodesByInstance[char.id] ?? [];
+                      const allNodes = rigNodesByInstance[char.id] ?? [];
+                      const nodes = showAuxNodes ? allNodes : allNodes.filter((n) => !n.isAuxiliary);
                       const expanded = Boolean(expandedCharRigs[char.id]);
                       const isLocked = Boolean(char.lockedProperties?.transform);
                       const isIsolated = isolatedIds.includes(char.id);
                       const lockedNodeSet = new Set(char.lockedNodes ?? []);
                       const hiddenNodeSet = new Set(char.hiddenNodes ?? []);
 
+                      const charCtxItems: ContextMenuItem[] = [
+                        {
+                          label: `Pose Joints (${char.name})`,
+                          shortcut: 'Dbl-Click',
+                          onClick: () => {
+                            setExpandedCharRigs((p) => ({ ...p, [char.id]: true }));
+                            onEnterPoseMode(char.id);
+                          },
+                        },
+                        {
+                          label: expanded ? 'Collapse Rig Tree' : 'Expand Rig Tree',
+                          onClick: () => setExpandedCharRigs((p) => ({ ...p, [char.id]: !expanded })),
+                        },
+                        {
+                          label: 'Group Selection',
+                          shortcut: 'Ctrl+G',
+                          onClick: () => {
+                            onSelectTarget({ kind: 'character', instanceId: char.id });
+                            onGroupSelection();
+                          },
+                        },
+                        {
+                          label: char.visible ? 'Hide Character' : 'Show Character',
+                          dividerAbove: true,
+                          onClick: () => onToggleCharacterVisibility(char.id),
+                        },
+                        {
+                          label: isIsolated ? 'Un-Isolate' : 'Isolate Character',
+                          onClick: () => onToggleIsolate(char.id),
+                        },
+                        {
+                          label: isLocked ? 'Unlock Transform' : 'Lock Transform',
+                          onClick: () => onToggleCharacterLock(char.id),
+                        },
+                        { label: 'Duplicate Instance', shortcut: 'Ctrl+D', onClick: () => onDuplicateCharacter(char.id) },
+                        {
+                          label: 'Remove from Scene',
+                          shortcut: 'Del',
+                          danger: true,
+                          dividerAbove: true,
+                          onClick: () => onRemoveCharacterFromScene(char.id),
+                        },
+                      ];
+
                       return (
                         <div key={char.id} className="space-y-1">
                           <div
-                            onContextMenu={(e) =>
-                              openCtxMenu(e, [
-                                {
-                                  label: char.visible ? 'Hide Character' : 'Show Character',
-                                  onClick: () => onToggleCharacterVisibility(char.id),
-                                },
-                                {
-                                  label: isIsolated ? 'Un-Isolate' : 'Isolate Character',
-                                  onClick: () => onToggleIsolate(char.id),
-                                },
-                                {
-                                  label: isLocked ? 'Unlock Transform' : 'Lock Transform',
-                                  onClick: () => onToggleCharacterLock(char.id),
-                                },
-                                { label: 'Duplicate Instance', shortcut: 'Ctrl+D', onClick: () => onDuplicateCharacter(char.id) },
-                                {
-                                  label: 'Remove from Scene',
-                                  shortcut: 'Del',
-                                  danger: true,
-                                  onClick: () => onRemoveCharacterFromScene(char.id),
-                                },
-                              ])
-                            }
-                            className={`flex items-center gap-0.5 rounded border p-1 transition-colors ${
+                            tabIndex={0}
+                            onContextMenu={(e) => openCtxMenu(e, charCtxItems)}
+                            onKeyDown={(e) => handleRowShiftF10(e, charCtxItems)}
+                            className={`flex items-center gap-0.5 rounded border p-1 transition-colors focus:outline-none ${
                               selected
-                                ? 'border-[#e8702a] bg-[#2a211c]'
+                                ? 'border-[#e8702a] bg-[#2e221b]'
                                 : 'border-[#2a2e36] bg-[#1e2127] hover:border-[#383e49]'
                             }`}
                           >
@@ -777,6 +903,7 @@ export function LeftAssetPanel({
                               onClick={(e) =>
                                 onSelectTarget({ kind: 'character', instanceId: char.id }, e.shiftKey)
                               }
+                              onDoubleClick={() => onEnterPoseMode(char.id)}
                               className="flex min-w-0 flex-1 items-center gap-1.5 px-1 py-0.5 text-left"
                             >
                               <Box className="h-3.5 w-3.5 shrink-0 text-[#98a0ad]" aria-hidden="true" />
@@ -835,13 +962,13 @@ export function LeftAssetPanel({
                                       key={node.nodeId}
                                       className={`flex items-center justify-between gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors ${
                                         isNodeSel
-                                          ? 'bg-[#2a211c] text-[#f5b489] font-medium'
+                                          ? 'bg-[#2e221b] text-[#f7be97] font-medium'
                                           : 'text-[#98a0ad] hover:bg-[#22262e] hover:text-[#e6e8ec]'
                                       }`}
                                     >
                                       <button
                                         type="button"
-                                        title={node.description ?? `Select ${node.name}`}
+                                        data-studio-note={node.description ?? `Pose ${node.name}`}
                                         onClick={() =>
                                           onSelectTarget({
                                             kind: 'body-part',
@@ -859,7 +986,7 @@ export function LeftAssetPanel({
                                         <button
                                           type="button"
                                           aria-label={nLocked ? `Unlock ${node.name}` : `Lock ${node.name}`}
-                                          title={nLocked ? 'Unlock bone rotation' : 'Lock bone rotation'}
+                                          data-studio-note={nLocked ? 'Unlock bone rotation' : 'Lock bone rotation'}
                                           onClick={() => onToggleNodeLock(char.id, node.nodeId)}
                                           className={`rounded p-0.5 ${nLocked ? 'text-[#e8702a]' : 'text-[#6b7280] hover:text-[#e6e8ec]'}`}
                                         >
@@ -868,7 +995,7 @@ export function LeftAssetPanel({
                                         <button
                                           type="button"
                                           aria-label={nHidden ? `Show ${node.name}` : `Hide ${node.name}`}
-                                          title={nHidden ? 'Show part mesh' : 'Hide part mesh'}
+                                          data-studio-note={nHidden ? 'Show part mesh' : 'Hide part mesh'}
                                           onClick={() => onToggleNodeVisibility(char.id, node.nodeId)}
                                           className={`rounded p-0.5 ${nHidden ? 'text-[#e8702a]' : 'text-[#6b7280] hover:text-[#e6e8ec]'}`}
                                         >

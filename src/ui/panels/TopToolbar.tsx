@@ -53,12 +53,12 @@ const SAVE_STATUS_LABELS: Record<SaveStatus, string> = {
 };
 
 const WORKSPACE_LAYOUTS: { id: WorkspaceLayoutId; label: string }[] = [
-  { id: 'general', label: 'Layout: General' },
-  { id: 'animation', label: 'Layout: Animation' },
-  { id: 'rigging', label: 'Layout: Rigging' },
-  { id: 'scene', label: 'Layout: Scene Build' },
-  { id: 'audio', label: 'Layout: Audio / Mic' },
-  { id: 'camera', label: 'Layout: Camera' },
+  { id: 'general', label: 'General' },
+  { id: 'animation', label: 'Animation' },
+  { id: 'rigging', label: 'Rigging' },
+  { id: 'scene', label: 'Scene Build' },
+  { id: 'audio', label: 'Audio / Mic' },
+  { id: 'camera', label: 'Camera' },
 ];
 
 export function TopToolbar({
@@ -147,7 +147,7 @@ export function TopToolbar({
         ) : (
           <button
             type="button"
-            title="Click to rename project"
+            data-studio-note="Click to rename project"
             onClick={() => setEditingName(true)}
             className="truncate max-w-[140px] rounded px-1.5 py-1 text-xs font-medium text-[#e6e8ec] hover:bg-[#252932]"
           >
@@ -178,7 +178,7 @@ export function TopToolbar({
         >
           <button
             type="button"
-            title="Guided Beginner workspace"
+            data-studio-note="Guided Beginner workspace with simplified controls"
             onClick={() => onChangeStudioMode('beginner')}
             className={`flex h-6 items-center gap-1 rounded px-2 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
               studioMode === 'beginner'
@@ -191,11 +191,11 @@ export function TopToolbar({
           </button>
           <button
             type="button"
-            title="Full Advanced Rigging & Curves workspace"
+            data-studio-note="Full Rigging, IK, Keyframe & Curve Editor workspace"
             onClick={() => onChangeStudioMode('advanced')}
             className={`flex h-6 items-center gap-1 rounded px-2 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
               studioMode === 'advanced'
-                ? 'bg-[#2a2f3a] text-[#ffffff]'
+                ? 'bg-[#2e221b] border border-[#e8702a]/70 text-[#f7be97] font-semibold'
                 : 'text-[#98a0ad] hover:text-[#e6e8ec]'
             }`}
           >
@@ -205,11 +205,13 @@ export function TopToolbar({
         </div>
 
         {/* Workspace Layout Preset */}
-        <div className="flex items-center gap-1 rounded border border-[#2a2e36] bg-[#14161a] px-1.5 h-7">
+        <div
+          data-studio-note="Switch studio panel & tab layout preset"
+          className="flex items-center gap-1 rounded border border-[#2a2e36] bg-[#14161a] px-1.5 h-7"
+        >
           <LayoutGrid className="h-3 w-3 text-[#98a0ad]" aria-hidden="true" />
           <select
             aria-label="Workspace layout preset"
-            title="Switch panel & tab arrangement preset"
             value={workspaceLayout}
             onChange={(e) => onChangeWorkspaceLayout(e.target.value as WorkspaceLayoutId)}
             className="bg-transparent text-[11px] text-[#e6e8ec] focus:outline-none"
@@ -227,20 +229,20 @@ export function TopToolbar({
         <div className="flex items-center rounded border border-[#2a2e36] bg-[#14161a] p-0.5">
           <button
             type="button"
-            title="Free Orbit & Editing Camera"
+            data-studio-note="Free Orbit & Rigging Camera (separate from render camera)"
             onClick={() => onToggleViewMode('editor')}
             className={`flex h-6 items-center gap-1.5 rounded px-2 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
               viewMode === 'editor'
-                ? 'bg-[#2a2f3a] text-[#ffffff]'
+                ? 'bg-[#2a2f3a] text-[#ffffff] font-semibold'
                 : 'text-[#98a0ad] hover:text-[#e6e8ec]'
             }`}
           >
             <Eye className="h-3 w-3" aria-hidden="true" />
-            <span>Editor Cam</span>
+            <span>Editor</span>
           </button>
           <button
             type="button"
-            title="Preview Scene Output Camera"
+            data-studio-note="Preview final exported Scene Camera framing"
             onClick={() => onToggleViewMode('scene')}
             className={`flex h-6 items-center gap-1.5 rounded px-2 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
               viewMode === 'scene'
@@ -256,8 +258,9 @@ export function TopToolbar({
         <div className="h-4 w-px bg-[#2a2e36]" aria-hidden="true" />
 
         <IconButton
-          label={undoLabel ? `Undo: ${undoLabel} (Ctrl+Z)` : 'Undo (Ctrl+Z)'}
-          note={undoLabel ? `Undo: ${undoLabel} (Ctrl+Z)` : 'Nothing to undo (Ctrl+Z)'}
+          label={undoLabel ? `Undo: ${undoLabel}` : 'Undo'}
+          note={undoLabel ? `Undo: ${undoLabel}` : 'Nothing to undo'}
+          shortcut="Ctrl+Z"
           disabled={!canUndo}
           active={canUndo}
           onClick={onUndo}
@@ -265,18 +268,19 @@ export function TopToolbar({
           <Undo2 className="h-3.5 w-3.5" aria-hidden="true" />
         </IconButton>
         <IconButton
-          label={redoLabel ? `Redo: ${redoLabel} (Ctrl+Shift+Z)` : 'Redo (Ctrl+Shift+Z)'}
-          note={redoLabel ? `Redo: ${redoLabel} (Ctrl+Shift+Z)` : 'Nothing to redo (Ctrl+Shift+Z)'}
+          label={redoLabel ? `Redo: ${redoLabel}` : 'Redo'}
+          note={redoLabel ? `Redo: ${redoLabel}` : 'Nothing to redo'}
+          shortcut="Ctrl+Shift+Z"
           disabled={!canRedo}
           active={canRedo}
           onClick={onRedo}
         >
           <Redo2 className="h-3.5 w-3.5" aria-hidden="true" />
         </IconButton>
-        <IconButton label="Save Project Now (Ctrl+S)" onClick={onSaveNow}>
+        <IconButton label="Save Project Now" note="Save project locally" shortcut="Ctrl+S" onClick={onSaveNow}>
           <Save className="h-3.5 w-3.5" aria-hidden="true" />
         </IconButton>
-        <IconButton label="Command Palette (Ctrl+K)" onClick={onOpenCommandPalette}>
+        <IconButton label="Command Palette" note="Search all studio actions & tools" shortcut="Ctrl+K" onClick={onOpenCommandPalette}>
           <Command className="h-3.5 w-3.5" aria-hidden="true" />
         </IconButton>
       </div>
@@ -294,7 +298,7 @@ export function TopToolbar({
         </StudioButton>
 
         <StudioButton variant="primary" note="Render & download cartoon video" onClick={onOpenExport}>
-          <span>Export Video</span>
+          <span>Export</span>
         </StudioButton>
 
         <div ref={menuRef} className="relative">

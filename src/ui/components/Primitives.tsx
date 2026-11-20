@@ -1,16 +1,141 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Check, ChevronDown, X } from 'lucide-react';
 
+interface TooltipState {
+  note: string;
+  shortcut?: string;
+  x: number;
+  y: number;
+}
+
+export function StudioTooltipHost() {
+  const [tip, setTip] = useState<TooltipState | null>(null);
+  const timerRef = useRef<number | null>(null);
+  const activeElRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const clearTimer = () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+
+    const showForEl = (el: HTMLElement, delayMs: number) => {
+      const note = el.getAttribute('data-studio-note');
+      if (!note) return;
+      const shortcut = el.getAttribute('data-studio-shortcut') ?? undefined;
+      const rect = el.getBoundingClientRect();
+      const x = rect.left + rect.width * 0.5;
+      const y = rect.bottom + 8;
+
+      clearTimer();
+      activeElRef.current = el;
+      if (delayMs <= 0) {
+        setTip({ note, shortcut, x, y });
+      } else {
+        timerRef.current = window.setTimeout(() => {
+          if (activeElRef.current === el) {
+            const r = el.getBoundingClientRect();
+            setTip({
+              note,
+              shortcut,
+              x: r.left + r.width * 0.5,
+              y: r.bottom + 8,
+            });
+          }
+        }, delayMs);
+      }
+    };
+
+    const hideAll = () => {
+      clearTimer();
+      activeElRef.current = null;
+      setTip(null);
+    };
+
+    const onPointerOver = (e: PointerEvent) => {
+      const target = (e.target as HTMLElement | null)?.closest<HTMLElement>('[data-studio-note]');
+      if (!target) {
+        if (activeElRef.current) hideAll();
+        return;
+      }
+      if (target === activeElRef.current) return;
+      showForEl(target, 260);
+    };
+
+    const onPointerOut = (e: PointerEvent) => {
+      if (!activeElRef.current) return;
+      const related = (e.relatedTarget as HTMLElement | null)?.closest<HTMLElement>('[data-studio-note]');
+      if (related !== activeElRef.current) {
+        hideAll();
+      }
+    };
+
+    const onFocusIn = (e: FocusEvent) => {
+      const target = (e.target as HTMLElement | null)?.closest<HTMLElement>('[data-studio-note]');
+      if (target && target.matches(':focus-visible')) {
+        showForEl(target, 120);
+      }
+    };
+
+    document.addEventListener('pointerover', onPointerOver, true);
+    document.addEventListener('pointerout', onPointerOut, true);
+    document.addEventListener('pointerdown', hideAll, true);
+    document.addEventListener('focusin', onFocusIn, true);
+    document.addEventListener('focusout', hideAll, true);
+    window.addEventListener('scroll', hideAll, true);
+    window.addEventListener('keydown', hideAll, true);
+
+    return () => {
+      clearTimer();
+      document.removeEventListener('pointerover', onPointerOver, true);
+      document.removeEventListener('pointerout', onPointerOut, true);
+      document.removeEventListener('pointerdown', hideAll, true);
+      document.removeEventListener('focusin', onFocusIn, true);
+      document.removeEventListener('focusout', hideAll, true);
+      window.removeEventListener('scroll', hideAll, true);
+      window.removeEventListener('keydown', hideAll, true);
+    };
+  }, []);
+
+  if (!tip) return null;
+
+  const vw = typeof window !== 'undefined' ? window.innerWidth : 1280;
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 720;
+  const clampedX = Math.max(120, Math.min(vw - 120, tip.x));
+  const showAbove = tip.y + 44 > vh;
+  const clampedY = showAbove ? Math.max(12, tip.y - 44) : tip.y;
+
+  return (
+    <div
+      role="tooltip"
+      data-testid="studio-hover-note"
+      style={{ left: clampedX, top: clampedY, transform: 'translateX(-50%)' }}
+      className="pointer-events-none fixed z-[90] flex max-w-[260px] items-center gap-2 rounded border border-[#3e4554] bg-[#14161a] px-2.5 py-1.5 text-[11px] leading-snug text-[#e6e8ec] shadow-2xl"
+    >
+      <span>{tip.note}</span>
+      {tip.shortcut && (
+        <kbd className="shrink-0 rounded border border-[#383e49] bg-[#22262f] px-1 py-0.5 font-mono-code text-[9px] text-[#f5b489]">
+          {tip.shortcut}
+        </kbd>
+      )}
+    </div>
+  );
+}
+
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'default' | 'primary' | 'ghost' | 'danger' | 'selected';
   size?: 'xs' | 'sm';
   note?: string;
+  shortcut?: string;
 }
 
 export function StudioButton({
   variant = 'default',
   size = 'sm',
   note,
+  shortcut,
   title,
   className = '',
   children,
@@ -23,17 +148,20 @@ export function StudioButton({
     variant === 'primary'
       ? 'bg-[#e8702a] text-[#121316] hover:bg-[#f07f3c] font-semibold shadow-sm'
       : variant === 'selected'
-        ? 'border border-[#e8702a] bg-[#2a211c] text-[#f5b489] font-semibold'
+        ? 'border border-[#e8702a] bg-[#2e221b] text-[#f7be97] font-semibold'
         : variant === 'danger'
           ? 'border border-[#7f2d2d] bg-[#2a1717] text-[#f3b3b3] hover:bg-[#3a1d1d]'
           : variant === 'ghost'
             ? 'text-[#a3abb8] hover:bg-[#252932] hover:text-[#e6e8ec]'
-            : 'border border-[#323742] bg-[#202329] text-[#e6e8ec] hover:border-[#4c5464] hover:bg-[#262a33]';
+            : 'border border-[#353b47] bg-[#202329] text-[#e6e8ec] hover:border-[#4c5464] hover:bg-[#272b34]';
+
+  const resolvedNote = note ?? title;
 
   return (
     <button
       type="button"
-      title={note ?? title}
+      data-studio-note={resolvedNote || undefined}
+      data-studio-shortcut={shortcut || undefined}
       className={`${base} ${sizeCls} ${varCls} ${className}`}
       {...rest}
     >
@@ -45,12 +173,14 @@ export function StudioButton({
 interface IconButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   label: string;
   note?: string;
+  shortcut?: string;
   active?: boolean;
 }
 
 export function IconButton({
   label,
   note,
+  shortcut,
   active = false,
   className = '',
   children,
@@ -61,11 +191,12 @@ export function IconButton({
       type="button"
       aria-label={label}
       aria-pressed={active || undefined}
-      title={note ?? label}
-      className={`inline-flex h-7 w-7 items-center justify-center rounded border transition-colors shrink-0 focus-visible:outline-2 focus-visible:outline-[#e8702a] disabled:opacity-35 disabled:cursor-not-allowed ${
+      data-studio-note={note ?? label}
+      data-studio-shortcut={shortcut || undefined}
+      className={`inline-flex h-7 w-7 items-center justify-center rounded border transition-colors shrink-0 focus-visible:outline-2 focus-visible:outline-[#e8702a] disabled:opacity-30 disabled:cursor-not-allowed ${
         active
-          ? 'border-[#e8702a] bg-[#e8702a]/20 text-[#f39356]'
-          : 'border-transparent text-[#98a0ad] hover:border-[#343a46] hover:bg-[#252932] hover:text-[#e6e8ec]'
+          ? 'border-[#e8702a] bg-[#2e221b] text-[#f5a16a]'
+          : 'border-transparent text-[#98a0ad] hover:border-[#383e49] hover:bg-[#252932] hover:text-[#e6e8ec]'
       } ${className}`}
       {...rest}
     >
@@ -87,6 +218,7 @@ interface CustomSelectProps<T extends string> {
   onChange: (value: T) => void;
   disabled?: boolean;
   ariaLabel?: string;
+  note?: string;
 }
 
 export function CustomSelect<T extends string>({
@@ -96,6 +228,7 @@ export function CustomSelect<T extends string>({
   onChange,
   disabled = false,
   ariaLabel,
+  note,
 }: CustomSelectProps<T>) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -129,6 +262,7 @@ export function CustomSelect<T extends string>({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={ariaLabel ?? label ?? 'Select option'}
+        data-studio-note={note || undefined}
         onClick={() => setOpen((v) => !v)}
         className="flex h-7 w-full items-center justify-between gap-2 rounded border border-[#2e333d] bg-[#14161a] px-2 text-xs text-[#e6e8ec] hover:border-[#464d5b] disabled:opacity-45"
       >
@@ -153,7 +287,7 @@ export function CustomSelect<T extends string>({
               }}
               className={`flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs transition-colors disabled:opacity-40 ${
                 opt.value === value
-                  ? 'bg-[#2a211c] text-[#e8702a]'
+                  ? 'bg-[#2e221b] text-[#f5a16a] font-medium'
                   : 'text-[#e6e8ec] hover:bg-[#262a33]'
               }`}
             >

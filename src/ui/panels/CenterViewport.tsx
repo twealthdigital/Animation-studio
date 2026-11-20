@@ -83,25 +83,25 @@ interface CenterViewportProps {
 }
 
 const FILTER_OPTIONS: { value: SelectionFilter; label: string }[] = [
-  { value: 'all', label: 'Filter: All' },
-  { value: 'character', label: 'Filter: Characters' },
-  { value: 'body-part', label: 'Filter: Body Parts' },
-  { value: 'ik-handle', label: 'Filter: IK Handles' },
-  { value: 'group', label: 'Filter: Groups' },
-  { value: 'prop', label: 'Filter: Props' },
-  { value: 'light', label: 'Filter: Lights' },
-  { value: 'camera', label: 'Filter: Camera' },
-  { value: 'waypoint', label: 'Filter: Path Points' },
+  { value: 'all', label: 'All Types' },
+  { value: 'character', label: 'Characters' },
+  { value: 'body-part', label: 'Body Joints' },
+  { value: 'ik-handle', label: 'IK Handles' },
+  { value: 'group', label: 'Groups' },
+  { value: 'prop', label: 'Props' },
+  { value: 'light', label: 'Lights' },
+  { value: 'camera', label: 'Camera' },
+  { value: 'waypoint', label: 'Path Points' },
 ];
 
 const CAMERA_PRESETS: { value: EditorCameraPreset; label: string }[] = [
-  { value: 'free', label: 'Angle: Free' },
-  { value: 'front', label: 'Angle: Front' },
-  { value: 'back', label: 'Angle: Back' },
-  { value: 'left', label: 'Angle: Left' },
-  { value: 'right', label: 'Angle: Right' },
-  { value: 'top', label: 'Angle: Top' },
-  { value: 'bottom', label: 'Angle: Bottom' },
+  { value: 'free', label: 'Free Orbit' },
+  { value: 'front', label: 'Front' },
+  { value: 'back', label: 'Back' },
+  { value: 'left', label: 'Left' },
+  { value: 'right', label: 'Right' },
+  { value: 'top', label: 'Top' },
+  { value: 'bottom', label: 'Bottom' },
 ];
 
 export function CenterViewport({
@@ -151,32 +151,36 @@ export function CenterViewport({
       <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-[#2a2e36] bg-[#16181c] px-2.5 text-xs overflow-x-auto">
         <div className="flex items-center gap-1 shrink-0">
           <IconButton
-            label="Select Tool (Q)"
-            note="Pick objects or double-click a character to pose joints (Q)"
+            label="Select Tool"
+            note="Pick objects · Double-click character to pose joints"
+            shortcut="Q"
             active={gizmoMode === 'select'}
             onClick={() => onChangeGizmoMode('select')}
           >
             <MousePointer className="h-3.5 w-3.5" aria-hidden="true" />
           </IconButton>
           <IconButton
-            label="Move Gizmo (G)"
-            note="Translate selected object in 3D space (G)"
+            label="Move Gizmo"
+            note="Translate selected object or group in 3D space"
+            shortcut="G"
             active={gizmoMode === 'translate'}
             onClick={() => onChangeGizmoMode('translate')}
           >
             <Move className="h-3.5 w-3.5" aria-hidden="true" />
           </IconButton>
           <IconButton
-            label="Rotate Gizmo (R)"
-            note="Rotate object or locked child joint around pivot (R)"
+            label="Rotate Gizmo"
+            note="Rotate object or child joint around locked socket"
+            shortcut="R"
             active={gizmoMode === 'rotate'}
             onClick={() => onChangeGizmoMode('rotate')}
           >
             <RotateCw className="h-3.5 w-3.5" aria-hidden="true" />
           </IconButton>
           <IconButton
-            label="Scale Gizmo (S)"
-            note="Resize selected object or group (S)"
+            label="Scale Gizmo"
+            note="Resize selected object or group"
+            shortcut="S"
             active={gizmoMode === 'scale'}
             onClick={() => onChangeGizmoMode('scale')}
           >
@@ -189,7 +193,8 @@ export function CenterViewport({
           <StudioButton
             size="xs"
             variant={gizmoSpace === 'local' ? 'selected' : 'default'}
-            note="Toggle World vs Character Local rotation/move axes (L)"
+            note="Switch gizmo between World axes and Character Local axes"
+            shortcut="L"
             onClick={() => onChangeGizmoSpace(gizmoSpace === 'world' ? 'local' : 'world')}
           >
             <Globe className="h-3 w-3" aria-hidden="true" />
@@ -199,7 +204,7 @@ export function CenterViewport({
           {/* Snap Toggle */}
           <IconButton
             label={`Snap (${snapSettings.enabled ? 'On' : 'Off'})`}
-            note="Snap position & rotation steps cleanly"
+            note="Snap position & rotation steps to grid increments"
             active={snapSettings.enabled}
             onClick={onToggleSnap}
           >
@@ -213,7 +218,9 @@ export function CenterViewport({
                 <button
                   key={ax}
                   type="button"
-                  title={`Constrain gizmo to ${ax.toUpperCase()} axis`}
+                  data-studio-note={
+                    ax === 'all' ? 'Allow free movement on all axes' : `Lock gizmo to ${ax.toUpperCase()} axis only`
+                  }
                   onClick={() => onChangeAxisConstraint(ax)}
                   className={`rounded px-1.5 py-0.5 text-[10px] font-mono-code uppercase ${
                     axisConstraint === ax
@@ -232,7 +239,7 @@ export function CenterViewport({
           {/* Selection Filter */}
           <select
             aria-label="Viewport selection filter"
-            title="Restrict viewport clicks to a specific item type"
+            data-studio-note="Filter viewport clicks by object or rig type"
             value={selectionFilter}
             onChange={(e) => onChangeSelectionFilter(e.target.value as SelectionFilter)}
             className="h-6 rounded border border-[#2e333d] bg-[#14161a] px-1.5 text-[11px] text-[#e6e8ec] focus:border-[#e8702a] focus:outline-none"
@@ -246,8 +253,8 @@ export function CenterViewport({
 
           {studioMode === 'advanced' && (
             <IconButton
-              label="Toggle Rig & Joint Links"
-              note="Show/hide bone hierarchy links, sockets, axis rings & IK handles"
+              label="Toggle Rig & Joint Overlay"
+              note="Show/hide bone links, gimbal sockets, axis rings & IK handles"
               active={showRigOverlay}
               onClick={onToggleRigOverlay}
             >
@@ -256,12 +263,13 @@ export function CenterViewport({
           )}
 
           {multiSelectedCount >= 2 && (
-            <div className="flex items-center gap-1 ml-1 rounded border border-[#e8702a]/60 bg-[#2a211c] px-1.5 py-0.5">
+            <div className="flex items-center gap-1 ml-1 rounded border border-[#e8702a] bg-[#2e221b] px-1.5 py-0.5">
               <Layers className="h-3 w-3 text-[#e8702a]" aria-hidden="true" />
-              <span className="text-[10px] font-semibold text-[#f5b489]">{multiSelectedCount}</span>
+              <span className="text-[10px] font-semibold text-[#f7be97]">{multiSelectedCount}</span>
               <button
                 type="button"
-                title="Group Selected Items (Ctrl+G)"
+                data-studio-note="Combine selected items into a logical group"
+                data-studio-shortcut="Ctrl+G"
                 onClick={onGroupSelection}
                 className="rounded bg-[#e8702a] px-1.5 py-0.5 text-[10px] font-semibold text-[#121316] hover:bg-[#f07f3c]"
               >
@@ -269,7 +277,7 @@ export function CenterViewport({
               </button>
               <button
                 type="button"
-                title="Align X"
+                data-studio-note="Align selected items on X axis"
                 onClick={() => onAlignMultiSelection('align-x')}
                 className="rounded px-1 text-[10px] text-[#e6e8ec] hover:bg-[#383e49]"
               >
@@ -277,7 +285,7 @@ export function CenterViewport({
               </button>
               <button
                 type="button"
-                title="Snap all to Floor Y=0"
+                data-studio-note="Snap selected items to Floor Y=0"
                 onClick={() => onAlignMultiSelection('ground-y')}
                 className="rounded px-1 text-[10px] text-[#e6e8ec] hover:bg-[#383e49]"
               >
@@ -291,7 +299,7 @@ export function CenterViewport({
           {/* Editor Camera Angle Presets, Persp/Ortho & Focus */}
           <select
             aria-label="Editor camera angle preset"
-            title="Snap editor camera to Front, Back, Left, Right, Top, or Bottom view"
+            data-studio-note="Snap viewport camera to Front, Back, Side, or Top view"
             value={editorCameraPreset}
             onChange={(e) => onChangeEditorCameraPreset(e.target.value as EditorCameraPreset)}
             className="h-6 rounded border border-[#2e333d] bg-[#14161a] px-1.5 text-[11px] text-[#e6e8ec] focus:border-[#e8702a] focus:outline-none"
@@ -306,7 +314,7 @@ export function CenterViewport({
           <StudioButton
             size="xs"
             variant={editorProjection === 'orthographic' ? 'selected' : 'default'}
-            note="Toggle Editor Perspective vs Orthographic projection"
+            note="Toggle Perspective vs flat Orthographic editing view"
             onClick={onToggleEditorProjection}
           >
             <Camera className="h-3 w-3" aria-hidden="true" />
@@ -314,16 +322,18 @@ export function CenterViewport({
           </StudioButton>
 
           <IconButton
-            label="Focus Hovered/Selected (F)"
-            note="Zoom smoothly onto hovered part or active selection (F)"
+            label="Focus Target"
+            note="Zoom tightly onto hovered part or active selection"
+            shortcut="F"
             onClick={onFocusTarget}
           >
             <Crosshair className="h-3.5 w-3.5" aria-hidden="true" />
           </IconButton>
 
           <IconButton
-            label="Frame All Stage (Shift+F)"
-            note="Frame all characters & props in viewport (Shift+F)"
+            label="Frame All"
+            note="Frame all characters & props in viewport"
+            shortcut="Shift+F"
             onClick={onFrameAll}
           >
             <Expand className="h-3.5 w-3.5" aria-hidden="true" />
@@ -331,15 +341,16 @@ export function CenterViewport({
 
           <IconButton
             label="Reset Editor View"
-            note="Reset editor orbit camera to default hero view"
+            note="Reset orbit camera back to default stage view"
             onClick={onResetEditorCamera}
           >
             <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
           </IconButton>
 
           <IconButton
-            label="Animation Suggestions (Tab)"
-            note="Show context-aware animation prediction HUD (Tab)"
+            label="Animation Suggestions"
+            note="Open next-step pose & motion predictions"
+            shortcut="Tab"
             active={tabHud.open}
             onClick={onToggleTabHud}
           >
@@ -348,12 +359,21 @@ export function CenterViewport({
         </div>
 
         <div className="flex items-center gap-2 text-[11px] text-[#98a0ad] shrink-0">
+          <span
+            className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+              poseModeInstanceId
+                ? 'bg-[#2e221b] text-[#f7be97] border border-[#e8702a]/70'
+                : 'bg-[#202329] text-[#98a0ad] border border-[#2e333d]'
+            }`}
+          >
+            {poseModeInstanceId ? 'Pose' : 'Object'}
+          </span>
           <span className="font-medium text-[#e6e8ec]">{sceneName}</span>
           <span aria-hidden="true">·</span>
           <span>{viewMode === 'scene' ? 'Final Cam' : 'Editor'}</span>
           <span aria-hidden="true">·</span>
           <span className="tabular-nums">
-            {characterCount} chars{propCount > 0 ? ` · ${propCount} props` : ''}
+            {characterCount}c{propCount > 0 ? ` · ${propCount}p` : ''}
           </span>
         </div>
       </div>
@@ -370,17 +390,17 @@ export function CenterViewport({
         {poseModeInstanceId && (
           <div
             data-testid="pose-mode-banner"
-            className="pointer-events-auto absolute top-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2.5 rounded border border-[#e8702a] bg-[#1a1512] px-3 py-1.5 text-xs shadow-xl"
+            className="pointer-events-auto absolute top-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded border border-[#e8702a] bg-[#1a1512] px-2.5 py-1 text-xs shadow-xl"
           >
             <Bone className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
-            <span className="font-semibold text-[#f5b489]">
-              Pose Mode{poseModeCharName ? `: ${poseModeCharName}` : ''}
+            <span className="font-semibold text-[#f7be97]">
+              Pose{poseModeCharName ? `: ${poseModeCharName}` : ''}
             </span>
             <span className="text-[11px] text-[#cbd5e1]">
-              Drag part or rings to rotate · Joints locked
+              Drag joint or rings · Socket-locked
             </span>
-            <StudioButton size="xs" variant="primary" onClick={onExitPoseMode}>
-              Exit Pose (Esc)
+            <StudioButton size="xs" variant="primary" shortcut="Esc" onClick={onExitPoseMode}>
+              Exit
             </StudioButton>
           </div>
         )}
@@ -393,7 +413,7 @@ export function CenterViewport({
               left: Math.max(12, hoverInfo.screenX + 14),
               top: Math.max(12, hoverInfo.screenY - 12),
             }}
-            className="pointer-events-none absolute z-20 max-w-[230px] rounded border border-[#3a404c] bg-[#181a1f] px-2.5 py-1.5 shadow-xl"
+            className="pointer-events-none absolute z-20 max-w-[230px] rounded border border-[#3a404c] bg-[#14161a] px-2.5 py-1.5 shadow-xl"
           >
             <div className="flex items-center gap-1.5">
               <span className="truncate text-[11px] font-semibold text-[#e6e8ec]">

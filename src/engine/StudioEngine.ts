@@ -127,10 +127,12 @@ export class StudioEngine {
   private lastHoverRayMs = 0;
   private lastHover: HoverTargetInfo | null = null;
   private hoveredNodeKey: string | null = null;
+  private hoveredRingAxis: 'x' | 'y' | 'z' | null = null;
+  private activeRingAxis: 'x' | 'y' | 'z' | null = null;
   private lastRigInstanceId: string | null = null;
   private lastIkTargets: readonly IkTargetData[] = [];
 
-  // Pose mode & direct limb drag-to-rotate state
+  // Pose mode & direct limb / ring drag-to-rotate state
   private poseModeInstanceId: string | null = null;
   private directLimbDrag: {
     instanceId: string;
@@ -139,9 +141,19 @@ export class StudioEngine {
     nodeObj: THREE.Object3D;
     startClientX: number;
     startClientY: number;
-    startRot: THREE.Euler;
+    startQuat: THREE.Quaternion;
+    parentInvWorldQuat: THREE.Quaternion;
+    camRight: THREE.Vector3;
+    camUp: THREE.Vector3;
+    camForward: THREE.Vector3;
+    axis?: 'x' | 'y' | 'z' | null;
+    jointScreenCenter?: { x: number; y: number };
+    tangent2D?: THREE.Vector2;
+    useCircular?: boolean;
+    circularSign?: number;
     active: boolean;
   } | null = null;
+  private snapRotateRad: number | null = null;
 
   // Damped camera focus transition state (cancelled immediately on manual Orbit/Gizmo input)
   private focusAnim: {
@@ -298,6 +310,12 @@ export class StudioEngine {
       if (this.selectionBoxHelper.visible) {
         this.selectionBoxHelper.update();
       }
+      if (this.lastRigInstanceId) {
+        this.rigVisualizer.updateLivePositions(
+          this.adapters.get(this.lastRigInstanceId),
+          this.getActiveEditorCamera(),
+        );
+      }
       this.requestRender();
     });
 
@@ -305,6 +323,7 @@ export class StudioEngine {
     dom.addEventListener('pointerdown', this.handlePointerDown);
     dom.addEventListener('pointermove', this.handlePointerMove);
     dom.addEventListener('pointerup', this.handlePointerUp);
+    dom.addEventListener('pointercancel', this.handlePointerCancel);
     dom.addEventListener('pointerleave', this.handlePointerLeave);
     dom.addEventListener('dblclick', this.handleDoubleClick);
     dom.addEventListener('contextmenu', this.handleContextMenu);
@@ -588,12 +607,14 @@ export class StudioEngine {
 
   setSnapSettings(snap: SnapSettings): void {
     if (!snap.enabled) {
+      this.snapRotateRad = null;
       this.transformControls.setTranslationSnap(null);
       this.transformControls.setRotationSnap(null);
       this.transformControls.setScaleSnap(null);
     } else {
+      this.snapRotateRad = (snap.rotateDegStep * Math.PI) / 180;
       this.transformControls.setTranslationSnap(snap.translateStep);
-      this.transformControls.setRotationSnap((snap.rotateDegStep * Math.PI) / 180);
+      this.transformControls.setRotationSnap(this.snapRotateRad);
       this.transformControls.setScaleSnap(snap.scaleStep);
     }
     this.requestRender();
@@ -606,6 +627,7 @@ export class StudioEngine {
   setShowRigOverlay(show: boolean): void {
     this.showRigOverlay = show;
     this.rigOverlayGroup.visible = this.viewMode === 'editor' && show;
+    this.attachGizmoToSelection();
     this.requestRender();
   }
 
@@ -938,6 +960,8 @@ export class StudioEngine {
       ikTargets: this.lastIkTargets,
       selection: this.currentSelection,
       hoveredNodeKey: this.hoveredNodeKey,
+      hoveredRingAxis: this.hoveredRingAxis,
+      activeRingAxis: this.activeRingAxis,
       lockedNodeIds: lockedSet,
     });
     this.rigVisualizer.updateScales(this.getActiveEditorCamera());
@@ -947,15 +971,21 @@ export class StudioEngine {
     this.transformControls.detach();
     this.selectionBoxHelper.visible = false;
 
-    if (this.viewMode !== 'editor' || this.gizmoMode === 'select') return;
+    if (this.viewMode !== 'editor') return;
+
+    // Allow body-part & IK interaction in Pose Mode even if toolbar gizmoMode is 'select'
+    const isBodyOrIk = this.currentSelection.kind === 'body-part' || this.currentSelection.kind === 'ik-handle';
+    if (this.gizmoMode === 'select' && !isBodyOrIk) return;
 
     this.transformControls.setSpace(this.gizmoSpace);
+    const tcMode: 'translate' | 'rotate' | 'scale' =
+      this.gizmoMode === 'select' ? 'rotate' : this.gizmoMode;
 
     if (this.currentSelection.kind === 'character') {
       if (this.lockedObjects.has(this.currentSelection.instanceId)) return;
       const adapter = this.adapters.get(this.currentSelection.instanceId);
       if (adapter) {
-        this.transformControls.setMode(this.gizmoMode);
+        this.transformControls.setMode(tcMode);
         this.transformControls.attach(adapter.rootGroup);
         this.selectionBoxHelper.setFromObject(adapter.rootGroup);
         this.selectionBoxHelper.visible = true;
@@ -970,14 +1000,20 @@ export class StudioEngine {
           ? adapter.getNodeObject(nodeId)
           : undefined;
       if (nodeObj) {
-        // Lock child bones strictly to local rotation around their parent joint pivot so limbs never detach!
         const isRootNode = nodeId === 'node_0';
-        const effectiveMode = isRootNode && this.gizmoMode !== 'scale' ? this.gizmoMode : 'rotate';
+        this.selectionBoxHelper.setFromObject(nodeObj);
+        this.selectionBoxHelper.visible = true;
+
+        // When RigVisualizer is visible for non-root joints, RigVisualizer renders clean
+        // arrowhead X/Y/Z rings directly on the socket without overlapping TransformControls!
+        if (!isRootNode && this.showRigOverlay) {
+          return;
+        }
+        const effectiveMode =
+          isRootNode && tcMode !== 'scale' ? tcMode : 'rotate';
         this.transformControls.setMode(effectiveMode);
         this.transformControls.setSpace('local');
         this.transformControls.attach(nodeObj);
-        this.selectionBoxHelper.setFromObject(nodeObj);
-        this.selectionBoxHelper.visible = true;
       }
     } else if (this.currentSelection.kind === 'ik-handle') {
       if (this.lockedObjects.has(this.currentSelection.instanceId)) return;
@@ -992,7 +1028,7 @@ export class StudioEngine {
       if (this.lockedObjects.has(this.currentSelection.propId)) return;
       const propObj = this.propObjects.get(this.currentSelection.propId);
       if (propObj) {
-        this.transformControls.setMode(this.gizmoMode);
+        this.transformControls.setMode(tcMode);
         this.transformControls.attach(propObj);
         this.selectionBoxHelper.setFromObject(propObj);
         this.selectionBoxHelper.visible = true;
@@ -1002,7 +1038,7 @@ export class StudioEngine {
       if (grpMeta?.locked) return;
       const proxy = this.groupProxies.get(this.currentSelection.groupId);
       if (proxy) {
-        this.transformControls.setMode(this.gizmoMode);
+        this.transformControls.setMode(tcMode);
         this.transformControls.attach(proxy);
         this.selectionBoxHelper.visible = false;
       }
@@ -1240,8 +1276,9 @@ export class StudioEngine {
     }
     this.restoredHoverEmissives.clear();
     this.hoverBoxHelper.visible = false;
-    if (this.hoveredNodeKey !== null) {
+    if (this.hoveredNodeKey !== null || this.hoveredRingAxis !== null) {
       this.hoveredNodeKey = null;
+      this.hoveredRingAxis = null;
       this.rebuildRigVisuals();
     }
     if (this.lastHover !== null) {
@@ -1280,10 +1317,46 @@ export class StudioEngine {
     title: string;
     description: string;
     locked: boolean;
+    ringAxis?: 'x' | 'y' | 'z';
   } | null {
     this.updateRayFromEvent(clientX, clientY);
     const allow = (k: SelectionFilter) =>
       options?.ignoreFilter || this.selectionFilter === 'all' || this.selectionFilter === k;
+
+    // 0. Interactive Rig Rotation Rings (highest priority when a joint is selected)
+    if (this.showRigOverlay && this.rigVisualizer.axisRingHandles.length > 0) {
+      const ringHits = this.raycaster.intersectObjects(this.rigVisualizer.axisRingHandles, false);
+      if (ringHits.length > 0) {
+        const ring = ringHits[0].object.userData.rigRotationRing as
+          | {
+              instanceId: string;
+              nodeId: string;
+              nodeName: string;
+              axis: 'x' | 'y' | 'z';
+              title: string;
+              description: string;
+            }
+          | undefined;
+        if (ring) {
+          return {
+            target: {
+              kind: 'body-part',
+              instanceId: ring.instanceId,
+              nodeId: ring.nodeId,
+              nodeName: ring.nodeName,
+            },
+            hitMesh: null,
+            worldPoint: ringHits[0].point,
+            title: ring.title,
+            description: ring.description,
+            locked:
+              Boolean(this.lockedCharacterNodes.get(ring.instanceId)?.has(ring.nodeId)) ||
+              this.lockedObjects.has(ring.instanceId),
+            ringAxis: ring.axis,
+          };
+        }
+      }
+    }
 
     // 1. IK Target Handles
     if (allow('ik-handle') && this.rigVisualizer.ikHandles.size > 0) {
@@ -1324,8 +1397,8 @@ export class StudioEngine {
       }
     }
 
-    // 3. Visible Rig Joint Spheres
-    if ((allow('body-part') || this.poseModeInstanceId) && this.rigVisualizer.rigNodeHandles.size > 0) {
+    // 3. Visible Rig Joint Sockets
+    if (this.showRigOverlay && (allow('body-part') || this.poseModeInstanceId) && this.rigVisualizer.rigNodeHandles.size > 0) {
       const jointHits = this.raycaster.intersectObjects([...this.rigVisualizer.rigNodeHandles.values()], false);
       if (jointHits.length > 0) {
         const nh = jointHits[0].object.userData.rigNodeHandle as
@@ -1337,7 +1410,7 @@ export class StudioEngine {
             hitMesh: jointHits[0].object,
             worldPoint: jointHits[0].point,
             title: nh.nodeName,
-            description: nh.description || 'Rotate joint around local pivot',
+            description: nh.description || 'Drag to rotate joint around locked socket',
             locked: Boolean(nh.locked) || this.lockedObjects.has(nh.instanceId),
           };
         }
@@ -1430,13 +1503,34 @@ export class StudioEngine {
     }
 
     if (charId) {
-      const rigNodeId = typeof hitObj.userData.rigNodeId === 'string' ? hitObj.userData.rigNodeId : null;
-      const rigNodeName = String(hitObj.userData.rigNodeName || rigNodeId || 'Part');
+      const rawNodeId = typeof hitObj.userData.rigNodeId === 'string' ? hitObj.userData.rigNodeId : null;
       const adapter = this.adapters.get(charId);
-      const rigNode =
-        rigNodeId && adapter && 'getRigNodes' in adapter && typeof adapter.getRigNodes === 'function'
-          ? adapter.getRigNodes().find((n) => n.nodeId === rigNodeId)
-          : undefined;
+      const allNodes =
+        adapter && 'getRigNodes' in adapter && typeof adapter.getRigNodes === 'function'
+          ? adapter.getRigNodes()
+          : [];
+      const rawNode = rawNodeId ? allNodes.find((n) => n.nodeId === rawNodeId) : undefined;
+
+      // Resolve auxiliary facial/decorative sub-parts (eyes, mouth, collar) to their parent articulable joint
+      let effectiveNode = rawNode;
+      const isExplicitlySelectedAux =
+        this.currentSelection.kind === 'body-part' &&
+        this.currentSelection.instanceId === charId &&
+        this.currentSelection.nodeId === rawNodeId;
+      if (effectiveNode?.isAuxiliary && !isExplicitlySelectedAux) {
+        while (effectiveNode?.isAuxiliary && effectiveNode.parentId) {
+          const parent = allNodes.find((n) => n.nodeId === effectiveNode!.parentId);
+          if (!parent) break;
+          effectiveNode = parent;
+        }
+      }
+
+      const rigNodeId = effectiveNode?.nodeId ?? rawNodeId;
+      const rigNodeName = effectiveNode?.name ?? String(hitObj.userData.rigNodeName || rigNodeId || 'Part');
+      const displayTitle =
+        rawNode && effectiveNode && rawNode.nodeId !== effectiveNode.nodeId
+          ? `${effectiveNode.name} • ${rawNode.name}`
+          : rigNodeName;
       const nodeObj =
         rigNodeId && adapter && 'getNodeObject' in adapter && typeof adapter.getNodeObject === 'function'
           ? adapter.getNodeObject(rigNodeId)
@@ -1454,8 +1548,8 @@ export class StudioEngine {
           target: { kind: 'body-part', instanceId: charId, nodeId: rigNodeId, nodeName: rigNodeName },
           hitMesh: nodeObj ?? hitObj,
           worldPoint: hits[0].point,
-          title: rigNodeName,
-          description: rigNode?.description || `Rotate ${rigNodeName} around joint`,
+          title: displayTitle,
+          description: effectiveNode?.description || `Rotate ${rigNodeName} around locked joint`,
           locked: lockedNode || this.lockedObjects.has(charId),
         };
       }
@@ -1475,11 +1569,11 @@ export class StudioEngine {
 
       return {
         target: { kind: 'character', instanceId: charId },
-        hitMesh: rigNodeId && rigNode ? (nodeObj ?? hitObj) : (adapter?.rootGroup ?? hitObj),
+        hitMesh: rigNodeId && effectiveNode ? (nodeObj ?? hitObj) : (adapter?.rootGroup ?? hitObj),
         worldPoint: hits[0].point,
-        title: rigNode ? `${rigNodeName}` : 'Character',
-        description: rigNode
-          ? `${rigNode.description ?? 'Select part'} • Double-click to pose`
+        title: effectiveNode ? displayTitle : 'Character',
+        description: effectiveNode
+          ? `${effectiveNode.description ?? 'Select part'} • Double-click to pose`
           : 'Click to transform • Double-click to pose joints',
         locked: this.lockedObjects.has(charId),
       };
@@ -1491,29 +1585,80 @@ export class StudioEngine {
   private handlePointerMove = (e: PointerEvent) => {
     if (this.disposed || this.viewMode !== 'editor') return;
 
-    // Live direct limb rotation drag when in Articulated Pose Mode
+    // Live camera-aligned or axis-ring limb rotation drag in Articulated Pose Mode
     if (this.directLimbDrag) {
-      const dx = e.clientX - this.directLimbDrag.startClientX;
-      const dy = e.clientY - this.directLimbDrag.startClientY;
-      if (!this.directLimbDrag.active && Math.hypot(dx, dy) > 4) {
-        this.directLimbDrag.active = true;
+      const drag = this.directLimbDrag;
+      const dx = e.clientX - drag.startClientX;
+      const dy = e.clientY - drag.startClientY;
+      if (!drag.active && Math.hypot(dx, dy) > 3) {
+        drag.active = true;
         this.orbitControls.enabled = false;
-      }
-      if (this.directLimbDrag.active) {
-        const sensitivity = 0.012;
-        if (e.altKey) {
-          this.directLimbDrag.nodeObj.rotation.set(
-            this.directLimbDrag.startRot.x,
-            this.directLimbDrag.startRot.y,
-            this.directLimbDrag.startRot.z - dx * sensitivity,
-          );
-        } else {
-          this.directLimbDrag.nodeObj.rotation.set(
-            this.directLimbDrag.startRot.x + dy * sensitivity,
-            this.directLimbDrag.startRot.y + dx * sensitivity,
-            this.directLimbDrag.startRot.z,
-          );
+        if (drag.axis) {
+          this.activeRingAxis = drag.axis;
+          this.rebuildRigVisuals();
         }
+      }
+      if (drag.active) {
+        if (drag.axis) {
+          // Interactive X/Y/Z Ring drag around exact local joint axis
+          let angle = 0;
+          if (drag.useCircular && drag.jointScreenCenter) {
+            const a0 = Math.atan2(
+              drag.startClientY - drag.jointScreenCenter.y,
+              drag.startClientX - drag.jointScreenCenter.x,
+            );
+            const a1 = Math.atan2(
+              e.clientY - drag.jointScreenCenter.y,
+              e.clientX - drag.jointScreenCenter.x,
+            );
+            let diff = a1 - a0;
+            while (diff > Math.PI) diff -= Math.PI * 2;
+            while (diff < -Math.PI) diff += Math.PI * 2;
+            angle = diff * (drag.circularSign ?? 1);
+          } else if (drag.tangent2D) {
+            angle = (dx * drag.tangent2D.x + dy * drag.tangent2D.y) * 0.014;
+          } else {
+            angle = (dx - dy) * 0.012;
+          }
+          if (this.snapRotateRad && this.snapRotateRad > 0) {
+            angle = Math.round(angle / this.snapRotateRad) * this.snapRotateRad;
+          }
+          const localAxis = new THREE.Vector3(
+            drag.axis === 'x' ? 1 : 0,
+            drag.axis === 'y' ? 1 : 0,
+            drag.axis === 'z' ? 1 : 0,
+          );
+          const dq = new THREE.Quaternion().setFromAxisAngle(localAxis, angle);
+          drag.nodeObj.quaternion.copy(drag.startQuat).multiply(dq);
+        } else {
+          // Smooth camera-aligned parent-locked free rotation on limb/socket drag
+          const sensitivity = 0.011;
+          if (e.altKey) {
+            const localForward = drag.camForward.clone().applyQuaternion(drag.parentInvWorldQuat).normalize();
+            let rollAngle = -dx * sensitivity;
+            if (this.snapRotateRad && this.snapRotateRad > 0) {
+              rollAngle = Math.round(rollAngle / this.snapRotateRad) * this.snapRotateRad;
+            }
+            const qRoll = new THREE.Quaternion().setFromAxisAngle(localForward, rollAngle);
+            drag.nodeObj.quaternion.copy(qRoll).multiply(drag.startQuat);
+          } else {
+            const localUp = drag.camUp.clone().applyQuaternion(drag.parentInvWorldQuat).normalize();
+            const localRight = drag.camRight.clone().applyQuaternion(drag.parentInvWorldQuat).normalize();
+            let yawAngle = dx * sensitivity;
+            let pitchAngle = dy * sensitivity;
+            if (this.axisConstraint === 'x') yawAngle = 0;
+            if (this.axisConstraint === 'y') pitchAngle = 0;
+            if (this.snapRotateRad && this.snapRotateRad > 0) {
+              yawAngle = Math.round(yawAngle / this.snapRotateRad) * this.snapRotateRad;
+              pitchAngle = Math.round(pitchAngle / this.snapRotateRad) * this.snapRotateRad;
+            }
+            const qYaw = new THREE.Quaternion().setFromAxisAngle(localUp, yawAngle);
+            const qPitch = new THREE.Quaternion().setFromAxisAngle(localRight, pitchAngle);
+            drag.nodeObj.quaternion.copy(qYaw).multiply(qPitch).multiply(drag.startQuat);
+          }
+        }
+        const adapter = this.adapters.get(drag.instanceId);
+        this.rigVisualizer.updateLivePositions(adapter, this.getActiveEditorCamera());
         if (this.selectionBoxHelper.visible) {
           this.selectionBoxHelper.update();
         }
@@ -1551,12 +1696,16 @@ export class StudioEngine {
       this.applyMeshHoverEmissive(hit.hitMesh);
       this.hoverBoxHelper.setFromObject(hit.hitMesh);
       this.hoverBoxHelper.visible = true;
+    } else {
+      this.hoverBoxHelper.visible = false;
     }
 
     const nextNodeKey =
       hit.target.kind === 'body-part' ? `${hit.target.instanceId}:${hit.target.nodeId}` : null;
-    if (nextNodeKey !== this.hoveredNodeKey) {
+    const nextRingAxis = hit.ringAxis ?? null;
+    if (nextNodeKey !== this.hoveredNodeKey || nextRingAxis !== this.hoveredRingAxis) {
       this.hoveredNodeKey = nextNodeKey;
+      this.hoveredRingAxis = nextRingAxis;
       this.rebuildRigVisuals();
     }
 
@@ -1590,29 +1739,101 @@ export class StudioEngine {
     }
   };
 
+  private handlePointerCancel = (e: PointerEvent) => {
+    if (this.directLimbDrag) {
+      this.directLimbDrag = null;
+      this.activeRingAxis = null;
+      this.orbitControls.enabled = this.viewMode === 'editor';
+      try {
+        if (this.renderer.domElement.hasPointerCapture(e.pointerId)) {
+          this.renderer.domElement.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // Ignore capture release errors
+      }
+      this.rebuildRigVisuals();
+      this.requestRender();
+    }
+  };
+
   private handlePointerDown = (e: PointerEvent) => {
     this.pointerDownPos = { x: e.clientX, y: e.clientY };
 
-    // Start direct drag-to-rotate if in Articulated Pose Mode and clicking directly on a limb (and NOT over TransformControls axis handle)
     if (
       e.button === 0 &&
-      this.poseModeInstanceId &&
       this.viewMode === 'editor' &&
       !(this.transformControls as unknown as { axis?: string | null }).axis
     ) {
       const hit = this.inspectRayTarget(e.clientX, e.clientY, { preferBodyPart: true });
-      if (
+      const canDragRing = Boolean(hit?.ringAxis);
+      const canDragLimb =
         hit &&
         hit.target.kind === 'body-part' &&
         hit.target.instanceId === this.poseModeInstanceId &&
-        !hit.locked
-      ) {
+        hit.target.nodeId !== 'node_0';
+
+      if (hit && hit.target.kind === 'body-part' && (canDragRing || canDragLimb) && !hit.locked) {
         const adapter = this.adapters.get(hit.target.instanceId);
         const nodeObj =
           adapter && 'getNodeObject' in adapter && typeof adapter.getNodeObject === 'function'
             ? adapter.getNodeObject(hit.target.nodeId)
             : undefined;
         if (nodeObj) {
+          nodeObj.updateMatrixWorld(true);
+          const cam = this.getActiveEditorCamera();
+          cam.updateMatrixWorld();
+          const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion).normalize();
+          const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion).normalize();
+          const camForward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
+
+          const parentWorldQuat = new THREE.Quaternion();
+          if (nodeObj.parent) {
+            nodeObj.parent.getWorldQuaternion(parentWorldQuat);
+          }
+          const parentInvWorldQuat = parentWorldQuat.clone().invert();
+
+          let jointScreenCenter: { x: number; y: number } | undefined;
+          let tangent2D: THREE.Vector2 | undefined;
+          let useCircular = false;
+          let circularSign = 1;
+
+          if (hit.ringAxis) {
+            const rect = this.renderer.domElement.getBoundingClientRect();
+            const jointWorld = new THREE.Vector3();
+            nodeObj.getWorldPosition(jointWorld);
+            const ndcCenter = jointWorld.clone().project(cam);
+            jointScreenCenter = {
+              x: rect.left + (ndcCenter.x * 0.5 + 0.5) * rect.width,
+              y: rect.top + (-ndcCenter.y * 0.5 + 0.5) * rect.height,
+            };
+
+            const nodeWorldQuat = new THREE.Quaternion();
+            nodeObj.getWorldQuaternion(nodeWorldQuat);
+            const localAxis = new THREE.Vector3(
+              hit.ringAxis === 'x' ? 1 : 0,
+              hit.ringAxis === 'y' ? 1 : 0,
+              hit.ringAxis === 'z' ? 1 : 0,
+            );
+            const axisWorld = localAxis.applyQuaternion(nodeWorldQuat).normalize();
+            const axisCamDot = axisWorld.dot(camForward);
+            useCircular = Math.abs(axisCamDot) > 0.28;
+            // Right-hand thumb rule projected onto screen (Y points down in screen coords)
+            circularSign = axisCamDot < 0 ? 1 : -1;
+
+            const radial = hit.worldPoint.clone().sub(jointWorld);
+            const tangentWorld = new THREE.Vector3().crossVectors(axisWorld, radial);
+            if (tangentWorld.lengthSq() > 1e-5) {
+              tangentWorld.normalize();
+              const p1 = hit.worldPoint.clone().addScaledVector(tangentWorld, 0.15).project(cam);
+              const p0 = hit.worldPoint.clone().project(cam);
+              tangent2D = new THREE.Vector2(
+                ((p1.x - p0.x) * 0.5) * rect.width,
+                (-(p1.y - p0.y) * 0.5) * rect.height,
+              );
+              if (tangent2D.lengthSq() > 1e-5) tangent2D.normalize();
+            }
+          }
+
           this.directLimbDrag = {
             instanceId: hit.target.instanceId,
             nodeId: hit.target.nodeId,
@@ -1620,9 +1841,27 @@ export class StudioEngine {
             nodeObj,
             startClientX: e.clientX,
             startClientY: e.clientY,
-            startRot: nodeObj.rotation.clone(),
+            startQuat: nodeObj.quaternion.clone(),
+            parentInvWorldQuat,
+            camRight,
+            camUp,
+            camForward,
+            axis: hit.ringAxis ?? null,
+            jointScreenCenter,
+            tangent2D,
+            useCircular,
+            circularSign,
             active: false,
           };
+          try {
+            this.renderer.domElement.setPointerCapture(e.pointerId);
+          } catch {
+            // Ignore pointer capture failure in synthetic environments
+          }
+          if (hit.ringAxis) {
+            // Prevent OrbitControls from stealing pointer when pressing directly on an X/Y/Z ring
+            this.orbitControls.enabled = false;
+          }
         }
       }
     }
@@ -1632,7 +1871,15 @@ export class StudioEngine {
     if (this.directLimbDrag) {
       const drag = this.directLimbDrag;
       this.directLimbDrag = null;
+      this.activeRingAxis = null;
       this.orbitControls.enabled = this.viewMode === 'editor';
+      try {
+        if (this.renderer.domElement.hasPointerCapture(e.pointerId)) {
+          this.renderer.domElement.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // Ignore capture release errors
+      }
       if (drag.active) {
         const adapter = this.adapters.get(drag.instanceId);
         const deltaRot =
@@ -1644,8 +1891,12 @@ export class StudioEngine {
           e.shiftKey,
         );
         this.callbacks.onNodeTransformCommit(drag.instanceId, drag.nodeId, drag.nodeName, deltaRot, { x: 0, y: 0, z: 0 });
+        this.rebuildRigVisuals();
         this.requestRender();
         return;
+      }
+      if (drag.axis) {
+        this.rebuildRigVisuals();
       }
     }
 
@@ -1899,6 +2150,7 @@ export class StudioEngine {
     dom.removeEventListener('pointerdown', this.handlePointerDown);
     dom.removeEventListener('pointermove', this.handlePointerMove);
     dom.removeEventListener('pointerup', this.handlePointerUp);
+    dom.removeEventListener('pointercancel', this.handlePointerCancel);
     dom.removeEventListener('pointerleave', this.handlePointerLeave);
     dom.removeEventListener('dblclick', this.handleDoubleClick);
     dom.removeEventListener('contextmenu', this.handleContextMenu);

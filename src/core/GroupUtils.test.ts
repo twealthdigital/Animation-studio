@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   composeTransforms,
   createLogicalGroup,
+  duplicateLogicalGroup,
   getMemberWorldTransform,
   ungroupLogicalGroup,
 } from './GroupUtils';
@@ -114,3 +115,42 @@ test('createLogicalGroup preserves member world transforms and ungroup restores 
   );
   assert.ok(Math.abs(ungrouped.props![0].transform.position.x - composedCheck.position.x) < 1e-5);
 });
+
+test('duplicateLogicalGroup clones group and members with distinct IDs and spatial offset', () => {
+  const base = makeBaseScene();
+  const { scene: grouped } = createLogicalGroup(
+    base,
+    ['char_host', 'prop_desk'],
+    'Broadcast Pair',
+    'grp_src',
+  );
+
+  let seq = 0;
+  const { scene: duplicated, group: newGroup } = duplicateLogicalGroup(
+    grouped,
+    'grp_src',
+    (prefix) => `${prefix}_clone_${++seq}`,
+    2.25,
+  );
+
+  assert.ok(newGroup);
+  assert.notEqual(newGroup.id, 'grp_src');
+  assert.equal(newGroup.name, 'Broadcast Pair Copy');
+  assert.equal(newGroup.memberIds.length, 2);
+  assert.ok(!newGroup.memberIds.includes('char_host'));
+  assert.ok(!newGroup.memberIds.includes('prop_desk'));
+  assert.equal(duplicated.groups?.length, 2);
+  assert.equal(duplicated.characters.length, 2);
+  assert.equal(duplicated.props?.length, 2);
+  assert.ok(Math.abs(newGroup.transform.position.x - (grouped.groups![0].transform.position.x + 2.25)) < 1e-6);
+
+  // Source group remains untouched
+  const srcAfter = duplicated.groups!.find((g) => g.id === 'grp_src')!;
+  assert.deepEqual(srcAfter.memberIds, ['char_host', 'prop_desk']);
+
+  // Missing group returns null safely
+  const missing = duplicateLogicalGroup(grouped, 'grp_nonexistent', (p) => `${p}_x`);
+  assert.equal(missing.group, null);
+  assert.equal(missing.scene.groups?.length, 1);
+});
+

@@ -43,6 +43,7 @@ import { migrateProjectData } from '../core/migrations';
 import { CommandManager } from '../core/CommandManager';
 import {
   createLogicalGroup,
+  duplicateLogicalGroup,
   findMemberGroup,
   isEffectiveVisible,
   ungroupLogicalGroup,
@@ -99,7 +100,7 @@ import {
   UserGuideDialog,
 } from '../ui/dialogs/StudioDialogs';
 import { CommandPalette, type PaletteAction } from '../ui/dialogs/CommandPalette';
-import { ConfirmDialog, type ContextMenuItem } from '../ui/components/Primitives';
+import { ConfirmDialog, type ContextMenuItem, StudioTooltipHost } from '../ui/components/Primitives';
 
 const UI_PREFS_KEY = 'stagecraft_ui_prefs_v1';
 
@@ -380,6 +381,23 @@ export function StudioWorkspace() {
     }
   }, [workspaceLayout, leftCollapse, rightCollapse, timelineCollapse]);
 
+  // Responsive viewport adaptation on narrower screens
+  useEffect(() => {
+    const adaptToWidth = () => {
+      const w = window.innerWidth;
+      if (w < 860) {
+        setLeftCollapse((c) => (c === 'expanded' ? 'compact' : c));
+        setRightCollapse((c) => (c === 'expanded' ? 'compact' : c));
+      } else if (w < 1120) {
+        setLeftWidth((lw) => Math.min(lw, 232));
+        setRightWidth((rw) => Math.min(rw, 268));
+      }
+    };
+    adaptToWidth();
+    window.addEventListener('resize', adaptToWidth);
+    return () => window.removeEventListener('resize', adaptToWidth);
+  }, []);
+
   // Derive active project & scene
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? projects[0],
@@ -485,6 +503,34 @@ export function StudioWorkspace() {
       setHistoryVersion((v) => v + 1);
     },
     [replaceActiveScene],
+  );
+
+  const commitProjectMutation = useCallback(
+    (label: string, mutator: (proj: ProjectData) => ProjectData) => {
+      const beforeProj = JSON.parse(JSON.stringify(projectRef.current)) as ProjectData;
+      const nextProj = mutator(JSON.parse(JSON.stringify(beforeProj)) as ProjectData);
+      projectRef.current = nextProj;
+      setProjects((prev) => prev.map((p) => (p.id === beforeProj.id ? nextProj : p)));
+      setSaveStatus('unsaved');
+      lastCoalesceRef.current = null;
+      commandManagerRef.current.pushExecuted({
+        label,
+        execute: () => {
+          const restored = JSON.parse(JSON.stringify(nextProj)) as ProjectData;
+          projectRef.current = restored;
+          setProjects((prev) => prev.map((p) => (p.id === restored.id ? restored : p)));
+          setSaveStatus('unsaved');
+        },
+        undo: () => {
+          const restored = JSON.parse(JSON.stringify(beforeProj)) as ProjectData;
+          projectRef.current = restored;
+          setProjects((prev) => prev.map((p) => (p.id === restored.id ? restored : p)));
+          setSaveStatus('unsaved');
+        },
+      });
+      setHistoryVersion((v) => v + 1);
+    },
+    [],
   );
 
   const handleUndo = useCallback(() => {
@@ -892,6 +938,40 @@ export function StudioWorkspace() {
     [commitSceneMutation],
   );
 
+  const handleDuplicateGroup = useCallback(
+    (groupId: string) => {
+      let createdId: string | null = null;
+      commitSceneMutation('Duplicate Group', (s) => {
+        const res = duplicateLogicalGroup(s, groupId, createId);
+        createdId = res.group?.id ?? null;
+        return res.scene;
+      });
+      if (createdId) {
+        setSelection({ kind: 'group', groupId: createdId });
+      }
+    },
+    [commitSceneMutation],
+  );
+
+  const handleRenameGroup = useCallback(
+    (groupId: string, name: string) => {
+      commitSceneMutation('Rename Group', (s) => ({
+        ...s,
+        groups: (s.groups ?? []).map((g) => (g.id === groupId ? { ...g, name } : g)),
+      }));
+    },
+    [commitSceneMutation],
+  );
+
+  const handleSelectGroupMembers = useCallback((groupId: string) => {
+    const grp = (sceneRef.current.groups ?? []).find((g) => g.id === groupId);
+    if (!grp || grp.memberIds.length === 0) return;
+    setMultiSelectedIds([...grp.memberIds]);
+    const firstChar = sceneRef.current.characters.find((c) => c.id === grp.memberIds[0]);
+    if (firstChar) setSelection({ kind: 'character', instanceId: firstChar.id });
+    else setSelection({ kind: 'prop', propId: grp.memberIds[0] });
+  }, []);
+
   const handleEnterPoseMode = useCallback((instanceId: string) => {
     const nodes = rigNodesRef.current[instanceId] ?? [];
     const preferred =
@@ -1084,6 +1164,15 @@ export function StudioWorkspace() {
               })),
           });
           items.push({
+            label: 'Select All Members',
+            onClick: () => handleSelectGroupMembers(grp.id),
+          });
+          items.push({
+            label: 'Duplicate Group',
+            shortcut: 'Ctrl+D',
+            onClick: () => handleDuplicateGroup(grp.id),
+          });
+          items.push({
             label: grp.locked ? 'Unlock Group' : 'Lock Group',
             onClick: () =>
               commitSceneMutation(`Toggle Lock ${grp.name}`, (s) => ({
@@ -1125,11 +1214,13 @@ export function StudioWorkspace() {
     [
       commitSceneMutation,
       handleDuplicateCharacter,
+      handleDuplicateGroup,
       handleEnterPoseMode,
       handleExitPoseMode,
       handleGroupSelection,
       handleKeyCharacterTransform,
       handleRemoveCharacter,
+      handleSelectGroupMembers,
       handleToggleIsolate,
       handleUngroupGroup,
       isolatedIds,
@@ -1202,13 +1293,21 @@ export function StudioWorkspace() {
           ...s,
           characters: s.characters.map((c) => {
             if (c.id !== instanceId) return c;
-            if (!shouldAutoKey) return { ...c, transform: committed };
+            const syncPos = shouldAutoKey || c.positionKeyframes.length > 0;
+            const syncRot = shouldAutoKey || c.rotationKeyframes.length > 0;
+            const syncScale = shouldAutoKey || c.scaleKeyframes.length > 0;
             return {
               ...c,
               transform: committed,
-              positionKeyframes: upsertVec3Key(c.positionKeyframes, tNow, committed.position),
-              rotationKeyframes: upsertVec3Key(c.rotationKeyframes, tNow, committed.rotation),
-              scaleKeyframes: upsertVec3Key(c.scaleKeyframes, tNow, committed.scale),
+              positionKeyframes: syncPos
+                ? upsertVec3Key(c.positionKeyframes, tNow, committed.position)
+                : c.positionKeyframes,
+              rotationKeyframes: syncRot
+                ? upsertVec3Key(c.rotationKeyframes, tNow, committed.rotation)
+                : c.rotationKeyframes,
+              scaleKeyframes: syncScale
+                ? upsertVec3Key(c.scaleKeyframes, tNow, committed.scale)
+                : c.scaleKeyframes,
             };
           }),
         }));
@@ -1264,13 +1363,21 @@ export function StudioWorkspace() {
           props: (s.props ?? []).map((p) => {
             if (p.id !== propId || p.locked) return p;
             const committed = cloneTransform(nextTransform);
-            if (!shouldAutoKey) return { ...p, transform: committed };
+            const syncPos = shouldAutoKey || p.positionKeyframes.length > 0;
+            const syncRot = shouldAutoKey || p.rotationKeyframes.length > 0;
+            const syncScale = shouldAutoKey || p.scaleKeyframes.length > 0;
             return {
               ...p,
               transform: committed,
-              positionKeyframes: upsertVec3Key(p.positionKeyframes, tNow, committed.position),
-              rotationKeyframes: upsertVec3Key(p.rotationKeyframes, tNow, committed.rotation),
-              scaleKeyframes: upsertVec3Key(p.scaleKeyframes, tNow, committed.scale),
+              positionKeyframes: syncPos
+                ? upsertVec3Key(p.positionKeyframes, tNow, committed.position)
+                : p.positionKeyframes,
+              rotationKeyframes: syncRot
+                ? upsertVec3Key(p.rotationKeyframes, tNow, committed.rotation)
+                : p.rotationKeyframes,
+              scaleKeyframes: syncScale
+                ? upsertVec3Key(p.scaleKeyframes, tNow, committed.scale)
+                : p.scaleKeyframes,
             };
           }),
         }));
@@ -1283,13 +1390,21 @@ export function StudioWorkspace() {
           groups: (s.groups ?? []).map((g) => {
             if (g.id !== groupId || g.locked) return g;
             const committed = cloneTransform(nextTransform);
-            if (!shouldAutoKey) return { ...g, transform: committed };
+            const syncPos = shouldAutoKey || g.positionKeyframes.length > 0;
+            const syncRot = shouldAutoKey || g.rotationKeyframes.length > 0;
+            const syncScale = shouldAutoKey || g.scaleKeyframes.length > 0;
             return {
               ...g,
               transform: committed,
-              positionKeyframes: upsertVec3Key(g.positionKeyframes, tNow, committed.position),
-              rotationKeyframes: upsertVec3Key(g.rotationKeyframes, tNow, committed.rotation),
-              scaleKeyframes: upsertVec3Key(g.scaleKeyframes, tNow, committed.scale),
+              positionKeyframes: syncPos
+                ? upsertVec3Key(g.positionKeyframes, tNow, committed.position)
+                : g.positionKeyframes,
+              rotationKeyframes: syncRot
+                ? upsertVec3Key(g.rotationKeyframes, tNow, committed.rotation)
+                : g.rotationKeyframes,
+              scaleKeyframes: syncScale
+                ? upsertVec3Key(g.scaleKeyframes, tNow, committed.scale)
+                : g.scaleKeyframes,
             };
           }),
         }));
@@ -1796,6 +1911,8 @@ export function StudioWorkspace() {
         e.preventDefault();
         if (selectionRef.current.kind === 'character') {
           handleDuplicateCharacter(selectionRef.current.instanceId);
+        } else if (selectionRef.current.kind === 'group') {
+          handleDuplicateGroup(selectionRef.current.groupId);
         }
         return;
       }
@@ -1839,6 +1956,35 @@ export function StudioWorkspace() {
             props: (s.props ?? []).filter((p) => p.id !== propId),
           }));
           setSelection({ kind: 'none' });
+        } else if (selectionRef.current.kind === 'group') {
+          handleUngroupGroup(selectionRef.current.groupId);
+        } else if (selectionRef.current.kind === 'light') {
+          const lightId = selectionRef.current.lightId;
+          if ((sceneRef.current.lights ?? []).length > 1) {
+            commitSceneMutation('Remove Light', (s) => ({
+              ...s,
+              lights: (s.lights ?? []).filter((l) => l.id !== lightId),
+            }));
+            setSelection({ kind: 'none' });
+          }
+        } else if (selectionRef.current.kind === 'audio-clip') {
+          const clipId = selectionRef.current.clipId;
+          commitSceneMutation('Delete Audio Clip', (s) => ({
+            ...s,
+            audioClips: s.audioClips.filter((c) => c.id !== clipId),
+          }));
+          setSelection({ kind: 'none' });
+        } else if (selectionRef.current.kind === 'action-clip') {
+          const { instanceId, clipId } = selectionRef.current;
+          commitSceneMutation('Delete Action Clip', (s) => ({
+            ...s,
+            characters: s.characters.map((c) =>
+              c.id === instanceId
+                ? { ...c, actionClips: c.actionClips.filter((a) => a.id !== clipId) }
+                : c,
+            ),
+          }));
+          setSelection({ kind: 'character', instanceId });
         }
       }
     };
@@ -1852,6 +1998,7 @@ export function StudioWorkspace() {
     gizmoSpace,
     handleApplyTabPrediction,
     handleDuplicateCharacter,
+    handleDuplicateGroup,
     handleExitPoseMode,
     handleGroupSelection,
     handleKeyCamera,
@@ -2636,14 +2783,26 @@ export function StudioWorkspace() {
             setSelection({ kind: 'audio-clip', clipId: clip.id });
           }}
           onRenameAsset={(assetId, name) => {
-            setAssets((prev) =>
-              prev.map((a) => {
-                if (a.id !== assetId) return a;
-                const updated = { ...a, name };
-                void dbSaveAsset(updated);
-                return updated;
-              }),
-            );
+            const target = assets.find((a) => a.id === assetId);
+            if (!target || target.name === name) return;
+            const prevName = target.name;
+            const applyName = (val: string) => {
+              setAssets((prev) =>
+                prev.map((a) => {
+                  if (a.id !== assetId) return a;
+                  const updated = { ...a, name: val };
+                  void dbSaveAsset(updated);
+                  return updated;
+                }),
+              );
+            };
+            applyName(name);
+            commandManagerRef.current.pushExecuted({
+              label: `Rename Asset (${name})`,
+              execute: () => applyName(name),
+              undo: () => applyName(prevName),
+            });
+            setHistoryVersion((v) => v + 1);
           }}
           onDeleteAsset={(assetId) => {
             const target = assets.find((a) => a.id === assetId);
@@ -2737,6 +2896,10 @@ export function StudioWorkspace() {
           }}
           onGroupSelection={handleGroupSelection}
           onUngroupGroup={handleUngroupGroup}
+          onDuplicateGroup={handleDuplicateGroup}
+          onRenameGroup={handleRenameGroup}
+          onSelectGroupMembers={handleSelectGroupMembers}
+          onEnterPoseMode={handleEnterPoseMode}
           onToggleGroupVisibility={(groupId) =>
             commitSceneMutation('Toggle Group Visibility', (s) => ({
               ...s,
@@ -3003,9 +3166,26 @@ export function StudioWorkspace() {
               'Update Character Transform',
               (s) => ({
                 ...s,
-                characters: s.characters.map((c) =>
-                  c.id === instanceId ? { ...c, transform: cloneTransform(transform) } : c,
-                ),
+                characters: s.characters.map((c) => {
+                  if (c.id !== instanceId) return c;
+                  const committed = cloneTransform(transform);
+                  const syncPos = autoKeyRef.current || c.positionKeyframes.length > 0;
+                  const syncRot = autoKeyRef.current || c.rotationKeyframes.length > 0;
+                  const syncScale = autoKeyRef.current || c.scaleKeyframes.length > 0;
+                  return {
+                    ...c,
+                    transform: committed,
+                    positionKeyframes: syncPos
+                      ? upsertVec3Key(c.positionKeyframes, timeRef.current, committed.position)
+                      : c.positionKeyframes,
+                    rotationKeyframes: syncRot
+                      ? upsertVec3Key(c.rotationKeyframes, timeRef.current, committed.rotation)
+                      : c.rotationKeyframes,
+                    scaleKeyframes: syncScale
+                      ? upsertVec3Key(c.scaleKeyframes, timeRef.current, committed.scale)
+                      : c.scaleKeyframes,
+                  };
+                }),
               }),
               `xform:${instanceId}`,
             )
@@ -3313,6 +3493,7 @@ export function StudioWorkspace() {
               ),
             }));
           }}
+          onDuplicateGroup={handleDuplicateGroup}
           onUngroupGroup={handleUngroupGroup}
           onUpdateLight={(lightId, patch) =>
             commitSceneMutation(
@@ -3534,7 +3715,7 @@ export function StudioWorkspace() {
           const hit = findAdjacentKeyframeTime(allTimes, currentTime, dir);
           if (hit !== null) handleSeek(hit);
         }}
-        onChangeFps={(fps) => updateActiveProject((p) => ({ ...p, fps }))}
+        onChangeFps={(fps) => commitProjectMutation(`Change FPS (${fps})`, (p) => ({ ...p, fps }))}
         onChangePlaybackSpeed={setPlaybackSpeed}
         onToggleLoop={() => setLoopPlayback((v) => !v)}
         onToggleAutoKey={() => setAutoKey((v) => !v)}
@@ -3946,6 +4127,8 @@ export function StudioWorkspace() {
         onConfirm={() => confirmState?.onConfirm()}
         onCancel={() => setConfirmState(null)}
       />
+
+      <StudioTooltipHost />
     </div>
   );
 }

@@ -182,6 +182,72 @@ export function ungroupLogicalGroup(
   };
 }
 
+export function duplicateLogicalGroup(
+  scene: SceneData,
+  groupId: string,
+  createIdFn: (prefix: string) => string,
+  offsetX = 1.5,
+): { scene: SceneData; group: SceneGroupData | null } {
+  const srcGroup = (scene.groups ?? []).find((g) => g.id === groupId);
+  if (!srcGroup) return { scene, group: null };
+
+  const newMemberIds: string[] = [];
+  const nextChars: CharacterInstanceData[] = [...scene.characters];
+  const nextProps: ScenePropData[] = [...(scene.props ?? [])];
+
+  for (const mId of srcGroup.memberIds) {
+    const srcChar = scene.characters.find((c) => c.id === mId);
+    if (srcChar) {
+      const cloned: CharacterInstanceData = {
+        ...(JSON.parse(JSON.stringify(srcChar)) as CharacterInstanceData),
+        id: createIdFn('inst'),
+        name: `${srcChar.name} Copy`,
+      };
+      nextChars.push(cloned);
+      newMemberIds.push(cloned.id);
+      continue;
+    }
+    const srcProp = (scene.props ?? []).find((p) => p.id === mId);
+    if (srcProp) {
+      const clonedProp: ScenePropData = {
+        ...(JSON.parse(JSON.stringify(srcProp)) as ScenePropData),
+        id: createIdFn('prop'),
+        name: `${srcProp.name} Copy`,
+      };
+      nextProps.push(clonedProp);
+      newMemberIds.push(clonedProp.id);
+    }
+  }
+
+  if (newMemberIds.length === 0) return { scene, group: null };
+
+  const clonedGroup: SceneGroupData = {
+    ...(JSON.parse(JSON.stringify(srcGroup)) as SceneGroupData),
+    id: createIdFn('grp'),
+    name: `${srcGroup.name} Copy`,
+    memberIds: newMemberIds,
+    transform: {
+      position: {
+        x: srcGroup.transform.position.x + offsetX,
+        y: srcGroup.transform.position.y,
+        z: srcGroup.transform.position.z,
+      },
+      rotation: { ...srcGroup.transform.rotation },
+      scale: { ...srcGroup.transform.scale },
+    },
+  };
+
+  return {
+    group: clonedGroup,
+    scene: {
+      ...scene,
+      characters: nextChars,
+      props: nextProps,
+      groups: [...(scene.groups ?? []), clonedGroup],
+    },
+  };
+}
+
 export function isEffectiveVisible(scene: SceneData, memberId: string, ownVisible: boolean): boolean {
   if (!ownVisible) return false;
   const grp = findMemberGroup(scene, memberId);

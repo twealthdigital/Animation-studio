@@ -105,7 +105,9 @@ export function RigAndIkSection({
 }: RigTabProps) {
   const [poseName, setPoseName] = useState('Pose A');
   const [blendAlpha, setBlendAlpha] = useState(0.5);
-  const [slotNodeId, setSlotNodeId] = useState<string>(rigNodes[0]?.nodeId ?? '');
+  const [showAux, setShowAux] = useState(false);
+  const visibleNodes = showAux ? rigNodes : rigNodes.filter((n) => !n.isAuxiliary);
+  const [slotNodeId, setSlotNodeId] = useState<string>(visibleNodes[0]?.nodeId ?? rigNodes[0]?.nodeId ?? '');
   const [slotTarget, setSlotTarget] = useState<HumanoidSlot | ''>('');
 
   const boneMap = char.boneMap ?? {};
@@ -170,17 +172,27 @@ export function RigAndIkSection({
       {/* Body Parts Quick Picker */}
       <div className="space-y-1.5">
         <div className="flex items-center justify-between text-[11px] text-[#98a0ad]">
-          <span>Selectable Rig Parts</span>
-          <span>Click to pose in 3D</span>
+          <span>Joints ({visibleNodes.length})</span>
+          <button
+            type="button"
+            data-studio-note="Include decorative sub-parts (eyes, mouth, collars)"
+            onClick={() => setShowAux((v) => !v)}
+            className={`rounded px-1.5 py-0.5 text-[10px] ${
+              showAux ? 'bg-[#2e221b] text-[#f5a16a]' : 'text-[#6b7280] hover:text-[#e6e8ec]'
+            }`}
+          >
+            {showAux ? 'All Parts' : 'Joints Only'}
+          </button>
         </div>
         <div className="max-h-36 space-y-1 overflow-y-auto rounded border border-[#2a2e36] bg-[#14161a] p-1.5">
-          {rigNodes.length === 0 ? (
-            <div className="p-2 text-center text-[11px] text-[#6b7280]">No rig nodes exposed.</div>
+          {visibleNodes.length === 0 ? (
+            <div className="p-2 text-center text-[11px] text-[#6b7280]">No rig joints exposed.</div>
           ) : (
-            rigNodes.map((n) => (
+            visibleNodes.map((n) => (
               <button
                 key={n.nodeId}
                 type="button"
+                data-studio-note={n.description ?? `Select ${n.name} to rotate around parent socket`}
                 onClick={() => onSelectNode(n.nodeId, n.name)}
                 className="flex w-full items-center justify-between rounded px-2 py-1 text-left text-[11px] text-[#e6e8ec] hover:bg-[#252932]"
               >
@@ -271,13 +283,14 @@ export function RigAndIkSection({
         <StudioButton
           className="w-full"
           size="xs"
+          note="Mirror left and right limb rotations across the rig"
           onClick={() => {
             const mirrored = mirrorPoseRotations(evaluatedNodeRotations, boneMap);
             applyPoseRotations(mirrored);
           }}
         >
           <FlipHorizontal2 className="h-3 w-3" aria-hidden="true" />
-          <span>Mirror Current Pose L ↔ R @ {currentTime.toFixed(1)}s</span>
+          <span>Mirror Pose L ↔ R</span>
         </StudioButton>
 
         {savedPoses.length > 0 && (
@@ -289,12 +302,12 @@ export function RigAndIkSection({
               >
                 <span className="truncate font-medium text-[#e6e8ec]">{pose.name}</span>
                 <div className="flex items-center gap-1 shrink-0">
-                  <StudioButton size="xs" onClick={() => applyPoseRotations(pose.nodeRotations)}>
+                  <StudioButton size="xs" note="Apply saved pose at playhead" onClick={() => applyPoseRotations(pose.nodeRotations)}>
                     Apply
                   </StudioButton>
                   <StudioButton
                     size="xs"
-                    title="Blend 50% into current pose"
+                    note={`Blend ${Math.round(blendAlpha * 100)}% of "${pose.name}" into current pose`}
                     onClick={() => {
                       const blended = blendPoses(evaluatedNodeRotations, pose.nodeRotations, blendAlpha);
                       applyPoseRotations(blended);
@@ -785,10 +798,16 @@ export function BodyPartInspector({
       </div>
 
       {/* Parent Joint Lock Indicator */}
-      <div className="rounded border border-[#2a2e36] bg-[#14161a] px-2.5 py-1.5 text-[10px] text-[#98a0ad]">
-        {nodeInfo?.parentId
-          ? 'Socket locked to parent bone — rotation pivots cleanly without detaching.'
-          : 'Root joint — drag directly in viewport or adjust rotation below.'}
+      <div
+        data-studio-note={
+          nodeInfo?.parentId
+            ? 'Joint position stays locked to parent bone so limbs pivot smoothly without detaching'
+            : 'Root bone for this character rig'
+        }
+        className="flex items-center justify-between rounded border border-[#2a2e36] bg-[#14161a] px-2.5 py-1 text-[10px] text-[#98a0ad]"
+      >
+        <span>{nodeInfo?.parentId ? 'Socket-locked to parent' : 'Character root joint'}</span>
+        <span className="font-mono-code text-[#e8702a]">Drag rings or mesh</span>
       </div>
 
       {/* Smooth Drag Sliders + Precise Degree Inputs */}

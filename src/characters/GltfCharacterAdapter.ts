@@ -116,8 +116,13 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
       });
     });
 
+    const hasBones = this.rigNodes.some((n) => n.type === 'bone');
+
     // Populate childIds & auto-mapped slots
     for (const node of this.rigNodes) {
+      if (hasBones && (node.type === 'mesh' || node.type === 'skinned-mesh')) {
+        node.isAuxiliary = true;
+      }
       if (node.parentId) {
         const p = this.rigNodes.find((n) => n.nodeId === node.parentId);
         if (p) p.childIds.push(node.nodeId);
@@ -126,7 +131,10 @@ export class GltfCharacterAdapter implements ICharacterAdapter {
     const mapped = autoMapHumanoidSlots(this.rigNodes);
     for (const [slot, nId] of Object.entries(mapped)) {
       const node = this.rigNodes.find((n) => n.nodeId === nId);
-      if (node) node.slot = slot as RigNodeInfo['slot'];
+      if (node) {
+        node.slot = slot as RigNodeInfo['slot'];
+        node.isAuxiliary = false;
+      }
     }
 
     // Ground model flush at y=0

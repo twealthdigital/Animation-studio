@@ -163,6 +163,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
   private nodeBaseTransform = new Map<string, { pos: THREE.Vector3; rot: THREE.Euler }>();
   private pendingNodeRotOverrides: Record<string, Vec3> = {};
   private pendingNodePosOverrides: Record<string, Vec3> = {};
+  private previouslyOverriddenNodes = new Set<string>();
   private pendingFacial: FacialState | null = null;
   private morphMeshes: THREE.Mesh[] = [];
 
@@ -505,7 +506,8 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
     const inferSlotFromProceduralGroup = (
       obj: THREE.Object3D,
       parentSlot: HumanoidSlot | undefined,
-    ): { name: string; slot?: HumanoidSlot; description?: string } => {
+      parentName: string | undefined,
+    ): { name: string; slot?: HumanoidSlot; description?: string; isAuxiliary?: boolean } => {
       const explicitSdk = sdkSlotByObj.get(obj);
       if (explicitSdk) {
         const label = obj.name || explicitSdk;
@@ -528,6 +530,20 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       if (parentSlot === 'rightForearm') return { name: 'Right Hand', slot: 'rightHand', description: describeSlot('rightHand') };
       if (parentSlot === 'leftThigh') return { name: 'Left Shin & Foot', slot: 'leftShin', description: describeSlot('leftShin') };
       if (parentSlot === 'rightThigh') return { name: 'Right Shin & Foot', slot: 'rightShin', description: describeSlot('rightShin') };
+      if (parentSlot === 'head') {
+        if (px > 0.08 && py > 0.5 && pz > 0.3) {
+          return { name: 'Left Eye', slot: 'leftEye', description: 'Left eye & pupil', isAuxiliary: true };
+        }
+        if (px < -0.08 && py > 0.5 && pz > 0.3) {
+          return { name: 'Right Eye', slot: 'rightEye', description: 'Right eye & pupil', isAuxiliary: true };
+        }
+        if (Math.abs(px) < 0.15 && py < 0.5 && pz > 0.4) {
+          return { name: 'Mouth', description: 'Mouth, teeth & tongue assembly', isAuxiliary: true };
+        }
+      }
+      if (parentName === 'Orbit Ring' && (obj as THREE.Group).isGroup) {
+        return { name: 'Orbit Ring Spin', description: 'Spin satellite along orbital ring', isAuxiliary: true };
+      }
 
       if (obj === root) return { name: 'Character Root', slot: 'root', description: describeSlot('root') };
 
@@ -566,8 +582,8 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
           }
           if (Math.abs(px) < 0.15 && Math.abs(pz) < 0.15 && py >= 0.85 && py <= 1.03) {
             return py > 0.95
-              ? { name: 'Collar', description: 'Shirt collar mesh' }
-              : { name: 'Collar Trim', description: 'Collar accent ring' };
+              ? { name: 'Collar', description: 'Shirt collar mesh', isAuxiliary: true }
+              : { name: 'Collar Trim', description: 'Collar accent ring', isAuxiliary: true };
           }
           if (Math.abs(px) < 0.15 && Math.abs(pz) < 0.15 && py > 1.03 && py < 1.2) {
             return { name: 'Neck', slot: 'neck', description: describeSlot('neck') };
@@ -576,18 +592,18 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
             return { name: 'Hips / Pelvis', slot: 'hips', description: describeSlot('hips') };
           }
           if (pz > 0.8 && pz < 1.25) {
-            return { name: 'Face Housing', description: 'Front visor drum housing' };
+            return { name: 'Face Housing', description: 'Front visor drum housing', isAuxiliary: true };
           }
           if (pz >= 1.35) {
             return geoType.includes('Torus')
-              ? { name: 'Screen Bezel', description: 'Visor outer bezel ring' }
-              : { name: 'Visor Screen', description: 'Animated face display screen' };
+              ? { name: 'Screen Bezel', description: 'Visor outer bezel ring', isAuxiliary: true }
+              : { name: 'Visor Screen', description: 'Animated face display screen', isAuxiliary: true };
           }
           if (Math.abs(px) >= 1.35 && Math.abs(py) < 0.25) {
             const side = px > 0 ? 'Left' : 'Right';
             return Math.abs(px) > 1.6
-              ? { name: `${side} Ear Cap`, description: `${side.toLowerCase()} ear pod cap` }
-              : { name: `${side} Ear Pod`, description: `${side.toLowerCase()} audio pod` };
+              ? { name: `${side} Ear Cap`, description: `${side.toLowerCase()} ear pod cap`, isAuxiliary: true }
+              : { name: `${side} Ear Pod`, description: `${side.toLowerCase()} audio pod`, isAuxiliary: true };
           }
         }
       }
@@ -606,6 +622,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       path: string,
       parentId: string | null,
       parentSlot: HumanoidSlot | undefined,
+      parentName: string | undefined,
       depth: number,
     ) => {
       if (depth > 5) return; // keep hierarchy concise & responsive
@@ -627,7 +644,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
       }
 
       const nodeId = path;
-      const inferred = inferSlotFromProceduralGroup(obj, parentSlot);
+      const inferred = inferSlotFromProceduralGroup(obj, parentSlot, parentName);
       if (!obj.name) {
         obj.name = inferred.name;
       }
@@ -653,6 +670,7 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
         parentId,
         type: isBone ? 'bone' : isMesh ? 'mesh' : 'group',
         slot: inferred.slot,
+        isAuxiliary: inferred.isAuxiliary,
         description: inferred.description,
         materials: extractMaterialLabels(obj),
         childIds,
@@ -673,14 +691,14 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
 
       obj.children.forEach((child, idx) => {
         const childPath = `${path}.${idx}`;
-        visit(child, childPath, nodeId, inferred.slot, depth + 1);
+        visit(child, childPath, nodeId, inferred.slot, inferred.name, depth + 1);
         if (this.nodeObjectMap.has(childPath)) {
           childIds.push(childPath);
         }
       });
     };
 
-    visit(root, 'node_0', null, undefined, 0);
+    visit(root, 'node_0', null, undefined, undefined, 0);
   }
 
   getRigNodes(): RigNodeInfo[] {
@@ -720,8 +738,24 @@ export class HtmlThreeAdapter implements ICharacterAdapter {
   }
 
   applyNodeOverrides(rotations: Record<string, Vec3>, positions?: Record<string, Vec3>): void {
+    const nextPositions = positions ?? {};
+    const nextActive = new Set<string>([...Object.keys(rotations), ...Object.keys(nextPositions)]);
+
+    // Snap any previously overridden nodes back to their rest transform so smoothed HTML loops don't leave ghost poses on Undo/Reset
+    for (const prevId of this.previouslyOverriddenNodes) {
+      if (!nextActive.has(prevId)) {
+        const obj = this.nodeObjectMap.get(prevId);
+        const base = this.nodeBaseTransform.get(prevId);
+        if (obj && base) {
+          obj.rotation.copy(base.rot);
+          obj.position.copy(base.pos);
+        }
+      }
+    }
+
+    this.previouslyOverriddenNodes = nextActive;
     this.pendingNodeRotOverrides = rotations;
-    this.pendingNodePosOverrides = positions ?? {};
+    this.pendingNodePosOverrides = nextPositions;
     this.applyPendingNodeTransforms();
   }
 

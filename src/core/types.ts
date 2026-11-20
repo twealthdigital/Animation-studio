@@ -95,6 +95,7 @@ export interface RigNodeInfo {
   parentId: string | null;
   type: 'group' | 'bone' | 'mesh' | 'skinned-mesh';
   slot?: HumanoidSlot;
+  isAuxiliary?: boolean;
   description?: string;
   materials?: string[];
   childIds: string[];

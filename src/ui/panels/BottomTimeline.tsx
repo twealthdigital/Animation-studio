@@ -288,14 +288,12 @@ export function BottomTimeline({
     window.addEventListener('pointerup', onUp);
   };
 
-  const openKeyframeContextMenu = (e: React.MouseEvent, ref: KeyframeRef, time: number, label: string) => {
-    e.preventDefault();
-    e.stopPropagation();
+  const openKeyframeCtxAt = (x: number, y: number, ref: KeyframeRef, time: number, label: string) => {
     selectKeyframe(ref, false);
     const activeTargets = selectedKeySet.has(keyRefUid(ref)) && selectedKeys.length > 1 ? selectedKeys : [ref];
     setCtxMenu({
-      x: e.clientX,
-      y: e.clientY,
+      x,
+      y,
       items: [
         { label: `Jump to ${time.toFixed(2)}s`, onClick: () => onSeek(time) },
         {
@@ -331,6 +329,12 @@ export function BottomTimeline({
     });
   };
 
+  const openKeyframeContextMenu = (e: React.MouseEvent, ref: KeyframeRef, time: number, label: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openKeyframeCtxAt(e.clientX, e.clientY, ref, time, label);
+  };
+
   const renderKeyframeDiamond = (
     ref: KeyframeRef,
     time: number,
@@ -344,9 +348,23 @@ export function BottomTimeline({
       <button
         key={keyRefUid(ref)}
         type="button"
-        title={title}
+        aria-label={title}
+        data-studio-note={`${title} · Drag to retime, Shift+F10 or Right-Click for easing/delete`}
         onPointerDown={(e) => startKeyframeDrag(e, ref, time)}
         onContextMenu={(e) => openKeyframeContextMenu(e, ref, time, title)}
+        onKeyDown={(e) => {
+          if (e.shiftKey && e.key === 'F10') {
+            e.preventDefault();
+            e.stopPropagation();
+            const r = e.currentTarget.getBoundingClientRect();
+            openKeyframeCtxAt(r.left + 4, r.bottom + 4, ref, time, title);
+          } else if (e.key === 'Delete' || e.key === 'Backspace') {
+            e.preventDefault();
+            e.stopPropagation();
+            onDeleteKeyframe(ref);
+            setSelectedKeys([]);
+          }
+        }}
         style={{ left: time * pxPerSec - 5 }}
         className={`absolute ${topClass} h-2.5 w-2.5 ${shape === 'diamond' ? 'rotate-45' : 'rounded-full'} border cursor-ew-resize transition-transform ${
           isSel
@@ -613,9 +631,10 @@ export function BottomTimeline({
             <div className="flex items-center rounded border border-[#2a2e36] bg-[#14161a] p-0.5">
               <button
                 type="button"
+                data-studio-note="View stacked tracks & diamond keyframes"
                 onClick={() => setTimelineView('tracks')}
                 className={`flex h-5 items-center gap-1 rounded px-2 text-[10px] font-medium ${
-                  timelineView === 'tracks' ? 'bg-[#262a33] text-[#e6e8ec]' : 'text-[#98a0ad]'
+                  timelineView === 'tracks' ? 'bg-[#2a2f3a] text-[#ffffff] font-semibold' : 'text-[#98a0ad] hover:text-[#e6e8ec]'
                 }`}
               >
                 <Layers className="h-3 w-3" aria-hidden="true" />
@@ -623,9 +642,10 @@ export function BottomTimeline({
               </button>
               <button
                 type="button"
+                data-studio-note="Edit motion speed & interpolation curves directly"
                 onClick={() => setTimelineView('graph')}
                 className={`flex h-5 items-center gap-1 rounded px-2 text-[10px] font-medium ${
-                  timelineView === 'graph' ? 'bg-[#e8702a] text-[#121316] font-semibold' : 'text-[#98a0ad]'
+                  timelineView === 'graph' ? 'bg-[#e8702a] text-[#121316] font-semibold' : 'text-[#98a0ad] hover:text-[#e6e8ec]'
                 }`}
               >
                 <Activity className="h-3 w-3" aria-hidden="true" />
@@ -636,21 +656,22 @@ export function BottomTimeline({
 
           {collapseState === 'expanded' && studioMode === 'advanced' && timelineView === 'tracks' && (
             <div className="flex items-center gap-1">
-              <StudioButton size="xs" title="Shift keyframes -0.5s" onClick={() => onBatchKeyframes('shift-left')}>
+              <StudioButton size="xs" note="Shift character keyframes earlier by 0.5s" onClick={() => onBatchKeyframes('shift-left')}>
                 -0.5s
               </StudioButton>
-              <StudioButton size="xs" title="Shift keyframes +0.5s" onClick={() => onBatchKeyframes('shift-right')}>
+              <StudioButton size="xs" note="Shift character keyframes later by 0.5s" onClick={() => onBatchKeyframes('shift-right')}>
                 +0.5s
               </StudioButton>
-              <StudioButton size="xs" title="Stretch timing 1.5x" onClick={() => onBatchKeyframes('stretch-double')}>
+              <StudioButton size="xs" note="Scale character keyframe timing by 1.5x" onClick={() => onBatchKeyframes('stretch-double')}>
                 1.5x
               </StudioButton>
-              <StudioButton size="xs" title="Reverse selected character keys" onClick={() => onBatchKeyframes('reverse')}>
+              <StudioButton size="xs" note="Reverse keyframe timing order" onClick={() => onBatchKeyframes('reverse')}>
                 Rev
               </StudioButton>
               <StudioButton
                 size="xs"
                 variant={workArea?.enabled ? 'selected' : 'default'}
+                note="Restrict playback & looping to highlighted Work Area range"
                 onClick={onToggleWorkArea}
               >
                 Work
@@ -660,6 +681,7 @@ export function BottomTimeline({
 
           <select
             aria-label="Timeline FPS"
+            data-studio-note="Project timeline frame rate (FPS)"
             value={fps}
             onChange={(e) => onChangeFps(Number(e.target.value))}
             className="h-6 rounded border border-[#2e333d] bg-[#14161a] px-1 text-[10px] text-[#e6e8ec]"
@@ -671,6 +693,7 @@ export function BottomTimeline({
 
           <select
             aria-label="Playback speed"
+            data-studio-note="Preview playback speed multiplier"
             value={playbackSpeed}
             onChange={(e) => onChangePlaybackSpeed(Number(e.target.value))}
             className="h-6 rounded border border-[#2e333d] bg-[#14161a] px-1 text-[10px] text-[#e6e8ec]"

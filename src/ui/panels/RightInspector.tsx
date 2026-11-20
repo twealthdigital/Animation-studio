@@ -3,6 +3,7 @@ import {
   Bone,
   Camera,
   ChevronRight,
+  Copy,
   Group,
   Key,
   Layers,
@@ -136,6 +137,7 @@ interface RightInspectorProps {
   onKeyPropTransform: (propId: string, easing: EasingType) => void;
   onUpdateGroup: (groupId: string, patch: Partial<SceneGroupData>) => void;
   onKeyGroupTransform: (groupId: string, easing: EasingType) => void;
+  onDuplicateGroup: (groupId: string) => void;
   onUngroupGroup: (groupId: string) => void;
   onUpdateLight: (lightId: string, patch: Partial<SceneLightData>) => void;
   onKeyLightIntensity: (lightId: string) => void;
@@ -234,6 +236,7 @@ export function RightInspector({
   onKeyPropTransform,
   onUpdateGroup,
   onKeyGroupTransform,
+  onDuplicateGroup,
   onUngroupGroup,
   onUpdateLight,
   onKeyLightIntensity,
@@ -684,7 +687,7 @@ export function RightInspector({
 
         {/* Native Character Actions & Moods */}
         <div className="space-y-2.5 border-b border-[#2a2e36] pb-3">
-          <div className="font-semibold text-[#e6e8ec]">Model Native Actions &amp; Moods</div>
+          <div className="font-semibold text-[#e6e8ec]">Actions &amp; Moods</div>
           {moods.length > 0 && (
             <CustomSelect
               label="Mood"
@@ -707,22 +710,23 @@ export function RightInspector({
               />
               <div className="grid grid-cols-2 gap-1.5">
                 <NumericInput label="Spd" min={0.25} max={3} step={0.1} value={actionSpeed} onChange={setActionSpeed} />
-                <StudioButton onClick={() => onPreviewCharacterAction(char.id, activeActId, actionSpeed)}>
+                <StudioButton note="Preview native character action" onClick={() => onPreviewCharacterAction(char.id, activeActId, actionSpeed)}>
                   <Play className="h-3 w-3" aria-hidden="true" />
                   <span>Preview</span>
                 </StudioButton>
               </div>
               <StudioButton
                 className="w-full"
+                note="Place this action clip on timeline at current playhead"
                 onClick={() => onAddActionClip(char.id, activeActId, actionSpeed)}
               >
                 <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Add Action Clip @ {currentTime.toFixed(1)}s</span>
+                <span>Add Clip @ {currentTime.toFixed(1)}s</span>
               </StudioButton>
             </div>
           ) : (
             <p className="text-[11px] text-[#6b7280]">
-              No native scripts detected. Use Presets &amp; Keyframes to animate.
+              No native scripts. Use Pose Joints or Presets.
             </p>
           )}
         </div>
@@ -733,19 +737,20 @@ export function RightInspector({
         {selectedCharRigNodes.length > 0 && (
           <div className="space-y-1.5 border-t border-[#2a2e36] pt-2.5 text-[11px]">
             <div className="flex items-center justify-between font-semibold text-[#e6e8ec]">
-              <span>Object Structure</span>
+              <span>Structure</span>
               <span className="font-mono-code text-[10px] text-[#98a0ad]">
-                {selectedCharRigNodes.length} parts · {rigReport?.rigKind ?? 'rig'}
+                {selectedCharRigNodes.filter((n) => !n.isAuxiliary).length} joints · {rigReport?.rigKind ?? 'rig'}
               </span>
             </div>
             <StudioButton
               size="xs"
               className="w-full"
-              note="Enter Articulated Pose Mode to drag & rotate joints directly"
+              note="Enter Pose Mode to drag & rotate joints directly without detaching"
+              shortcut="Dbl-Click"
               onClick={() => onEnterPoseMode(char.id)}
             >
               <Bone className="h-3 w-3" aria-hidden="true" />
-              <span>Pose Joints (or Double-Click in 3D)</span>
+              <span>Pose Joints</span>
             </StudioButton>
             <div className="flex flex-wrap gap-1 pt-0.5">
               {Array.from(
@@ -1538,19 +1543,30 @@ export function RightInspector({
     const t = evaluatedGroupTransform ?? grp.transform;
     return (
       <div className="space-y-4">
-        <div className="flex items-center justify-between border-b border-[#2a2e36] pb-2">
-          <span className="flex items-center gap-1.5 font-semibold text-[#e6e8ec]">
-            <Group className="h-3.5 w-3.5 text-[#e8702a]" aria-hidden="true" />
-            <span>Group: {grp.name}</span>
+        <div className="flex items-center justify-between gap-1 border-b border-[#2a2e36] pb-2">
+          <span className="flex min-w-0 items-center gap-1.5 font-semibold text-[#e6e8ec]">
+            <Group className="h-3.5 w-3.5 shrink-0 text-[#e8702a]" aria-hidden="true" />
+            <span className="truncate">{grp.name}</span>
           </span>
-          <StudioButton
-            size="xs"
-            note="Ungroup members keeping world positions (Ctrl+Shift+G)"
-            onClick={() => onUngroupGroup(grp.id)}
-          >
-            <Ungroup className="h-3 w-3" aria-hidden="true" />
-            <span>Ungroup</span>
-          </StudioButton>
+          <div className="flex items-center gap-1 shrink-0">
+            <IconButton
+              label="Duplicate Group"
+              note="Clone group & all members"
+              shortcut="Ctrl+D"
+              onClick={() => onDuplicateGroup(grp.id)}
+            >
+              <Copy className="h-3.5 w-3.5" aria-hidden="true" />
+            </IconButton>
+            <StudioButton
+              size="xs"
+              note="Ungroup members keeping world positions"
+              shortcut="Ctrl+Shift+G"
+              onClick={() => onUngroupGroup(grp.id)}
+            >
+              <Ungroup className="h-3 w-3" aria-hidden="true" />
+              <span>Ungroup</span>
+            </StudioButton>
+          </div>
         </div>
 
         <label className="block">
