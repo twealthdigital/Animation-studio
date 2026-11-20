@@ -155,6 +155,19 @@ export class StudioEngine {
     active: boolean;
   } | null = null;
   private snapRotateRad: number | null = null;
+  private snapTranslateStep: number | null = null;
+  private suppressNextDblClickUntilMs = 0;
+  private directObjectDrag: {
+    target: SelectionTarget;
+    obj: THREE.Object3D;
+    startClientX: number;
+    startClientY: number;
+    startObjPos: THREE.Vector3;
+    startHitPoint: THREE.Vector3;
+    dragPlane: THREE.Plane;
+    groupMemberStarts?: { obj: THREE.Object3D; startPos: THREE.Vector3 }[];
+    active: boolean;
+  } | null = null;
 
   // Damped camera focus transition state (cancelled immediately on manual Orbit/Gizmo input)
   private focusAnim: {
@@ -610,11 +623,13 @@ export class StudioEngine {
   setSnapSettings(snap: SnapSettings): void {
     if (!snap.enabled) {
       this.snapRotateRad = null;
+      this.snapTranslateStep = null;
       this.transformControls.setTranslationSnap(null);
       this.transformControls.setRotationSnap(null);
       this.transformControls.setScaleSnap(null);
     } else {
       this.snapRotateRad = (snap.rotateDegStep * Math.PI) / 180;
+      this.snapTranslateStep = snap.translateStep;
       this.transformControls.setTranslationSnap(snap.translateStep);
       this.transformControls.setRotationSnap(this.snapRotateRad);
       this.transformControls.setScaleSnap(snap.scaleStep);
@@ -1615,6 +1630,7 @@ export class StudioEngine {
       const dy = e.clientY - drag.startClientY;
       if (!drag.active && Math.hypot(dx, dy) > 3) {
         drag.active = true;
+        this.suppressNextDblClickUntilMs = performance.now() + 350;
         this.orbitControls.enabled = false;
         if (drag.axis) {
           this.activeRingAxis = drag.axis;
@@ -1686,6 +1702,64 @@ export class StudioEngine {
           this.selectionBoxHelper.update();
         }
         this.requestRender();
+      }
+      return;
+    }
+
+    // Live click-and-drag / trackpad double-click-and-drag object translation anywhere in viewport
+    if (this.directObjectDrag) {
+      const drag = this.directObjectDrag;
+      const dx = e.clientX - drag.startClientX;
+      const dy = e.clientY - drag.startClientY;
+      if (!drag.active && Math.hypot(dx, dy) > 4) {
+        drag.active = true;
+        this.suppressNextDblClickUntilMs = performance.now() + 350;
+        this.focusAnim = null;
+        this.orbitControls.enabled = false;
+      }
+      if (drag.active) {
+        this.updateRayFromEvent(e.clientX, e.clientY);
+        const intersectPt = new THREE.Vector3();
+        if (this.raycaster.ray.intersectPlane(drag.dragPlane, intersectPt)) {
+          const delta = intersectPt.sub(drag.startHitPoint);
+          if (this.axisConstraint === 'x') {
+            delta.y = 0;
+            delta.z = 0;
+          } else if (this.axisConstraint === 'y') {
+            delta.x = 0;
+            delta.z = 0;
+          } else if (this.axisConstraint === 'z') {
+            delta.x = 0;
+            delta.y = 0;
+          }
+          const nextPos = drag.startObjPos.clone().add(delta);
+          if (this.snapTranslateStep && this.snapTranslateStep > 0) {
+            const step = this.snapTranslateStep;
+            nextPos.x = Math.round(nextPos.x / step) * step;
+            nextPos.y = Math.round(nextPos.y / step) * step;
+            nextPos.z = Math.round(nextPos.z / step) * step;
+          }
+          const appliedDelta = nextPos.clone().sub(drag.startObjPos);
+          drag.obj.position.copy(nextPos);
+          if (drag.groupMemberStarts) {
+            for (const m of drag.groupMemberStarts) {
+              m.obj.position.copy(m.startPos).add(appliedDelta);
+            }
+          }
+          if (drag.target.kind === 'light') {
+            const dynLight = this.dynamicLights.get(drag.target.lightId);
+            if (dynLight) dynLight.position.copy(nextPos);
+          } else if (drag.target.kind === 'character') {
+            this.rigVisualizer.updateLivePositions(
+              this.adapters.get(drag.target.instanceId),
+              this.getActiveEditorCamera(),
+            );
+          }
+          if (this.selectionBoxHelper.visible) {
+            this.selectionBoxHelper.update();
+          }
+          this.requestRender();
+        }
       }
       return;
     }
@@ -1772,8 +1846,9 @@ export class StudioEngine {
   };
 
   private handlePointerCancel = (e: PointerEvent) => {
-    if (this.directLimbDrag) {
+    if (this.directLimbDrag || this.directObjectDrag) {
       this.directLimbDrag = null;
+      this.directObjectDrag = null;
       this.activeRingAxis = null;
       this.orbitControls.enabled = this.viewMode === 'editor';
       try {
@@ -1787,6 +1862,100 @@ export class StudioEngine {
       this.requestRender();
     }
   };
+
+  private resolveDraggableObject(target: SelectionTarget): {
+    target: SelectionTarget;
+    obj: THREE.Object3D;
+    groupMemberStarts?: { obj: THREE.Object3D; startPos: THREE.Vector3 }[];
+  } | null {
+    if (target.kind === 'character') {
+      const a = this.adapters.get(target.instanceId);
+      return a ? { target, obj: a.rootGroup } : null;
+    }
+    if (target.kind === 'body-part' && target.nodeId === 'node_0') {
+      const a = this.adapters.get(target.instanceId);
+      return a ? { target: { kind: 'character', instanceId: target.instanceId }, obj: a.rootGroup } : null;
+    }
+    if (target.kind === 'prop') {
+      const p = this.propObjects.get(target.propId);
+      return p ? { target, obj: p } : null;
+    }
+    if (target.kind === 'group') {
+      const proxy = this.groupProxies.get(target.groupId);
+      if (!proxy) return null;
+      const meta = this.groupMeta.get(target.groupId);
+      const groupMemberStarts: { obj: THREE.Object3D; startPos: THREE.Vector3 }[] = [];
+      if (meta) {
+        for (const mId of meta.memberIds) {
+          const ch = this.adapters.get(mId);
+          if (ch) groupMemberStarts.push({ obj: ch.rootGroup, startPos: ch.rootGroup.position.clone() });
+          const pr = this.propObjects.get(mId);
+          if (pr) groupMemberStarts.push({ obj: pr, startPos: pr.position.clone() });
+        }
+      }
+      return { target, obj: proxy, groupMemberStarts };
+    }
+    if (target.kind === 'light') {
+      const m = this.lightMarkers.get(target.lightId);
+      return m ? { target, obj: m } : null;
+    }
+    if (target.kind === 'camera') {
+      return { target, obj: this.sceneCameraMarker };
+    }
+    if (target.kind === 'waypoint') {
+      const w =
+        this.waypointNodes.get(`${target.instanceId}:${target.pointId}:point`) ??
+        [...this.waypointNodes.values()].find((n) => n.ownerId === target.instanceId && n.pointId === target.pointId);
+      return w ? { target, obj: w.mesh } : null;
+    }
+    return null;
+  }
+
+  private commitObjectDragTransform(target: SelectionTarget, obj: THREE.Object3D): void {
+    if (target.kind === 'character') {
+      this.callbacks.onCharacterTransformCommit(target.instanceId, {
+        position: { x: obj.position.x, y: obj.position.y, z: obj.position.z },
+        rotation: { x: obj.rotation.x, y: obj.rotation.y, z: obj.rotation.z },
+        scale: { x: obj.scale.x, y: obj.scale.y, z: obj.scale.z },
+      });
+    } else if (target.kind === 'prop') {
+      this.callbacks.onPropTransformCommit(target.propId, {
+        position: { x: obj.position.x, y: obj.position.y, z: obj.position.z },
+        rotation: { x: obj.rotation.x, y: obj.rotation.y, z: obj.rotation.z },
+        scale: { x: obj.scale.x, y: obj.scale.y, z: obj.scale.z },
+      });
+    } else if (target.kind === 'group') {
+      this.callbacks.onGroupTransformCommit?.(target.groupId, {
+        position: { x: obj.position.x, y: obj.position.y, z: obj.position.z },
+        rotation: { x: obj.rotation.x, y: obj.rotation.y, z: obj.rotation.z },
+        scale: { x: obj.scale.x, y: obj.scale.y, z: obj.scale.z },
+      });
+    } else if (target.kind === 'light') {
+      this.callbacks.onLightPositionCommit(target.lightId, {
+        x: obj.position.x,
+        y: obj.position.y,
+        z: obj.position.z,
+      });
+    } else if (target.kind === 'camera') {
+      this.sceneCamera.position.copy(obj.position);
+      this.callbacks.onCameraTransformCommit({
+        position: { x: obj.position.x, y: obj.position.y, z: obj.position.z },
+        target: { x: 0, y: 1.5, z: 0 },
+        fov: this.sceneCamera.fov,
+      });
+    } else if (target.kind === 'waypoint') {
+      const wp = obj.userData.waypoint as
+        | { ownerId: string; ownerKind: 'character' | 'prop' | 'camera'; pointId: string; kind: 'point' | 'in' | 'out' }
+        | undefined;
+      if (wp) {
+        this.callbacks.onWaypointTransformCommit(wp.ownerId, wp.ownerKind, wp.pointId, wp.kind, {
+          x: obj.position.x,
+          y: Math.max(0, obj.position.y - 0.04),
+          z: obj.position.z,
+        });
+      }
+    }
+  }
 
   private handlePointerDown = (e: PointerEvent) => {
     this.pointerDownPos = { x: e.clientX, y: e.clientY };
@@ -1896,6 +2065,36 @@ export class StudioEngine {
             // Prevent OrbitControls from stealing pointer when pressing directly on an X/Y/Z ring
             this.orbitControls.enabled = false;
           }
+          return;
+        }
+      }
+
+      // Direct click-and-drag / trackpad double-click-and-drag on any stage object
+      const objHit = this.inspectRayTarget(e.clientX, e.clientY, { preferBodyPart: false });
+      if (objHit && !objHit.locked) {
+        const resolved = this.resolveDraggableObject(objHit.target);
+        if (resolved) {
+          const cam = this.getActiveEditorCamera();
+          cam.updateMatrixWorld();
+          const camForward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
+          const dragPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(camForward, objHit.worldPoint);
+          this.directObjectDrag = {
+            target: resolved.target,
+            obj: resolved.obj,
+            startClientX: e.clientX,
+            startClientY: e.clientY,
+            startObjPos: resolved.obj.position.clone(),
+            startHitPoint: objHit.worldPoint.clone(),
+            dragPlane,
+            groupMemberStarts: resolved.groupMemberStarts,
+            active: false,
+          };
+          this.orbitControls.enabled = false;
+          try {
+            this.renderer.domElement.setPointerCapture(e.pointerId);
+          } catch {
+            // Ignore pointer capture failure in synthetic environments
+          }
         }
       }
     }
@@ -1931,6 +2130,32 @@ export class StudioEngine {
       }
       if (drag.axis) {
         this.rebuildRigVisuals();
+      }
+    }
+
+    if (this.directObjectDrag) {
+      const drag = this.directObjectDrag;
+      this.directObjectDrag = null;
+      this.orbitControls.enabled = this.viewMode === 'editor';
+      try {
+        if (this.renderer.domElement.hasPointerCapture(e.pointerId)) {
+          this.renderer.domElement.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // Ignore capture release errors
+      }
+      if (drag.active) {
+        if (
+          this.poseModeInstanceId &&
+          !(drag.target.kind === 'character' && drag.target.instanceId === this.poseModeInstanceId)
+        ) {
+          this.poseModeInstanceId = null;
+          this.callbacks.onPoseModeChange?.(null);
+        }
+        this.callbacks.onSelectTarget(drag.target, e.shiftKey);
+        this.commitObjectDragTransform(drag.target, drag.obj);
+        this.requestRender();
+        return;
       }
     }
 
@@ -1971,6 +2196,7 @@ export class StudioEngine {
 
   private handleDoubleClick = (e: MouseEvent) => {
     if (this.viewMode !== 'editor') return;
+    if (performance.now() < this.suppressNextDblClickUntilMs) return;
     const hit = this.inspectRayTarget(e.clientX, e.clientY, { preferBodyPart: true, ignoreFilter: true });
     if (!hit) return;
 
