@@ -981,10 +981,6 @@ export function StudioWorkspace() {
       nodes[0];
     setPoseModeInstanceId(instanceId);
     engineRef.current?.setPoseMode(instanceId);
-    setGizmoMode('rotate');
-    setGizmoSpace('local');
-    engineRef.current?.setGizmoMode('rotate');
-    engineRef.current?.setGizmoSpace('local');
     setInspectorCharTab('rig');
     if (preferred) {
       setSelection({
@@ -1228,7 +1224,16 @@ export function StudioWorkspace() {
     ],
   );
 
-  // Mount Three.js StudioEngine once
+  const applySceneEvaluationRef = useRef(applySceneEvaluation);
+  const buildContextMenuItemsRef = useRef(buildContextMenuItems);
+  const commitSceneMutationRef = useRef(commitSceneMutation);
+  const updateActiveProjectRef = useRef(updateActiveProject);
+  applySceneEvaluationRef.current = applySceneEvaluation;
+  buildContextMenuItemsRef.current = buildContextMenuItems;
+  commitSceneMutationRef.current = commitSceneMutation;
+  updateActiveProjectRef.current = updateActiveProject;
+
+  // Mount Three.js StudioEngine strictly once
   useEffect(() => {
     const mount = viewportMountRef.current;
     if (!mount) return;
@@ -1253,10 +1258,6 @@ export function StudioWorkspace() {
       onPoseModeChange: (instId, preferredNodeId) => {
         setPoseModeInstanceId(instId);
         if (instId) {
-          setGizmoMode('rotate');
-          setGizmoSpace('local');
-          engineRef.current?.setGizmoMode('rotate');
-          engineRef.current?.setGizmoSpace('local');
           setInspectorCharTab('rig');
           if (preferredNodeId) {
             const nodeName =
@@ -1278,7 +1279,7 @@ export function StudioWorkspace() {
         setViewportContextMenu({
           x: clientX,
           y: clientY,
-          items: buildContextMenuItems(target),
+          items: buildContextMenuItemsRef.current(target),
         });
       },
       onCharacterTransformCommit: (instanceId, nextTransform) => {
@@ -1289,7 +1290,7 @@ export function StudioWorkspace() {
         const shouldAutoKey = autoKeyRef.current;
         const tNow = timeRef.current;
 
-        commitSceneMutation(`Transform ${char.name}`, (s) => ({
+        commitSceneMutationRef.current(`Transform ${char.name}`, (s) => ({
           ...s,
           characters: s.characters.map((c) => {
             if (c.id !== instanceId) return c;
@@ -1314,7 +1315,7 @@ export function StudioWorkspace() {
       },
       onNodeTransformCommit: (instanceId, nodeId, nodeName, rotation, _pos) => {
         const tNow = timeRef.current;
-        commitSceneMutation(
+        commitSceneMutationRef.current(
           `Rotate ${nodeName}`,
           (s) => ({
             ...s,
@@ -1337,7 +1338,7 @@ export function StudioWorkspace() {
         );
       },
       onIkTargetCommit: (instanceId, chain, targetPos) => {
-        commitSceneMutation(
+        commitSceneMutationRef.current(
           `Move ${chain} IK Target`,
           (s) => ({
             ...s,
@@ -1358,7 +1359,7 @@ export function StudioWorkspace() {
       onPropTransformCommit: (propId, nextTransform) => {
         const tNow = timeRef.current;
         const shouldAutoKey = autoKeyRef.current;
-        commitSceneMutation(`Transform Prop`, (s) => ({
+        commitSceneMutationRef.current(`Transform Prop`, (s) => ({
           ...s,
           props: (s.props ?? []).map((p) => {
             if (p.id !== propId || p.locked) return p;
@@ -1385,7 +1386,7 @@ export function StudioWorkspace() {
       onGroupTransformCommit: (groupId, nextTransform) => {
         const tNow = timeRef.current;
         const shouldAutoKey = autoKeyRef.current;
-        commitSceneMutation(`Transform Group`, (s) => ({
+        commitSceneMutationRef.current(`Transform Group`, (s) => ({
           ...s,
           groups: (s.groups ?? []).map((g) => {
             if (g.id !== groupId || g.locked) return g;
@@ -1410,7 +1411,7 @@ export function StudioWorkspace() {
         }));
       },
       onLightPositionCommit: (lightId, position) => {
-        commitSceneMutation(`Move Light`, (s) => ({
+        commitSceneMutationRef.current(`Move Light`, (s) => ({
           ...s,
           lights: (s.lights ?? []).map((l) => (l.id === lightId ? { ...l, position } : l)),
         }));
@@ -1422,7 +1423,7 @@ export function StudioWorkspace() {
           target: { ...curTarget },
           fov: nextPose.fov,
         };
-        commitSceneMutation('Move Scene Camera', (s) => ({
+        commitSceneMutationRef.current('Move Scene Camera', (s) => ({
           ...s,
           camera: { ...s.camera, pose: mergedPose },
           cameras: (s.cameras ?? []).map((cam, idx) =>
@@ -1445,7 +1446,7 @@ export function StudioWorkspace() {
             return updatePointWithHandleSymmetry(pt, handleKind, rel);
           });
 
-        commitSceneMutation('Edit Path Waypoint', (s) => {
+        commitSceneMutationRef.current('Edit Path Waypoint', (s) => {
           if (ownerKind === 'prop') {
             return {
               ...s,
@@ -1479,7 +1480,7 @@ export function StudioWorkspace() {
             setCurrentTime(workStart);
             const profiles = new Map(sc.characters.map((c) => [c.id, c.audioProfile]));
             audioEngineRef.current?.startPlayback(workStart, sc.audioClips, profiles);
-            applySceneEvaluation(sc, workStart, 0);
+            applySceneEvaluationRef.current(sc, workStart, 0);
             return;
           }
           if (fullStoryRef.current) {
@@ -1489,7 +1490,7 @@ export function StudioWorkspace() {
               const nextScene = proj.scenes[curIdx + 1];
               timeRef.current = 0;
               setCurrentTime(0);
-              updateActiveProject((p) => ({ ...p, activeSceneId: nextScene.id }), false);
+              updateActiveProjectRef.current((p) => ({ ...p, activeSceneId: nextScene.id }), false);
               const profiles = new Map(nextScene.characters.map((c) => [c.id, c.audioProfile]));
               audioEngineRef.current?.startPlayback(0, nextScene.audioClips, profiles);
               return;
@@ -1500,14 +1501,14 @@ export function StudioWorkspace() {
           setIsPlaying(false);
           engineRef.current?.setPlaying(false);
           audioEngineRef.current?.stopAll();
-          applySceneEvaluation(sc, workEnd, 0);
+          applySceneEvaluationRef.current(sc, workEnd, 0);
           return;
         }
 
         timeRef.current = nextTime;
         const profiles = new Map(sc.characters.map((c) => [c.id, c.audioProfile]));
         audioEngineRef.current?.syncPlayback(nextTime, sc.audioClips, profiles);
-        applySceneEvaluation(sc, nextTime, dt);
+        applySceneEvaluationRef.current(sc, nextTime, dt);
 
         const nowMs = performance.now();
         if (nowMs - lastUiTimeSyncRef.current > 65) {
@@ -1532,7 +1533,7 @@ export function StudioWorkspace() {
       engineRef.current = null;
       audioEngineRef.current?.dispose();
     };
-  }, [applySceneEvaluation, buildContextMenuItems, commitSceneMutation, updateActiveProject]);
+  }, []);
 
   // Keep engine synced with displayedScene (handles Tab preview + Undo/Redo + character instances)
   useEffect(() => {

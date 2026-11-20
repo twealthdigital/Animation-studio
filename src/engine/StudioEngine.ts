@@ -126,6 +126,7 @@ export class StudioEngine {
   >();
   private lastHoverRayMs = 0;
   private lastHover: HoverTargetInfo | null = null;
+  private hoveredInstanceId: string | null = null;
   private hoveredNodeKey: string | null = null;
   private hoveredRingAxis: 'x' | 'y' | 'z' | null = null;
   private activeRingAxis: 'x' | 'y' | 'z' | null = null;
@@ -181,6 +182,7 @@ export class StudioEngine {
   private renderDirty = false;
   private disposed = false;
   private pointerDownPos = { x: 0, y: 0 };
+  private gizmoPointerDown = false;
 
   constructor(container: HTMLElement, callbacks: StudioEngineCallbacks) {
     this.container = container;
@@ -950,14 +952,15 @@ export class StudioEngine {
   }
 
   private rebuildRigVisuals(): void {
-    const adapter = this.lastRigInstanceId ? this.adapters.get(this.lastRigInstanceId) : undefined;
-    const lockedSet = this.lastRigInstanceId
-      ? this.lockedCharacterNodes.get(this.lastRigInstanceId) ?? new Set<string>()
+    const targetInstanceId = this.lastRigInstanceId ?? this.hoveredInstanceId;
+    const adapter = targetInstanceId ? this.adapters.get(targetInstanceId) : undefined;
+    const lockedSet = targetInstanceId
+      ? this.lockedCharacterNodes.get(targetInstanceId) ?? new Set<string>()
       : new Set<string>();
     this.rigVisualizer.rebuild(adapter, {
-      instanceId: this.lastRigInstanceId,
+      instanceId: targetInstanceId,
       poseModeInstanceId: this.poseModeInstanceId,
-      ikTargets: this.lastIkTargets,
+      ikTargets: targetInstanceId === this.lastRigInstanceId ? this.lastIkTargets : [],
       selection: this.currentSelection,
       hoveredNodeKey: this.hoveredNodeKey,
       hoveredRingAxis: this.hoveredRingAxis,
@@ -975,7 +978,22 @@ export class StudioEngine {
 
     // Allow body-part & IK interaction in Pose Mode even if toolbar gizmoMode is 'select'
     const isBodyOrIk = this.currentSelection.kind === 'body-part' || this.currentSelection.kind === 'ik-handle';
-    if (this.gizmoMode === 'select' && !isBodyOrIk) return;
+    if (this.gizmoMode === 'select' && !isBodyOrIk) {
+      if (this.currentSelection.kind === 'character') {
+        const adapter = this.adapters.get(this.currentSelection.instanceId);
+        if (adapter) {
+          this.selectionBoxHelper.setFromObject(adapter.rootGroup);
+          this.selectionBoxHelper.visible = true;
+        }
+      } else if (this.currentSelection.kind === 'prop') {
+        const propObj = this.propObjects.get(this.currentSelection.propId);
+        if (propObj) {
+          this.selectionBoxHelper.setFromObject(propObj);
+          this.selectionBoxHelper.visible = true;
+        }
+      }
+      return;
+    }
 
     this.transformControls.setSpace(this.gizmoSpace);
     const tcMode: 'translate' | 'rotate' | 'scale' =
@@ -1276,7 +1294,8 @@ export class StudioEngine {
     }
     this.restoredHoverEmissives.clear();
     this.hoverBoxHelper.visible = false;
-    if (this.hoveredNodeKey !== null || this.hoveredRingAxis !== null) {
+    if (this.hoveredInstanceId !== null || this.hoveredNodeKey !== null || this.hoveredRingAxis !== null) {
+      this.hoveredInstanceId = null;
       this.hoveredNodeKey = null;
       this.hoveredRingAxis = null;
       this.rebuildRigVisuals();
@@ -1397,8 +1416,12 @@ export class StudioEngine {
       }
     }
 
-    // 3. Visible Rig Joint Sockets
-    if (this.showRigOverlay && (allow('body-part') || this.poseModeInstanceId) && this.rigVisualizer.rigNodeHandles.size > 0) {
+    // 3. Visible Rig Joint Sockets (only pick individual sockets on hover, in Pose Mode, body-part filter, or Alt-click)
+    const canPickRigSockets =
+      Boolean(options?.preferBodyPart) ||
+      this.selectionFilter === 'body-part' ||
+      Boolean(this.poseModeInstanceId);
+    if (this.showRigOverlay && canPickRigSockets && this.rigVisualizer.rigNodeHandles.size > 0) {
       const jointHits = this.raycaster.intersectObjects([...this.rigVisualizer.rigNodeHandles.values()], false);
       if (jointHits.length > 0) {
         const nh = jointHits[0].object.userData.rigNodeHandle as
@@ -1700,10 +1723,19 @@ export class StudioEngine {
       this.hoverBoxHelper.visible = false;
     }
 
+    const nextHoveredInstanceId =
+      hit.target.kind === 'body-part' || hit.target.kind === 'character' || hit.target.kind === 'ik-handle'
+        ? hit.target.instanceId
+        : null;
     const nextNodeKey =
       hit.target.kind === 'body-part' ? `${hit.target.instanceId}:${hit.target.nodeId}` : null;
     const nextRingAxis = hit.ringAxis ?? null;
-    if (nextNodeKey !== this.hoveredNodeKey || nextRingAxis !== this.hoveredRingAxis) {
+    if (
+      nextHoveredInstanceId !== this.hoveredInstanceId ||
+      nextNodeKey !== this.hoveredNodeKey ||
+      nextRingAxis !== this.hoveredRingAxis
+    ) {
+      this.hoveredInstanceId = nextHoveredInstanceId;
       this.hoveredNodeKey = nextNodeKey;
       this.hoveredRingAxis = nextRingAxis;
       this.rebuildRigVisuals();
@@ -1758,11 +1790,13 @@ export class StudioEngine {
 
   private handlePointerDown = (e: PointerEvent) => {
     this.pointerDownPos = { x: e.clientX, y: e.clientY };
+    const activeTcAxis = (this.transformControls as unknown as { axis?: string | null }).axis;
+    this.gizmoPointerDown = Boolean(activeTcAxis);
 
     if (
       e.button === 0 &&
       this.viewMode === 'editor' &&
-      !(this.transformControls as unknown as { axis?: string | null }).axis
+      !activeTcAxis
     ) {
       const hit = this.inspectRayTarget(e.clientX, e.clientY, { preferBodyPart: true });
       const canDragRing = Boolean(hit?.ringAxis);
@@ -1900,6 +1934,10 @@ export class StudioEngine {
       }
     }
 
+    if (this.gizmoPointerDown) {
+      this.gizmoPointerDown = false;
+      return;
+    }
     if (this.transformControls.dragging || this.viewMode !== 'editor' || e.button !== 0) return;
     const dist = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y);
     if (dist > 5) return;
@@ -1937,9 +1975,27 @@ export class StudioEngine {
     if (!hit) return;
 
     if (hit.target.kind === 'body-part') {
-      this.poseModeInstanceId = hit.target.instanceId;
-      this.callbacks.onPoseModeChange?.(hit.target.instanceId, hit.target.nodeId);
-      this.callbacks.onSelectTarget(hit.target, false);
+      const charId = hit.target.instanceId;
+      let target = hit.target;
+      if (target.nodeId === 'node_0') {
+        const adapter = this.adapters.get(charId);
+        const nodes =
+          adapter && 'getRigNodes' in adapter && typeof adapter.getRigNodes === 'function'
+            ? adapter.getRigNodes()
+            : [];
+        const preferred =
+          nodes.find((n) => n.slot === 'head') ??
+          nodes.find((n) => n.slot === 'leftUpperArm') ??
+          nodes.find((n) => n.nodeId !== 'node_0' && !n.isAuxiliary) ??
+          nodes.find((n) => n.nodeId !== 'node_0') ??
+          nodes[0];
+        if (preferred) {
+          target = { kind: 'body-part', instanceId: charId, nodeId: preferred.nodeId, nodeName: preferred.name };
+        }
+      }
+      this.poseModeInstanceId = charId;
+      this.callbacks.onPoseModeChange?.(charId, target.nodeId);
+      this.callbacks.onSelectTarget(target, false);
       this.rebuildRigVisuals();
       return;
     }
@@ -1960,6 +2016,7 @@ export class StudioEngine {
         const preferred =
           nodes.find((n) => n.slot === 'head') ??
           nodes.find((n) => n.slot === 'leftUpperArm') ??
+          nodes.find((n) => n.nodeId !== 'node_0' && !n.isAuxiliary) ??
           nodes.find((n) => n.nodeId !== 'node_0') ??
           nodes[0];
         this.poseModeInstanceId = charId;
