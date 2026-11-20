@@ -1231,25 +1231,208 @@ export class StudioEngine {
     };
   }
 
-  private getDirectBreakableChildren(root: THREE.Object3D): THREE.Object3D[] {
-    let container = root;
-    let depth = 0;
-    while (depth < 6) {
-      const visibleMeshChildren = container.children.filter((ch) => {
-        if (!ch.visible || ch.userData?.__detachedHidden || ch.userData?.__isStagePropsGroup) return false;
-        return this.hasVisibleMesh(ch);
-      });
-      if (visibleMeshChildren.length >= 2) {
-        return visibleMeshChildren;
+  private cloneSingleMeshCentered(mesh: THREE.Mesh): {
+    templateGroup: THREE.Group;
+    transform: Transform3D;
+    color: string;
+  } {
+    this.clearHoverEmissivesOnly();
+    this.clearSelectionHighlight();
+
+    mesh.updateMatrixWorld(true);
+    let worldBox = new THREE.Box3();
+    if (mesh.geometry) {
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      if (mesh.geometry.boundingBox) {
+        worldBox = mesh.geometry.boundingBox.clone().applyMatrix4(mesh.matrixWorld);
       }
-      if (visibleMeshChildren.length === 1 && !(visibleMeshChildren[0] as THREE.Mesh).isMesh) {
-        container = visibleMeshChildren[0];
-        depth += 1;
-        continue;
-      }
-      return visibleMeshChildren;
     }
-    return [];
+
+    const worldCenter = new THREE.Vector3();
+    if (!worldBox.isEmpty()) {
+      worldBox.getCenter(worldCenter);
+    } else {
+      mesh.getWorldPosition(worldCenter);
+    }
+
+    const worldPos = new THREE.Vector3();
+    const worldQuat = new THREE.Quaternion();
+    const worldScale = new THREE.Vector3();
+    mesh.matrixWorld.decompose(worldPos, worldQuat, worldScale);
+
+    const safeScale = new THREE.Vector3(
+      Math.abs(worldScale.x) < 1e-4 ? 1 : worldScale.x,
+      Math.abs(worldScale.y) < 1e-4 ? 1 : worldScale.y,
+      Math.abs(worldScale.z) < 1e-4 ? 1 : worldScale.z,
+    );
+
+    const pivotMatrix = new THREE.Matrix4().compose(worldCenter, worldQuat, safeScale);
+    const invPivotMatrix = pivotMatrix.clone().invert();
+    const localMatrix = invPivotMatrix.multiply(mesh.matrixWorld.clone());
+
+    const clonedMat = Array.isArray(mesh.material)
+      ? mesh.material.map((m) => m.clone())
+      : mesh.material
+        ? mesh.material.clone()
+        : new THREE.MeshStandardMaterial({ color: 0xe8702a, roughness: 0.6 });
+    const clonedGeom = mesh.geometry ? mesh.geometry.clone() : new THREE.BoxGeometry(0.15, 0.15, 0.15);
+    clonedGeom.computeBoundingBox();
+    clonedGeom.computeBoundingSphere();
+
+    const atomicMesh = new THREE.Mesh(clonedGeom, clonedMat);
+    atomicMesh.name = mesh.name || 'Component';
+    atomicMesh.castShadow = true;
+    atomicMesh.receiveShadow = true;
+    atomicMesh.frustumCulled = false;
+
+    const locPos = new THREE.Vector3();
+    const locQuat = new THREE.Quaternion();
+    const locScale = new THREE.Vector3();
+    localMatrix.decompose(locPos, locQuat, locScale);
+    atomicMesh.position.copy(locPos);
+    atomicMesh.quaternion.copy(locQuat);
+    atomicMesh.scale.copy(locScale);
+
+    const templateGroup = new THREE.Group();
+    templateGroup.name = mesh.name || 'Basic Component';
+    templateGroup.add(atomicMesh);
+
+    const euler = new THREE.Euler().setFromQuaternion(worldQuat, 'XYZ');
+    const color = this.readPrimaryColorHex(templateGroup);
+
+    this.refreshSelectionVisuals();
+
+    return {
+      templateGroup,
+      transform: {
+        position: { x: worldCenter.x, y: worldCenter.y, z: worldCenter.z },
+        rotation: { x: euler.x, y: euler.y, z: euler.z },
+        scale: { x: safeScale.x, y: safeScale.y, z: safeScale.z },
+      },
+      color,
+    };
+  }
+
+  private isGenericObjectName(raw: string | undefined | null): boolean {
+    if (!raw) return true;
+    const t = raw.trim().toLowerCase();
+    return (
+      !t ||
+      t === 'group' ||
+      t === 'object3d' ||
+      t === 'scene' ||
+      t === 'mesh' ||
+      t === 'root' ||
+      t === 'character' ||
+      t === 'character root' ||
+      t === 'detached part' ||
+      t === 'basic component'
+    );
+  }
+
+  private collectBasicLeafMeshes(
+    root: THREE.Object3D,
+    options?: {
+      nodeMetaByObj?: Map<THREE.Object3D, { nodeId: string; name: string }>;
+      fallbackPrefix?: string;
+    },
+  ): Array<{
+    mesh: THREE.Mesh;
+    childPath: string;
+    label: string;
+    nearestNodeId?: string;
+  }> {
+    const rawItems: Array<{
+      mesh: THREE.Mesh;
+      childPath: string;
+      baseLabel: string;
+      nearestNodeId?: string;
+    }> = [];
+
+    const walk = (
+      obj: THREE.Object3D,
+      pathSegs: number[],
+      inheritedName: string,
+      inheritedNodeId?: string,
+    ) => {
+      if (
+        !obj.visible ||
+        obj.userData?.__detachedHidden === true ||
+        obj.userData?.__isStagePropsGroup === true ||
+        obj.userData?.__isSelectionHighlight === true
+      ) {
+        return;
+      }
+
+      const meta = options?.nodeMetaByObj?.get(obj);
+      const userNodeName =
+        typeof obj.userData?.rigNodeName === 'string' ? obj.userData.rigNodeName : undefined;
+      const userNodeId =
+        meta?.nodeId ??
+        (typeof obj.userData?.rigNodeId === 'string' ? obj.userData.rigNodeId : undefined);
+      const currentNodeId = userNodeId && userNodeId !== 'node_0' ? userNodeId : inheritedNodeId;
+
+      let nextName = inheritedName;
+      if (meta?.name && !this.isGenericObjectName(meta.name)) {
+        nextName = meta.name;
+      } else if (userNodeName && !this.isGenericObjectName(userNodeName)) {
+        nextName = userNodeName;
+      } else if (obj.name && !this.isGenericObjectName(obj.name)) {
+        nextName = obj.name;
+      }
+
+      const mesh = obj as THREE.Mesh;
+      if (mesh.isMesh && mesh.geometry) {
+        const posAttr = mesh.geometry.getAttribute('position');
+        if (posAttr && posAttr.count > 0) {
+          const ownLabel =
+            (meta?.name && !this.isGenericObjectName(meta.name) ? meta.name : '') ||
+            (mesh.name && !this.isGenericObjectName(mesh.name) ? mesh.name : '') ||
+            (userNodeName && !this.isGenericObjectName(userNodeName) ? userNodeName : '') ||
+            nextName ||
+            options?.fallbackPrefix ||
+            'Joint Part';
+          rawItems.push({
+            mesh,
+            childPath: pathSegs.join('/'),
+            baseLabel: ownLabel,
+            nearestNodeId: currentNodeId,
+          });
+        }
+      }
+
+      for (let i = 0; i < obj.children.length; i++) {
+        walk(obj.children[i], [...pathSegs, i], nextName, currentNodeId);
+      }
+    };
+
+    walk(root, [], options?.fallbackPrefix || '');
+
+    // Deduplicate identical labels cleanly (e.g. "Left Arm 1", "Left Arm 2")
+    const totals = new Map<string, number>();
+    for (const item of rawItems) {
+      totals.set(item.baseLabel, (totals.get(item.baseLabel) ?? 0) + 1);
+    }
+    const seen = new Map<string, number>();
+    return rawItems.map((item) => {
+      const count = totals.get(item.baseLabel) ?? 1;
+      if (count <= 1) {
+        return {
+          mesh: item.mesh,
+          childPath: item.childPath,
+          label: item.baseLabel,
+          nearestNodeId: item.nearestNodeId,
+        };
+      }
+      const nextIdx = (seen.get(item.baseLabel) ?? 0) + 1;
+      seen.set(item.baseLabel, nextIdx);
+      return {
+        mesh: item.mesh,
+        childPath: item.childPath,
+        label: `${item.baseLabel} ${nextIdx}`,
+        nearestNodeId: item.nearestNodeId,
+      };
+    });
   }
 
   extractDetachedPartsForCharacter(
@@ -1271,102 +1454,113 @@ export class StudioEngine {
     }
 
     const detachedSet = new Set(alreadyDetachedNodeIds);
-    const children = this.getDirectBreakableChildren(rootNode);
+    const leafMeshes = this.collectBasicLeafMeshes(rootNode, {
+      nodeMetaByObj: nodeNameByObj,
+      fallbackPrefix: 'Component',
+    });
+
     const parts: DetachedPartExtraction[] = [];
-    const newlyDetachedIds: string[] = [];
+    const newlyDetachedIds = new Set<string>();
 
-    children.forEach((child, idx) => {
-      const meta = nodeNameByObj.get(child);
-      const nodeId =
-        meta?.nodeId ??
-        (typeof child.userData?.rigNodeId === 'string' ? child.userData.rigNodeId : undefined);
-      if (nodeId && detachedSet.has(nodeId)) return;
-
-      const label =
-        meta?.name ||
-        (typeof child.userData?.rigNodeName === 'string' ? child.userData.rigNodeName : '') ||
-        child.name ||
-        `Part ${idx + 1}`;
-      const { templateGroup, transform, color } = this.cloneSubtreeCentered(child);
+    for (const item of leafMeshes) {
+      if (item.nearestNodeId && detachedSet.has(item.nearestNodeId)) continue;
+      const { templateGroup, transform, color } = this.cloneSingleMeshCentered(item.mesh);
       parts.push({
-        name: label,
+        name: item.label,
         transform,
         color,
-        sourceNodeId: nodeId,
+        sourceNodeId: item.nearestNodeId,
+        sourceChildPath: item.childPath,
+        detachedSource: {
+          originKind: 'character-node',
+          sourceAssetId,
+          sourceCharacterId: instanceId,
+          sourceNodeId: 'node_0',
+          sourceChildPath: item.childPath,
+          atomicLeafOnly: true,
+          sourceColor: color,
+        },
+        templateGroup,
+      });
+      if (item.nearestNodeId) newlyDetachedIds.add(item.nearestNodeId);
+    }
+
+    const allDetached = parts.length > 0;
+    return { parts, detachedNodeIds: Array.from(newlyDetachedIds), allDetached };
+  }
+
+  extractBasicPartsForBodyPart(
+    instanceId: string,
+    sourceAssetId: string,
+    nodeId: string,
+    nodeName: string,
+  ): DetachedPartExtraction[] {
+    const adapter = this.adapters.get(instanceId);
+    if (!adapter || !('getNodeObject' in adapter) || typeof adapter.getNodeObject !== 'function') {
+      return [];
+    }
+    const nodeObj = adapter.getNodeObject(nodeId);
+    if (!nodeObj || !this.hasVisibleMesh(nodeObj)) return [];
+
+    const rigNodes =
+      'getRigNodes' in adapter && typeof adapter.getRigNodes === 'function' ? adapter.getRigNodes() : [];
+    const nodeNameByObj = new Map<THREE.Object3D, { nodeId: string; name: string }>();
+    for (const rn of rigNodes) {
+      const obj = adapter.getNodeObject(rn.nodeId);
+      if (obj) nodeNameByObj.set(obj, { nodeId: rn.nodeId, name: rn.name });
+    }
+
+    const leafMeshes = this.collectBasicLeafMeshes(nodeObj, {
+      nodeMetaByObj: nodeNameByObj,
+      fallbackPrefix: nodeName || nodeObj.name || 'Component',
+    });
+
+    return leafMeshes.map((item) => {
+      const { templateGroup, transform, color } = this.cloneSingleMeshCentered(item.mesh);
+      return {
+        name: item.label,
+        transform,
+        color,
+        sourceNodeId: item.nearestNodeId ?? nodeId,
+        sourceChildPath: item.childPath,
         detachedSource: {
           originKind: 'character-node',
           sourceAssetId,
           sourceCharacterId: instanceId,
           sourceNodeId: nodeId,
-          sourceChildPath: nodeId ? undefined : `${idx}`,
+          sourceChildPath: item.childPath,
+          atomicLeafOnly: true,
           sourceColor: color,
         },
         templateGroup,
-      });
-      if (nodeId) newlyDetachedIds.push(nodeId);
+      };
     });
-
-    // Check if any visible meshes remain outside the newly extracted children
-    const allDetached = parts.length > 0 && children.length === parts.length;
-    return { parts, detachedNodeIds: newlyDetachedIds, allDetached };
-  }
-
-  extractSingleBodyPart(
-    instanceId: string,
-    sourceAssetId: string,
-    nodeId: string,
-    nodeName: string,
-  ): DetachedPartExtraction | null {
-    const adapter = this.adapters.get(instanceId);
-    if (!adapter || !('getNodeObject' in adapter) || typeof adapter.getNodeObject !== 'function') {
-      return null;
-    }
-    const nodeObj = adapter.getNodeObject(nodeId);
-    if (!nodeObj || !this.hasVisibleMesh(nodeObj)) return null;
-    const { templateGroup, transform, color } = this.cloneSubtreeCentered(nodeObj);
-    return {
-      name: nodeName || nodeObj.name || 'Detached Part',
-      transform,
-      color,
-      sourceNodeId: nodeId,
-      detachedSource: {
-        originKind: 'character-node',
-        sourceAssetId,
-        sourceCharacterId: instanceId,
-        sourceNodeId: nodeId,
-        sourceColor: color,
-      },
-      templateGroup,
-    };
   }
 
   extractSubPartsForProp(prop: ScenePropData): DetachedPartExtraction[] {
     const propObj = this.propObjects.get(prop.id);
     if (!propObj) return [];
     const content = propObj.children[0] ?? propObj;
-    const children = this.getDirectBreakableChildren(content);
-    if (children.length < 2) return [];
+    const leafMeshes = this.collectBasicLeafMeshes(content, {
+      fallbackPrefix: prop.name,
+    });
+    if (leafMeshes.length < 2) return [];
 
-    const parts: DetachedPartExtraction[] = [];
-    children.forEach((child, idx) => {
-      const label =
-        (child.name && child.name.trim()) ||
-        (typeof child.userData?.rigNodeName === 'string' && child.userData.rigNodeName) ||
-        `${prop.name} ${idx + 1}`;
-      const { templateGroup, transform, color } = this.cloneSubtreeCentered(child);
-      const childPathRel =
-        typeof child.userData?.propChildPath === 'string' && child.userData.propChildPath
-          ? child.userData.propChildPath
-          : `${idx}`;
+    return leafMeshes.map((item) => {
+      const { templateGroup, transform, color } = this.cloneSingleMeshCentered(item.mesh);
+      const childPathRel = item.childPath;
       const parentSource = prop.detachedSource;
       const combinedPath = parentSource?.sourceChildPath
-        ? `${parentSource.sourceChildPath}/${childPathRel}`
+        ? childPathRel
+          ? `${parentSource.sourceChildPath}/${childPathRel}`
+          : parentSource.sourceChildPath
         : childPathRel;
 
       const detachedSource: DetachedPartSource = parentSource
         ? {
             ...parentSource,
             sourceChildPath: combinedPath,
+            atomicLeafOnly: true,
             sourceColor: color,
           }
         : {
@@ -1374,37 +1568,37 @@ export class StudioEngine {
             sourcePropKind: prop.kind,
             sourcePropAssetId: prop.assetId,
             sourceChildPath: childPathRel,
+            atomicLeafOnly: true,
             sourceColor: prop.color,
           };
 
-      parts.push({
-        name: label,
+      return {
+        name: item.label,
         transform,
         color,
         sourceChildPath: childPathRel,
         detachedSource,
         templateGroup,
-      });
+      };
     });
-    return parts;
   }
 
   canBreakApartTarget(target: SelectionTarget): boolean {
     if (target.kind === 'group') return true;
-    if (target.kind === 'body-part') return target.nodeId !== 'node_0';
+    if (target.kind === 'body-part') return true;
     if (target.kind === 'character') {
       const adapter = this.adapters.get(target.instanceId);
       if (!adapter || !('getNodeObject' in adapter) || typeof adapter.getNodeObject !== 'function') {
         return false;
       }
       const rootNode = adapter.getNodeObject('node_0') ?? adapter.rootGroup;
-      return this.getDirectBreakableChildren(rootNode).length >= 1;
+      return this.collectBasicLeafMeshes(rootNode).length >= 1;
     }
     if (target.kind === 'prop') {
       const propObj = this.propObjects.get(target.propId);
       if (!propObj) return false;
       const content = propObj.children[0] ?? propObj;
-      return this.getDirectBreakableChildren(content).length >= 2;
+      return this.collectBasicLeafMeshes(content).length >= 2;
     }
     return false;
   }
@@ -1591,7 +1785,10 @@ export class StudioEngine {
           const wasDetached = targetObj.userData.__detachedHidden;
           targetObj.visible = true;
           delete targetObj.userData.__detachedHidden;
-          const { templateGroup } = this.cloneSubtreeCentered(targetObj);
+          const { templateGroup } =
+            src.atomicLeafOnly && (targetObj as THREE.Mesh).isMesh
+              ? this.cloneSingleMeshCentered(targetObj as THREE.Mesh)
+              : this.cloneSubtreeCentered(targetObj);
           targetObj.visible = wasVisible;
           targetObj.userData.__detachedHidden = wasDetached;
           tempAdapter?.dispose();
@@ -1614,7 +1811,10 @@ export class StudioEngine {
         const content = rebuilt.children[0] ?? rebuilt;
         const targetObj = src.sourceChildPath ? this.resolveChildByPath(content, src.sourceChildPath) : content;
         if (targetObj) {
-          const { templateGroup } = this.cloneSubtreeCentered(targetObj);
+          const { templateGroup } =
+            src.atomicLeafOnly && (targetObj as THREE.Mesh).isMesh
+              ? this.cloneSingleMeshCentered(targetObj as THREE.Mesh)
+              : this.cloneSubtreeCentered(targetObj);
           return templateGroup;
         }
       }
@@ -1999,7 +2199,7 @@ export class StudioEngine {
   }
 
   private rebuildRigVisuals(): void {
-    const targetInstanceId = this.lastRigInstanceId ?? this.hoveredInstanceId;
+    const targetInstanceId = this.hoveredInstanceId ?? this.lastRigInstanceId;
     const adapter = targetInstanceId ? this.adapters.get(targetInstanceId) : undefined;
     const lockedSet = targetInstanceId
       ? this.lockedCharacterNodes.get(targetInstanceId) ?? new Set<string>()
@@ -2469,13 +2669,20 @@ export class StudioEngine {
       }
     }
 
-    // 3. Visible Rig Joint Sockets (pick individual sockets on hover, in Pose Mode, body-part filter, or Alt-click)
+    // 3. Focused Rig Joint Sockets (only pick active/focused sockets or all sockets in explicit Pose Mode
+    // so dimmed background sockets NEVER steal clicks from the exact 3D mesh under the cursor)
     const canPickRigSockets =
-      Boolean(options?.preferBodyPart) ||
-      this.selectionFilter === 'body-part' ||
-      Boolean(this.poseModeInstanceId);
+      this.selectionFilter !== 'character' &&
+      (Boolean(options?.preferBodyPart) ||
+        this.selectionFilter === 'body-part' ||
+        Boolean(this.poseModeInstanceId));
     if (this.showRigOverlay && canPickRigSockets && this.rigVisualizer.rigNodeHandles.size > 0) {
-      const jointHits = this.raycaster.intersectObjects([...this.rigVisualizer.rigNodeHandles.values()], false);
+      const candidateSockets = [...this.rigVisualizer.rigNodeHandles.values()].filter((m) => {
+        if (this.poseModeInstanceId) return true;
+        return Boolean(m.userData?.rigNodeHandle?.isFocused);
+      });
+      const jointHits =
+        candidateSockets.length > 0 ? this.raycaster.intersectObjects(candidateSockets, false) : [];
       if (jointHits.length > 0) {
         const nh = jointHits[0].object.userData.rigNodeHandle as
           | { instanceId: string; nodeId: string; nodeName: string; description?: string; locked?: boolean }
@@ -2625,34 +2832,45 @@ export class StudioEngine {
           ? adapter.getNodeObject(rigNodeId)
           : undefined;
 
-      // Return exact body-part / tiny component / component group if hovering or in Pose Mode / body-part filter / Alt-click
-      if (
-        rigNodeId &&
-        (options?.preferBodyPart ||
-          this.selectionFilter === 'body-part' ||
-          this.poseModeInstanceId === charId)
-      ) {
-        const lockedNode = Boolean(this.lockedCharacterNodes.get(charId)?.has(rigNodeId));
-        return {
-          target: { kind: 'body-part', instanceId: charId, nodeId: rigNodeId, nodeName: rigNodeName },
-          hitMesh: nodeObj ?? hitObj,
-          worldPoint: hits[0].point,
-          title: rigNodeName,
-          description: effectiveNode?.description || `Control ${rigNodeName} • Ctrl+Shift+G to detach independently`,
-          locked: lockedNode || this.lockedObjects.has(charId),
-        };
-      }
-
+      // If this character is explicitly inside a logical SceneGroupData, keep group behavior unless drilling in
       const grpId = this.memberToGroup.get(charId);
-      if (grpId && !options?.ignoreGroups && this.currentSelection.kind !== 'character' && this.currentSelection.kind !== 'body-part') {
+      if (
+        grpId &&
+        !options?.ignoreGroups &&
+        this.poseModeInstanceId !== charId &&
+        this.selectionFilter !== 'body-part' &&
+        this.currentSelection.kind !== 'character' &&
+        this.currentSelection.kind !== 'body-part'
+      ) {
         const gMeta = this.groupMeta.get(grpId);
         return {
           target: { kind: 'group', groupId: grpId },
           hitMesh: adapter?.rootGroup ?? hitObj,
           worldPoint: hits[0].point,
           title: gMeta?.name ?? 'Group',
-          description: 'Grouped character • Ctrl+Shift+G to ungroup • Double-click to pose',
+          description: 'Grouped character • Ctrl+Shift+G to ungroup • Alt+Click to pick part',
           locked: Boolean(gMeta?.locked),
+        };
+      }
+
+      // Direct part-level picking by default! Clicking a part selects ONLY that part (never the whole character)
+      // unless the user explicitly filtered selection to whole 'character' mode.
+      const shouldPickBodyPart =
+        Boolean(rigNodeId) &&
+        (options?.preferBodyPart ||
+          this.selectionFilter !== 'character' ||
+          this.poseModeInstanceId === charId);
+      if (shouldPickBodyPart && rigNodeId) {
+        const lockedNode = Boolean(this.lockedCharacterNodes.get(charId)?.has(rigNodeId));
+        return {
+          target: { kind: 'body-part', instanceId: charId, nodeId: rigNodeId, nodeName: rigNodeName },
+          hitMesh: nodeObj ?? hitObj,
+          worldPoint: hits[0].point,
+          title: rigNodeName,
+          description:
+            effectiveNode?.description ||
+            `Part: ${rigNodeName} • Drag to rotate • G/R/S + X/Y/Z • Ctrl+Shift+G to ungroup to basic parts`,
+          locked: lockedNode || this.lockedObjects.has(charId),
         };
       }
 
@@ -2662,8 +2880,8 @@ export class StudioEngine {
         worldPoint: hits[0].point,
         title: effectiveNode ? rigNodeName : 'Character',
         description: effectiveNode
-          ? `${effectiveNode.description ?? 'Select part'} • Double-click to pick part • Ctrl+Shift+G to ungroup apart`
-          : 'Click to select • Double-click to pick parts • Ctrl+Shift+G to ungroup apart',
+          ? `${effectiveNode.description ?? 'Select part'} • Ctrl+Shift+G to ungroup to basic components`
+          : 'Click to select • Ctrl+Shift+G to ungroup to basic components',
         locked: this.lockedObjects.has(charId),
       };
     }
@@ -3327,14 +3545,13 @@ export class StudioEngine {
       }
 
       const hit = this.inspectRayTarget(e.clientX, e.clientY, {
-        preferBodyPart: e.altKey || this.selectionFilter === 'body-part' || Boolean(this.poseModeInstanceId),
+        preferBodyPart: e.altKey || this.selectionFilter !== 'character',
         ignoreGroups: e.altKey,
       });
       const canDragRing = Boolean(hit?.ringAxis);
       const canDragLimb =
         hit &&
         hit.target.kind === 'body-part' &&
-        hit.target.instanceId === this.poseModeInstanceId &&
         hit.target.nodeId !== 'node_0' &&
         (this.gizmoMode === 'select' || this.gizmoMode === 'rotate');
 
@@ -3599,7 +3816,7 @@ export class StudioEngine {
     if (dist > 5) return;
 
     const hit = this.inspectRayTarget(e.clientX, e.clientY, {
-      preferBodyPart: e.altKey || this.selectionFilter === 'body-part' || Boolean(this.poseModeInstanceId),
+      preferBodyPart: e.altKey || this.selectionFilter !== 'character',
       ignoreGroups: e.altKey,
     });
 
@@ -3638,8 +3855,21 @@ export class StudioEngine {
     });
     if (!hit) return;
 
+    // Blender-style Object <-> Part toggle on double-click:
+    // If a body part of this character is already selected, double-clicking toggles to the whole Character root
+    // so you can move/scale the full character cleanly; double-clicking again returns to Pose/Part mode.
     if (hit.target.kind === 'body-part') {
       const charId = hit.target.instanceId;
+      if (
+        this.currentSelection.kind === 'body-part' &&
+        this.currentSelection.instanceId === charId &&
+        !this.poseModeInstanceId
+      ) {
+        this.callbacks.onSelectTarget({ kind: 'character', instanceId: charId }, false);
+        this.rebuildRigVisuals();
+        return;
+      }
+
       let target = hit.target;
       if (target.nodeId === 'node_0') {
         const adapter = this.adapters.get(charId);
@@ -3665,7 +3895,6 @@ export class StudioEngine {
     }
 
     if (hit.target.kind === 'character' || hit.target.kind === 'group') {
-      // If double-clicking character (or character inside group), enter Articulated Pose Mode!
       let charId = hit.target.kind === 'character' ? hit.target.instanceId : null;
       if (!charId && hit.target.kind === 'group') {
         const meta = this.groupMeta.get(hit.target.groupId);

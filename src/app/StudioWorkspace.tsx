@@ -1271,7 +1271,7 @@ export function StudioWorkspace() {
       setMultiSelectedIds(newIds);
       setSelection({ kind: 'prop', propId: newIds[0] });
       setNoticeMessage(
-        `Ungrouped "${char.name}" into ${newProps.length} independent clickable parts.`,
+        `Ungrouped "${char.name}" into ${newProps.length} basic components/joints.`,
       );
     },
     [commitSceneMutation],
@@ -1291,52 +1291,73 @@ export function StudioWorkspace() {
       const char = sceneRef.current.characters.find((c) => c.id === instanceId);
       if (!engine || !char) return;
 
-      const extracted = engine.extractSingleBodyPart(instanceId, char.assetId, nodeId, nodeName);
-      if (!extracted) {
-        setNoticeMessage(`Could not detach "${nodeName}" (no visible mesh geometry).`);
+      const extractedParts = engine.extractBasicPartsForBodyPart(instanceId, char.assetId, nodeId, nodeName);
+      if (extractedParts.length === 0) {
+        setNoticeMessage(`Could not ungroup "${nodeName}" (no visible mesh geometry).`);
         return;
       }
 
-      const propId = createId('part');
-      engine.registerDetachedTemplate(propId, extracted.templateGroup);
-      const newProp: ScenePropData = {
-        id: propId,
-        name: extracted.name,
-        kind: 'detached-part',
-        color: extracted.color,
-        visible: true,
-        locked: false,
-        transform: cloneTransform(extracted.transform),
-        positionKeyframes: [],
-        rotationKeyframes: [],
-        scaleKeyframes: [],
-        motionPath: createDefaultMotionPath(),
-        parentAttachment: null,
-        detachedSource: extracted.detachedSource,
-      };
+      const newProps: ScenePropData[] = extractedParts.map((part) => {
+        const propId = createId('part');
+        engine.registerDetachedTemplate(propId, part.templateGroup);
+        return {
+          id: propId,
+          name: part.name,
+          kind: 'detached-part',
+          color: part.color,
+          visible: true,
+          locked: false,
+          transform: cloneTransform(part.transform),
+          positionKeyframes: [],
+          rotationKeyframes: [],
+          scaleKeyframes: [],
+          motionPath: createDefaultMotionPath(),
+          parentAttachment: null,
+          detachedSource: part.detachedSource,
+        };
+      });
 
-      commitSceneMutation(`Detach ${newProp.name}`, (s) => ({
-        ...s,
-        props: [...(s.props ?? []), newProp],
-        characters: s.characters.map((c) => {
-          if (c.id !== instanceId) return c;
-          const nextDetached = Array.from(new Set([...(c.detachedNodes ?? []), nodeId]));
-          const nextNodeGroups = (c.nodeGroups ?? [])
-            .map((g) => ({
-              ...g,
-              memberNodeIds: g.memberNodeIds.filter((id) => id !== nodeId),
-            }))
-            .filter((g) => g.memberNodeIds.length > 0);
-          return { ...c, detachedNodes: nextDetached, nodeGroups: nextNodeGroups };
+      const detachedNodeIdsToAdd = new Set<string>([nodeId]);
+      for (const part of extractedParts) {
+        if (part.sourceNodeId && part.sourceNodeId !== 'node_0') {
+          detachedNodeIdsToAdd.add(part.sourceNodeId);
+        }
+      }
+
+      commitSceneMutation(
+        newProps.length > 1
+          ? `Ungroup ${nodeName} (${newProps.length} basic components)`
+          : `Detach ${newProps[0].name}`,
+        (s) => ({
+          ...s,
+          props: [...(s.props ?? []), ...newProps],
+          characters: s.characters.map((c) => {
+            if (c.id !== instanceId) return c;
+            const nextDetached = Array.from(
+              new Set([...(c.detachedNodes ?? []), ...detachedNodeIdsToAdd]),
+            );
+            const nextNodeGroups = (c.nodeGroups ?? [])
+              .map((g) => ({
+                ...g,
+                memberNodeIds: g.memberNodeIds.filter((id) => !detachedNodeIdsToAdd.has(id)),
+              }))
+              .filter((g) => g.memberNodeIds.length > 0);
+            return { ...c, detachedNodes: nextDetached, nodeGroups: nextNodeGroups };
+          }),
         }),
-      }));
+      );
 
       setPoseModeInstanceId(null);
       engine.setPoseMode(null);
       setMultiSelectedNodes([]);
-      setMultiSelectedIds([propId]);
-      setSelection({ kind: 'prop', propId });
-      setNoticeMessage(`Detached "${newProp.name}" into an independent clickable object.`);
+      const newIds = newProps.map((p) => p.id);
+      setMultiSelectedIds(newIds);
+      setSelection({ kind: 'prop', propId: newIds[0] });
+      setNoticeMessage(
+        newProps.length > 1
+          ? `Ungrouped "${nodeName}" into ${newProps.length} basic components/joints.`
+          : `Detached "${newProps[0].name}" as an independent clickable object.`,
+      );
     },
     [commitSceneMutation, handleBreakApartCharacter, handleUngroupNodeGroup],
   );
@@ -1353,7 +1374,7 @@ export function StudioWorkspace() {
           handleDetachPropAttachment(propId);
           return;
         }
-        setNoticeMessage(`"${prop.name}" is already separated down to its smallest piece.`);
+        setNoticeMessage(`"${prop.name}" is already a single basic component.`);
         return;
       }
 
@@ -1378,7 +1399,7 @@ export function StudioWorkspace() {
         };
       });
 
-      commitSceneMutation(`Ungroup ${prop.name} (${newProps.length} pieces)`, (s) => ({
+      commitSceneMutation(`Ungroup ${prop.name} (${newProps.length} basic components)`, (s) => ({
         ...s,
         props: [...(s.props ?? []).filter((p) => p.id !== propId), ...newProps],
         groups: (s.groups ?? [])
@@ -1391,7 +1412,7 @@ export function StudioWorkspace() {
       setMultiSelectedIds(newIds);
       setSelection({ kind: 'prop', propId: newIds[0] });
       setNoticeMessage(
-        `Separated "${prop.name}" into ${newProps.length} independent clickable pieces.`,
+        `Ungrouped "${prop.name}" into ${newProps.length} basic components.`,
       );
     },
     [commitSceneMutation, handleDetachPropAttachment],
@@ -2452,6 +2473,12 @@ export function StudioWorkspace() {
           handleExitPoseMode();
           return;
         }
+        if (selectionRef.current.kind !== 'none') {
+          setMultiSelectedIds([]);
+          setMultiSelectedNodes([]);
+          setSelection({ kind: 'none' });
+          return;
+        }
         return;
       }
 
@@ -2543,15 +2570,83 @@ export function StudioWorkspace() {
       if (e.code === 'Space') {
         e.preventDefault();
         handleTogglePlay();
-      } else if (lower === 'q') {
+      } else if (lower === 'a' && !mod) {
+        e.preventDefault();
+        if (e.altKey) {
+          // Blender Alt+A: Deselect All
+          setMultiSelectedIds([]);
+          setMultiSelectedNodes([]);
+          setSelection({ kind: 'none' });
+          setNoticeMessage('Deselected all.');
+        } else {
+          // Blender A: Select All visible stage objects
+          const allIds = [
+            ...sceneRef.current.characters.filter((c) => c.visible).map((c) => c.id),
+            ...(sceneRef.current.props ?? []).filter((p) => p.visible).map((p) => p.id),
+          ];
+          if (allIds.length > 0) {
+            setMultiSelectedIds(allIds);
+            setMultiSelectedNodes([]);
+            const firstChar = sceneRef.current.characters.find((c) => c.id === allIds[0]);
+            if (firstChar) setSelection({ kind: 'character', instanceId: firstChar.id });
+            else setSelection({ kind: 'prop', propId: allIds[0] });
+            setNoticeMessage(`Selected all ${allIds.length} stage objects (Alt+A to deselect).`);
+          }
+        }
+      } else if (lower === 'q' && !mod) {
         setGizmoMode('select');
         engineRef.current?.setGizmoMode('select');
       } else if (lower === 'b' && !mod) {
         setGizmoMode('box-select');
         engineRef.current?.setGizmoMode('box-select');
-      } else if (lower === 'h' && !mod) {
+      } else if (lower === 'o' && !mod) {
         setGizmoMode('orbit');
         engineRef.current?.setGizmoMode('orbit');
+      } else if (lower === 'h' && !mod) {
+        e.preventDefault();
+        if (e.altKey) {
+          // Blender Alt+H: Unhide All hidden objects & body parts
+          commitSceneMutation('Unhide All', (s) => ({
+            ...s,
+            characters: s.characters.map((c) => ({ ...c, visible: true, hiddenNodes: [] })),
+            props: (s.props ?? []).map((p) => ({ ...p, visible: true })),
+            lights: (s.lights ?? []).map((l) => ({ ...l, visible: true })),
+          }));
+          setNoticeMessage('Unhid all objects & parts.');
+        } else {
+          // Blender H: Hide selected part or object
+          const curSel = selectionRef.current;
+          if (curSel.kind === 'body-part' && curSel.nodeId !== 'node_0') {
+            commitSceneMutation(`Hide ${curSel.nodeName}`, (s) => ({
+              ...s,
+              characters: s.characters.map((c) =>
+                c.id === curSel.instanceId
+                  ? { ...c, hiddenNodes: Array.from(new Set([...(c.hiddenNodes ?? []), curSel.nodeId])) }
+                  : c,
+              ),
+            }));
+            setSelection({ kind: 'none' });
+            setNoticeMessage(`Hid "${curSel.nodeName}" (Alt+H to unhide all).`);
+          } else if (curSel.kind === 'character') {
+            commitSceneMutation('Hide Character', (s) => ({
+              ...s,
+              characters: s.characters.map((c) =>
+                c.id === curSel.instanceId ? { ...c, visible: false } : c,
+              ),
+            }));
+            setSelection({ kind: 'none' });
+            setNoticeMessage('Hid character (Alt+H to unhide all).');
+          } else if (curSel.kind === 'prop') {
+            commitSceneMutation('Hide Object', (s) => ({
+              ...s,
+              props: (s.props ?? []).map((p) =>
+                p.id === curSel.propId ? { ...p, visible: false } : p,
+              ),
+            }));
+            setSelection({ kind: 'none' });
+            setNoticeMessage('Hid object (Alt+H to unhide all).');
+          }
+        }
       } else if (lower === 'g' && !mod) {
         setGizmoMode('translate');
         engineRef.current?.setGizmoMode('translate');
@@ -2561,14 +2656,28 @@ export function StudioWorkspace() {
       } else if (lower === 's' && !mod) {
         setGizmoMode('scale');
         engineRef.current?.setGizmoMode('scale');
-      } else if (lower === 'l') {
+      } else if ((lower === 'x' || lower === 'y' || lower === 'z') && !mod && !e.altKey && !e.shiftKey) {
+        // Blender-style quick X / Y / Z axis lock toggle during Move / Rotate / Scale
+        if (gizmoMode === 'translate' || gizmoMode === 'rotate' || gizmoMode === 'scale') {
+          const targetAxis = lower as AxisConstraint;
+          const nextAxis: AxisConstraint = axisConstraint === targetAxis ? 'all' : targetAxis;
+          setAxisConstraint(nextAxis);
+          engineRef.current?.setAxisConstraint(nextAxis);
+          setNoticeMessage(
+            nextAxis === 'all' ? 'Axis Lock: Free (All Axes)' : `Axis Lock: ${nextAxis.toUpperCase()} Axis`,
+          );
+        }
+      } else if (lower === 'l' && !mod) {
         const nextSpace: GizmoSpace = gizmoSpace === 'world' ? 'local' : 'world';
         setGizmoSpace(nextSpace);
         engineRef.current?.setGizmoSpace(nextSpace);
-      } else if (lower === 'f') {
+      } else if (lower === 'f' || e.code === 'NumpadDecimal') {
         e.preventDefault();
         if (e.shiftKey) engineRef.current?.frameAll();
         else engineRef.current?.focusOnTarget();
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        engineRef.current?.frameAll();
       } else if (e.key === '+' || e.key === '=' || e.code === 'NumpadAdd') {
         e.preventDefault();
         engineRef.current?.zoomIn();
@@ -2631,8 +2740,10 @@ export function StudioWorkspace() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [
     activeTabPrediction,
+    axisConstraint,
     buildContextMenuItems,
     commitSceneMutation,
+    gizmoMode,
     gizmoSpace,
     handleApplyTabPrediction,
     handleBreakApartCharacter,

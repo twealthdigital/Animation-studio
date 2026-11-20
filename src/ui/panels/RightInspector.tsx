@@ -807,12 +807,12 @@ export function RightInspector({
                 <StudioButton
                   size="xs"
                   className="w-full"
-                  note="Ungroup character into independent clickable parts that are no longer attached to the source"
+                  note="Ungroup entire character all the way down to basic components & joints"
                   shortcut="Ctrl+Shift+G"
                   onClick={() => onBreakApartCharacter(char.id)}
                 >
                   <Ungroup className="h-3 w-3" aria-hidden="true" />
-                  <span>Ungroup / Break Apart</span>
+                  <span>Ungroup to Basic Parts</span>
                 </StudioButton>
               )}
             </div>
@@ -1078,11 +1078,11 @@ export function RightInspector({
                 size="xs"
                 className="w-full"
                 shortcut="Ctrl+Shift+G"
-                note="Ungroup into smaller independent clickable pieces with separate properties"
+                note="Ungroup entire object all the way down to basic clickable components"
                 onClick={() => onBreakApartProp(prop.id)}
               >
                 <Ungroup className="h-3 w-3" aria-hidden="true" />
-                <span>Ungroup / Separate Pieces</span>
+                <span>Ungroup to Basic Parts</span>
               </StudioButton>
             )}
             {prop.parentAttachment && onDetachPropAttachment && (

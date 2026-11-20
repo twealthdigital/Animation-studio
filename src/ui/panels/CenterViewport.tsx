@@ -162,7 +162,7 @@ export function CenterViewport({
         <div className="flex items-center gap-1 shrink-0">
           <IconButton
             label="Select Tool"
-            note="Pick object or part · Drag outside object to marquee highlight · Double-click character to pose"
+            note="Click any part directly to select only that part · Double-click to toggle whole character · Click outside to clear"
             shortcut="Q"
             active={gizmoMode === 'select'}
             onClick={() => onChangeGizmoMode('select')}
@@ -180,8 +180,8 @@ export function CenterViewport({
           </IconButton>
           <IconButton
             label="Camera Orbit Mouse"
-            note="Orbit camera freely with left-click drag without accidentally moving or highlighting parts"
-            shortcut="H"
+            note="Orbit camera freely with left-click drag (or use middle-mouse drag in any tool like Blender)"
+            shortcut="O"
             active={gizmoMode === 'orbit'}
             onClick={() => onChangeGizmoMode('orbit')}
           >

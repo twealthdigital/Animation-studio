@@ -899,11 +899,11 @@ export function BodyPartInspector({
             size="xs"
             className="w-full"
             shortcut="Ctrl+Shift+G"
-            note="Detach this part from the character into its own independent clickable object with separate properties"
+            note="Ungroup this part all the way down to its basic clickable components & joints"
             onClick={() => onDetachPart(char.id, nodeId, nodeName)}
           >
             <Ungroup className="h-3 w-3" aria-hidden="true" />
-            <span>Detach as Independent Object</span>
+            <span>Ungroup to Basic Parts</span>
           </StudioButton>
         </div>
       )}

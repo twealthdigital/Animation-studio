@@ -283,6 +283,8 @@ export interface DetachedPartSource {
   sourcePropAssetId?: string;
   /** Slash-separated child index path inside the source subtree (e.g. "0/2"). */
   sourceChildPath?: string;
+  /** When true, reconstruct ONLY this leaf mesh's own geometry without child meshes. */
+  atomicLeafOnly?: boolean;
   sourceColor?: string;
 }
 
