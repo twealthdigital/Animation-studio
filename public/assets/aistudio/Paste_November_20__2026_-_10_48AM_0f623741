@@ -1,0 +1,984 @@
+# STAGECRAFT 3D — ADVANCED STUDIO COMPLETION & INTELLIGENT ANIMATION ENGINE
+
+## MASTER DEVELOPMENT DIRECTIVE
+
+You are continuing development of an existing application called **Stagecraft 3D Studio**.
+
+You already have the complete existing project, including its source code, architecture, documentation, character importing systems, 3D engine, animation engine, audio engine, timeline, UI components, storage systems and existing implementations.
+
+**YOUR JOB IS TO CONTINUE DEVELOPING THE EXISTING APPLICATION. DO NOT REBUILD IT FROM SCRATCH.**
+
+This is not a request to create another UI mockup, prototype or simplified demonstration.
+
+You must turn the existing Stagecraft project into a highly interactive, intelligent, professional 3D animation and cartoon production studio.
+
+The goal is to make it powerful enough for experienced creators while remaining intuitive enough that a complete beginner can create impressive animated scenes.
+
+Do not simply add buttons that look functional. Every feature must have working underlying logic.
+
+Do not replace existing working systems unnecessarily. Inspect them, understand their architecture, improve them and extend them.
+
+---
+
+# PART 1 — FIRST, AUDIT THE EXISTING PROJECT
+
+Before writing new code:
+
+1. Inspect the entire existing source code.
+2. Read ARCHITECTURE.md, PROJECT_PLAN.md, PROGRESS.md, DECISIONS.md and IMPORT_FORMAT.md.
+3. Inspect the existing character adapters and importing pipeline.
+4. Inspect the Three.js rendering engine.
+5. Inspect the animation and timeline systems.
+6. Inspect the audio engine.
+7. Inspect the inspector, asset panel, viewport, toolbar and dialogs.
+8. Identify features that are genuinely implemented, partially implemented or only visually represented.
+9. Run the existing application and tests.
+10. Identify architectural weaknesses, broken interactions and missing functionality.
+
+Create a detailed internal implementation checklist.
+
+Update the project documentation to accurately reflect the real state of development.
+
+Preserve the existing design language and application structure.
+
+Do not spend time rebuilding features that already work.
+
+# PART 2 — ADVANCED 3D CHARACTER AND OBJECT MANIPULATION
+
+The current transformation system must evolve significantly.
+
+I do not want the application to feel like a basic 3D viewer where selecting an object only gives me arrows to move it forward, backward, sideways, upward or downward.
+
+I want a genuinely interactive 3D manipulation environment.
+
+## 2.1 Advanced transformation controls
+
+Implement:
+
+- Translation.
+- Rotation.
+- Scaling.
+- Local and world transformation modes.
+- Transform gizmos.
+- Axis constraints.
+- Free movement.
+- Snapping.
+- Precision controls.
+- Numeric transform inputs.
+- Transform reset.
+- Pivot editing.
+- Object origin editing.
+- Parent-child transformations.
+- Multiple object selection.
+- Group transformations.
+- Object duplication.
+- Object alignment.
+- Object distribution.
+
+Support intuitive mouse interaction and keyboard shortcuts.
+
+The user should be able to manipulate objects directly inside the viewport and through precise inspector controls.
+
+## 2.2 Advanced 3D selection
+
+Implement selectable:
+
+- Characters.
+- Individual body parts.
+- Meshes.
+- Props.
+- Cameras.
+- Lights.
+- Scene objects.
+- Rig controls.
+- Animation handles.
+
+Allow users to select an individual part of a character without automatically selecting the entire character.
+
+Support selection highlighting, hierarchy navigation and contextual editing.
+
+# PART 3 — PROFESSIONAL CURVE-BASED MOVEMENT SYSTEM
+
+THIS IS ONE OF THE MOST IMPORTANT FEATURES.
+
+I want a proper motion-path and curve-based animation environment.
+
+A character should not be restricted to straight-line movement.
+
+The user must be able to create sophisticated movement using editable control points.
+
+## 3.1 Bézier movement paths
+
+Implement:
+
+- Cubic Bézier curves.
+- Quadratic Bézier curves.
+- Editable spline paths.
+- Catmull-Rom curves.
+- Multi-point paths.
+- Closed paths.
+- Open paths.
+- Smooth paths.
+- Sharp corners.
+- Adjustable handles.
+- Tangent controls.
+- Curve interpolation.
+- Path smoothing.
+
+When selecting a character and activating path editing, display its movement path inside the 3D viewport.
+
+The user should see the path, control points and handles.
+
+They must be able to:
+
+- Add a point.
+- Delete a point.
+- Move a point.
+- Adjust handles.
+- Change handle direction.
+- Change handle length.
+- Convert between smooth and sharp points.
+- Drag the character along the path.
+- Adjust path height and depth.
+- Preview the movement.
+- Reverse the path.
+- Adjust movement speed.
+- Adjust path timing.
+
+The path must be genuinely editable, not a decorative line.
+
+## 3.2 Individual motion points
+
+Every character or object should have its own editable movement path.
+
+Different objects should be able to follow completely different paths simultaneously.
+
+Support multiple paths for the same object where appropriate.
+
+For example:
+
+A character can walk along a curved path, while a ball follows a different curved path and a camera follows another path.
+
+These movements must be independently editable and synchronized through the timeline.
+
+## 3.3 Orientation along paths
+
+Support:
+
+- Automatic orientation along movement direction.
+- Manual rotation.
+- Banking.
+- Tilting.
+- Smooth orientation transitions.
+- Look-at targets.
+- Forward-facing constraints.
+
+A character should not rotate awkwardly when following a curved path.
+
+# PART 4 — CHARACTER BODY-PART ANIMATION AND NODE-BASED RIGGING
+
+I do not want one transformation controller for the entire character.
+
+I want individual character parts to be controllable.
+
+The animation system must support skeletal hierarchies and individual node manipulation.
+
+## 4.1 Character hierarchy
+
+Display character structures in an expandable hierarchy.
+
+Example:
+
+Character
+- Root
+- Hips
+- Spine
+- Chest
+- Neck
+- Head
+  - Jaw
+  - Left Eye
+  - Right Eye
+- Left Arm
+  - Upper Arm
+  - Forearm
+  - Hand
+- Right Arm
+  - Upper Arm
+  - Forearm
+  - Hand
+- Left Leg
+  - Thigh
+  - Shin
+  - Foot
+- Right Leg
+  - Thigh
+  - Shin
+  - Foot
+
+This is an illustrative hierarchy, not a mandatory structure for every imported character.
+
+Read the actual skeleton and mesh hierarchy when available.
+
+## 4.2 Individual node controls
+
+When a user selects the head, they should be able to animate the head independently.
+
+When they select an arm, they should be able to animate the arm independently.
+
+Implement:
+
+- Individual bone selection.
+- Bone rotation.
+- Bone translation where appropriate.
+- Bone constraints.
+- Joint limits.
+- Parent-child inheritance.
+- IK controls.
+- FK controls.
+- IK/FK switching.
+- Pose manipulation.
+- Pose saving.
+- Pose mirroring.
+- Pose copying.
+- Pose blending.
+
+Display visible bone and joint controls in the viewport.
+
+## 4.3 Inverse kinematics
+
+Implement practical IK systems for:
+
+- Arms.
+- Legs.
+- Hands.
+- Feet.
+- Look-at/head targets.
+
+For example, I should be able to grab a character's hand and move it toward a location while the arm naturally bends to follow it.
+
+Likewise, I should be able to move a foot target and have the leg respond naturally.
+
+Use stable IK algorithms such as CCD or FABRIK where appropriate.
+
+## 4.4 Rig compatibility
+
+Support:
+
+- Imported skeletal rigs.
+- Different bone naming conventions.
+- Humanoid rigs.
+- Generic rigs.
+- Basic automatic humanoid mapping.
+- Manual bone mapping.
+- Missing-bone detection.
+- Rig compatibility reports.
+
+Do not assume every imported character uses the same skeleton.
+
+# PART 5 — A REAL, VISUAL AND INTERACTIVE ANIMATION TIMELINE
+
+The timeline must become one of the strongest parts of Stagecraft.
+
+I want to visually understand exactly what is happening to every character and object over time.
+
+## 5.1 Visible keyframes
+
+Every animated property must have visible keyframes.
+
+For example:
+
+Character A
+- Position
+- Rotation
+- Scale
+- Head rotation
+- Left arm rotation
+- Right arm rotation
+- Leg movement
+- Facial expression
+- Visibility
+- Custom properties
+
+Character B
+- Position
+- Rotation
+- Scale
+- Head rotation
+- Arm movement
+
+Camera
+- Position
+- Rotation
+- Focal length
+- Target
+
+Each property should have its own track or clearly identifiable animation channel.
+
+Display keyframes as visible, selectable markers on the timeline.
+
+## 5.2 Keyframe interaction
+
+The user must be able to:
+
+- Add keyframes.
+- Delete keyframes.
+- Select keyframes.
+- Move keyframes.
+- Duplicate keyframes.
+- Copy and paste keyframes.
+- Multi-select keyframes.
+- Shift keyframes.
+- Stretch timing.
+- Reverse animation.
+- Change interpolation.
+- Adjust keyframe values.
+- Preview selected keyframes.
+- Navigate between previous and next keyframes.
+
+Support automatic keyframing and manual keyframing.
+
+When automatic keyframing is enabled, modifying an animated property at a different timeline position should create or update the appropriate keyframe.
+
+## 5.3 Animation interpolation
+
+Implement:
+
+- Linear interpolation.
+- Step interpolation.
+- Ease-in.
+- Ease-out.
+- Ease-in-out.
+- Cubic Bézier interpolation.
+- Custom interpolation curves.
+
+Different properties should be able to use different interpolation settings.
+
+## 5.4 Animation graph editor
+
+Create a dedicated graph editor.
+
+I want to see animation curves representing changes in values over time.
+
+The user should be able to:
+
+- Select a property.
+- View its curve.
+- Add control points.
+- Move control points.
+- Adjust Bézier handles.
+- Change tangents.
+- Create smooth transitions.
+- Create sudden transitions.
+- Adjust velocity and acceleration.
+- Zoom and pan.
+- Preview changes immediately.
+
+The graph editor must be connected to the actual animation engine.
+
+Changing a curve must change the resulting animation.
+
+## 5.5 Timeline usability
+
+Include:
+
+- Play and pause.
+- Stop.
+- Frame stepping.
+- Playback speed.
+- Frame rate.
+- Timeline zoom.
+- Timeline scrolling.
+- Timecode display.
+- Frame snapping.
+- Playhead dragging.
+- Loop playback.
+- Work area.
+- Scene duration.
+- Track visibility.
+- Track locking.
+- Track grouping.
+- Track collapsing.
+
+The timeline should remain usable with many characters and hundreds of keyframes.
+
+# PART 6 — SMART ANIMATION ASSISTANT
+
+Stagecraft should not simply be a manual animation tool.
+
+It should help beginners create sophisticated animation.
+
+Implement an intelligent animation assistance system.
+
+## 6.1 Motion presets
+
+Provide reusable animations such as:
+
+- Walking.
+- Running.
+- Jumping.
+- Sitting.
+- Standing.
+- Waving.
+- Dancing.
+- Talking.
+- Laughing.
+- Crying.
+- Looking around.
+- Turning.
+- Falling.
+- Picking something up.
+- Throwing something.
+- Pointing.
+- Clapping.
+- Surprised reactions.
+
+These should be actual animation presets, not buttons that trigger arbitrary movement.
+
+Where a compatible rig exists, apply the animation to the character's bones.
+
+Where compatibility is limited, explain the limitation and offer an appropriate alternative.
+
+## 6.2 Motion blending
+
+Allow users to combine and transition between animations.
+
+For example:
+
+Walking → Running → Stopping → Looking around.
+
+The transitions should be smooth and editable.
+
+## 6.3 Beginner-friendly animation creation
+
+Create a simplified animation workflow.
+
+A beginner should be able to:
+
+1. Select a character.
+2. Choose an action.
+3. Set where the action starts.
+4. Set where it ends.
+5. Adjust speed.
+6. Preview.
+7. Modify the result.
+
+The advanced timeline and graph editor should remain accessible for more detailed work.
+
+## 6.4 Intelligent movement suggestions
+
+Provide contextual assistance.
+
+Examples:
+
+- Suggesting a walking animation when a character is moved along a long path.
+- Suggesting body rotation when a character changes direction.
+- Suggesting a camera movement for a scene.
+- Detecting abrupt transitions.
+- Warning about overlapping animations.
+- Identifying missing keyframes.
+- Suggesting smoother transitions.
+
+AI integration must use a properly designed provider interface, with a functional local animation workflow that does not depend on an API being available.
+
+Do not pretend an AI feature works when no provider is connected.
+
+# PART 7 — ADVANCED FACIAL ANIMATION
+
+Support facial animation where the imported character exposes compatible morph targets, blend shapes or facial bones.
+
+Include:
+
+- Eye blinking.
+- Eye direction.
+- Eyebrow movement.
+- Mouth opening.
+- Jaw movement.
+- Smile.
+- Frown.
+- Sadness.
+- Anger.
+- Surprise.
+- Fear.
+- Custom expressions.
+
+Allow facial expressions to be keyframed independently.
+
+Provide expression presets and a facial control panel.
+
+Implement a basic procedural fallback where possible.
+
+# PART 8 — UNIVERSAL HTML AND 3D CHARACTER IMPORTING
+
+The original vision requires users to import 3D characters packaged as HTML files and immediately see them rendered in the studio.
+
+Make this import experience reliable.
+
+Improve the existing:
+
+- HtmlCharacterAnalyzer.
+- CharacterAdapter.
+- HtmlThreeAdapter.
+- HtmlIframeAdapter.
+- GltfCharacterAdapter.
+- CharacterRegistry.
+
+Support compatible HTML characters using:
+
+- Three.js.
+- GLTF/GLB assets.
+- Embedded models.
+- External asset dependencies.
+- Supported JavaScript modules.
+- Declared character metadata.
+- Exposed animation controls.
+
+Do not claim universal compatibility with arbitrary HTML applications.
+
+Instead, build a documented character compatibility system.
+
+Implement:
+
+1. Import detection.
+2. Dependency analysis.
+3. Character type detection.
+4. Model extraction where possible.
+5. Skeleton detection.
+6. Animation detection.
+7. Facial control detection.
+8. Compatibility reporting.
+9. Import error handling.
+10. Preview before adding to the scene.
+
+Support iframe-based characters as a separate rendering mode when they cannot safely be extracted into the native Three.js scene.
+
+Make their limitations explicit.
+
+Create a Stagecraft Character SDK or adapter contract so developers can make their HTML characters fully compatible with the studio.
+
+# PART 9 — INDEPENDENT CHARACTER VOICE AND AUDIO SYSTEM
+
+Every character must have its own audio configuration.
+
+This is a major requirement.
+
+For each character, provide:
+
+- Voice selection.
+- Voice provider selection.
+- Voice profile.
+- Voice pitch.
+- Voice speed.
+- Voice volume.
+- Audio input.
+- Microphone recording.
+- Dialogue assignment.
+- Audio playback.
+- Audio trimming.
+- Audio synchronization.
+- Individual mute.
+- Individual audio monitoring.
+
+Support external voice generation providers through modular integrations.
+
+Use browser speech synthesis as a fallback, not as the complete voice system.
+
+## 9.1 Dialogue editor
+
+Create a dedicated dialogue workflow.
+
+Users should be able to:
+
+- Write dialogue.
+- Assign dialogue to a character.
+- Generate speech through a connected provider.
+- Record their own voice.
+- Import audio files.
+- Preview dialogue.
+- Edit dialogue timing.
+- Split dialogue.
+- Combine dialogue.
+- Add pauses.
+- Synchronize dialogue with animation.
+
+## 9.2 Lip synchronization
+
+Implement audio-driven lip synchronization where supported.
+
+Use available phoneme or viseme data when possible.
+
+Support fallback mouth animation when detailed phoneme data is unavailable.
+
+Ensure the dialogue, audio and mouth movement remain synchronized during playback and export.
+
+# PART 10 — SCENE AND CAMERA PRODUCTION SYSTEM
+
+Develop a proper multi-scene production environment.
+
+Support:
+
+- Multiple scenes.
+- Scene duplication.
+- Scene ordering.
+- Scene transitions.
+- Scene duration.
+- Scene-specific characters.
+- Scene-specific props.
+- Scene-specific cameras.
+- Scene-specific lighting.
+- Scene thumbnails.
+
+## 10.1 Camera system
+
+Implement:
+
+- Perspective cameras.
+- Orthographic cameras.
+- Multiple cameras.
+- Camera switching.
+- Camera keyframes.
+- Camera movement paths.
+- Camera target controls.
+- Zoom.
+- Focus controls.
+- Depth of field where supported.
+- Camera framing presets.
+
+Provide cinematic camera presets such as:
+
+- Wide shot.
+- Medium shot.
+- Close-up.
+- Extreme close-up.
+- Over-the-shoulder.
+- Tracking shot.
+- Establishing shot.
+
+## 10.2 Lighting and environment
+
+Support:
+
+- Directional lights.
+- Point lights.
+- Spotlights.
+- Ambient lighting.
+- HDR environments where available.
+- Shadows.
+- Background colors.
+- Environment presets.
+
+Make lighting settings editable in the inspector.
+
+# PART 11 — PROPS, OBJECTS AND ENVIRONMENT EDITING
+
+The studio must not be limited to characters.
+
+Users should be able to import and manipulate:
+
+- Props.
+- Furniture.
+- Vehicles.
+- Buildings.
+- Environmental assets.
+- Decorative objects.
+- Custom 3D models.
+
+Support GLB, GLTF and other practical formats where feasible.
+
+Objects must support the same advanced transformation, curve movement and keyframe systems.
+
+Allow parent-child relationships.
+
+For example, a character should be able to pick up an object and move it with their hand through an appropriate attachment or constraint system.
+
+# PART 12 — SMART SCENE CREATION
+
+Introduce beginner-friendly scene creation tools.
+
+Provide:
+
+- Scene templates.
+- Environment presets.
+- Character placement assistance.
+- Camera placement assistance.
+- Lighting presets.
+- Animation presets.
+- Drag-and-drop scene construction.
+
+Allow users to build scenes from reusable elements.
+
+Create a contextual helper that suggests useful next steps based on the selected object or current editing context.
+
+Do not clutter the main interface.
+
+Keep advanced functionality organized into dedicated panels and expandable sections.
+
+# PART 13 — ADVANCED VIDEO AND AUDIO PRODUCTION
+
+Improve the existing export system.
+
+Support:
+
+- Video resolution selection.
+- Frame rate selection.
+- Aspect ratio selection.
+- Scene range export.
+- Full project export.
+- Audio mixing.
+- Dialogue mixing.
+- Background music.
+- Sound effects.
+- Audio fades.
+- Audio volume automation.
+- Export progress.
+- Export cancellation.
+- Error reporting.
+
+Support practical output formats based on browser and codec availability.
+
+Use a rendering architecture that can produce consistent frame timing rather than relying exclusively on real-time screen capture.
+
+Where a format is unsupported by the browser, communicate the limitation clearly.
+
+Test audio/video synchronization during export.
+
+# PART 14 — PROFESSIONAL EDITING EXPERIENCE
+
+Make the application genuinely interactive.
+
+Implement:
+
+- Context menus.
+- Drag-and-drop.
+- Tooltips.
+- Keyboard shortcuts.
+- Undo and redo.
+- Multi-selection.
+- Object duplication.
+- Search.
+- Command palette.
+- Adjustable panels.
+- Resizable timeline.
+- Expandable hierarchies.
+- Viewport navigation.
+- Camera presets.
+- Snap controls.
+- Selection filters.
+- Property locking.
+- Project autosave.
+- Recovery after unexpected closure.
+
+Provide contextual right-click actions.
+
+Avoid unnecessary dialogs.
+
+Whenever practical, allow editing directly in the viewport.
+
+Every visible interactive control must have a real working action.
+
+# PART 15 — BEGINNER MODE AND ADVANCED MODE
+
+This is extremely important.
+
+The studio must be powerful without being intimidating.
+
+Create two complementary working experiences.
+
+## Beginner mode
+
+A guided, simplified environment.
+
+The user should be able to:
+
+- Import a character.
+- Add props.
+- Select an action.
+- Draw a movement path.
+- Add dialogue.
+- Choose a camera.
+- Preview the scene.
+- Export a video.
+
+Provide helpful explanations and contextual tips.
+
+## Advanced mode
+
+Expose the complete professional controls:
+
+- Detailed object hierarchy.
+- Rigging.
+- Individual bone manipulation.
+- IK/FK.
+- Keyframe tracks.
+- Graph editor.
+- Bézier controls.
+- Animation layers.
+- Constraints.
+- Advanced audio editing.
+- Camera controls.
+
+Switching modes must never delete or simplify the underlying project data.
+
+Both modes must operate on the same project and animation engine.
+
+# PART 16 — TECHNICAL QUALITY AND ARCHITECTURE
+
+Maintain the existing React, TypeScript and Three.js architecture unless a change is genuinely necessary.
+
+Avoid building an enormous single component.
+
+Use modular systems.
+
+Maintain clear separation between:
+
+- Rendering.
+- Animation evaluation.
+- Character manipulation.
+- Rigging.
+- Audio.
+- Timeline.
+- Scene management.
+- Persistence.
+- UI.
+- Export.
+
+Use a unified animation data model so that viewport manipulation, timeline keyframes, graph editing and export all operate on the same underlying animation state.
+
+Do not implement separate animation logic for different interfaces.
+
+Use stable object identifiers.
+
+Prevent animation updates from causing unnecessary React re-renders.
+
+Handle cleanup of Three.js resources, event listeners, audio nodes and animation loops.
+
+Preserve project compatibility where possible.
+
+Implement migrations if existing project data structures must change.
+
+# PART 17 — TESTING AND VALIDATION
+
+Do not mark a feature complete because its interface exists.
+
+Test actual functionality.
+
+At minimum, verify these workflows:
+
+### Workflow A — Character import
+
+Import an HTML character, inspect its compatibility, add it to the viewport, manipulate it and save the project.
+
+### Workflow B — Curved movement
+
+Select a character, create a multi-point Bézier path, edit its handles, animate the character along the path and preview the result.
+
+### Workflow C — Body-part animation
+
+Select an individual arm, create rotation keyframes, animate the arm and verify the rest of the character is not unintentionally transformed.
+
+### Workflow D — IK
+
+Move a hand target and verify that the arm responds correctly where a compatible rig exists.
+
+### Workflow E — Timeline
+
+Create keyframes for position, rotation and facial expression. Move, duplicate, delete and edit them. Verify that playback reflects the changes.
+
+### Workflow F — Graph editor
+
+Change an animation curve and verify that the resulting movement changes accordingly.
+
+### Workflow G — Multiple characters
+
+Animate several characters simultaneously with independent paths, animation tracks and audio configurations.
+
+### Workflow H — Dialogue
+
+Assign different dialogue to two characters, preview the audio and verify synchronization.
+
+### Workflow I — Production
+
+Create multiple scenes, animate them, add camera movements and export a finished video.
+
+### Workflow J — Persistence
+
+Save, close and reopen a project. Verify that characters, animations, keyframes, paths, audio assignments and scenes remain intact.
+
+Add unit tests, integration tests and browser-based interaction tests wherever practical.
+
+Fix regressions before moving forward.
+
+# PART 18 — IMPLEMENTATION ORDER
+
+Work incrementally.
+
+Do not attempt to implement every feature in one giant unstructured code change.
+
+Use this order:
+
+1. Existing architecture audit and baseline tests.
+2. Advanced object transformation and selection.
+3. Curve-based motion paths.
+4. Character hierarchy and individual bone controls.
+5. IK/FK and rigging improvements.
+6. Unified animation data model.
+7. Visual keyframe timeline.
+8. Graph editor.
+9. Animation presets and blending.
+10. Facial animation.
+11. Universal HTML character import improvements.
+12. Independent character audio and voice system.
+13. Dialogue and lip synchronization.
+14. Advanced scene and camera systems.
+15. Props and environment editing.
+16. Smart scene creation.
+17. Advanced video/audio export.
+18. Beginner and advanced workflows.
+19. Performance optimization.
+20. Complete regression and end-to-end testing.
+
+You may adjust the order if technical dependencies require it, but document why.
+
+After each phase:
+
+- Implement the functionality.
+- Run relevant tests.
+- Test the actual interface.
+- Fix issues.
+- Update PROGRESS.md.
+- Record architectural decisions.
+- Preserve working functionality.
+
+Do not leave half-implemented placeholder controls.
+
+If an external service or API is required, create a proper integration interface and make the missing configuration explicit. Do not fake the integration.
+
+# FINAL PRODUCT STANDARD
+
+Stagecraft must feel like a real creative production application.
+
+I want a user to be able to import a character, grab its individual body parts, create complex curved movement, edit visible keyframes, manipulate animation graphs, assign voices, synchronize dialogue, direct multiple characters, construct scenes and produce finished cartoon videos.
+
+A beginner should be able to create impressive animations through guided workflows and presets.
+
+An experienced animator should be able to access detailed controls and refine every movement.
+
+The studio should be powerful, intuitive, responsive and genuinely interactive.
+
+**MOST IMPORTANT:**
+
+Do not mistake a visually impressive interface for a completed application.
+
+Do not create fake buttons.
+
+Do not use hardcoded animation demonstrations as substitutes for actual editing functionality.
+
+Do not remove existing features to make implementation easier.
+
+Do not rebuild the application.
+
+Continue from the existing Stagecraft 3D codebase and progressively turn it into the complete production studio described above.
+
+Start by auditing the existing project, then implement the phases in order. Keep working through the phases rather than stopping after producing a plan or completing only the interface.
+
+If you reach a context or execution limit, leave the application in a working state, update the progress documentation with exact completed and remaining tasks, and identify the precise next implementation step.

@@ -1,0 +1,6 @@
+{
+  "name": "Stagecraft 3D",
+  "description": "A modular 3D cartoon production studio for importing, staging, animating, voicing, and exporting 3D character stories.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

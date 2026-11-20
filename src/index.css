@@ -1,0 +1,96 @@
+@import "tailwindcss";
+
+:root {
+  --studio-bg: #121316;
+  --studio-panel: #191b1f;
+  --studio-elevated: #202329;
+  --studio-border: #2a2e36;
+  --studio-border-strong: #383e49;
+  --studio-text: #e6e8ec;
+  --studio-text-muted: #98a0ad;
+  --studio-text-dim: #6b7280;
+  --studio-accent: #e8702a;
+  --studio-accent-hover: #f07f3c;
+  --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--studio-bg);
+  color: var(--studio-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.font-mono-code {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom studio scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #323741 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: #323741;
+  border-radius: 3px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: #464d5b;
+}
+
+/* Custom studio range slider */
+input[type="range"].studio-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: #2a2e36;
+  outline: none;
+}
+
+input[type="range"].studio-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #e8702a;
+  cursor: pointer;
+  border: 1.5px solid #121316;
+}
+
+input[type="range"].studio-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #e8702a;
+  cursor: pointer;
+  border: 1.5px solid #121316;
+}
