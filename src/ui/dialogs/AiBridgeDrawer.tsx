@@ -85,7 +85,7 @@ export function AiBridgeDrawer({
           mcpServers: {
             'stagecraft-3d': {
               type: 'http',
-              url: `${origin}/api/ai/mcp`,
+              url: `${origin}/api/mcp`,
               headers: {
                 Authorization: `Bearer ${token}`,
               },
@@ -95,6 +95,11 @@ export function AiBridgeDrawer({
         null,
         2,
       ),
+    [origin, token],
+  );
+
+  const claudeConnectorUrl = useMemo(
+    () => `${origin}/api/mcp?token=${encodeURIComponent(token || 'YOUR_TOKEN')}`,
     [origin, token],
   );
 
@@ -236,16 +241,41 @@ export function AiBridgeDrawer({
       <div className="flex-1 overflow-y-auto p-3.5 space-y-3">
         {tab === 'connect' && (
           <>
+            {/* Claude Remote Connector URL (Built directly into this app!) */}
+            <div className="rounded border border-[#2a2e36] bg-[#14161a] p-2.5 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-[#e6e8ec]">1. Claude Remote Connector URL</span>
+                <span className="rounded bg-[#2b211a] px-1.5 py-0.5 text-[9px] font-semibold text-[#e8702a]">
+                  NO EXTRA REPO NEEDED
+                </span>
+              </div>
+              <p className="text-[11px] text-[#98a0ad]">
+                Built right into this server! In Claude (Pro/Max/Team): <strong className="text-[#e6e8ec]">Settings → Connectors → Add custom connector</strong> and paste this URL:
+              </p>
+              <div className="flex items-center gap-1.5">
+                <code className="flex-1 truncate rounded border border-[#2a2e36] bg-[#101215] px-2 py-1 font-mono-code text-[10px] text-[#e6e8ec]">
+                  {claudeConnectorUrl}
+                </code>
+                <StudioButton
+                  variant="primary"
+                  size="xs"
+                  onClick={() => void copyText('claude-url', claudeConnectorUrl)}
+                >
+                  {copiedId === 'claude-url' ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                  <span>{copiedId === 'claude-url' ? 'Copied' : 'Copy URL'}</span>
+                </StudioButton>
+              </div>
+            </div>
+
             {/* Universal Chat AI Copy */}
             <div className="rounded border border-[#2a2e36] bg-[#14161a] p-2.5 space-y-2">
               <div className="flex items-center justify-between">
-                <span className="font-semibold text-[#e6e8ec]">1. Any Chat AI (ChatGPT, Claude, Gemini)</span>
+                <span className="font-semibold text-[#e6e8ec]">2. Any Chat AI (Free Claude, ChatGPT, Gemini)</span>
               </div>
               <p className="text-[11px] text-[#98a0ad]">
-                Copies your current 3D scene JSON + instructions so any chat AI can either call the live API directly or give you JSON commands to run here.
+                Copies your current 3D scene JSON + instructions so any free chat AI can output JSON commands to paste into <strong className="text-[#e6e8ec]">Paste &amp; Run JSON</strong>.
               </p>
               <StudioButton
-                variant="primary"
                 size="xs"
                 className="w-full"
                 onClick={() =>
@@ -262,7 +292,7 @@ export function AiBridgeDrawer({
             {/* Token & Live Endpoint */}
             <div className="rounded border border-[#2a2e36] bg-[#14161a] p-2.5 space-y-2">
               <div className="flex items-center justify-between">
-                <span className="font-semibold text-[#e6e8ec]">2. Live REST API &amp; Token</span>
+                <span className="font-semibold text-[#e6e8ec]">3. Live REST API &amp; Token</span>
                 <button
                   type="button"
                   onClick={onRegenerateToken}
@@ -299,7 +329,7 @@ export function AiBridgeDrawer({
             {/* MCP Config */}
             <div className="rounded border border-[#2a2e36] bg-[#14161a] p-2.5 space-y-2">
               <div className="flex items-center justify-between">
-                <span className="font-semibold text-[#e6e8ec]">3. MCP Config (Claude / Cursor / Windsurf)</span>
+                <span className="font-semibold text-[#e6e8ec]">4. MCP Config (Claude Desktop / Cursor / Windsurf)</span>
                 <StudioButton size="xs" onClick={() => void copyText('mcp', mcpSnippet)}>
                   {copiedId === 'mcp' ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
                   <span>{copiedId === 'mcp' ? 'Copied' : 'Copy MCP'}</span>

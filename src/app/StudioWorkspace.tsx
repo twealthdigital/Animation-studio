@@ -3251,9 +3251,18 @@ export function StudioWorkspace() {
     handleTogglePlay,
   ]);
 
+  const executedBatchIdsRef = useRef<Set<string>>(new Set());
+  const lastPollMsRef = useRef<number>(0);
+
   const enqueueAiBatch = useCallback(
     (commands: AiBridgeCommand[], source = 'External AI', batchId = createId('localbatch')) => {
       if (commands.length === 0) return;
+      if (executedBatchIdsRef.current.has(batchId)) return;
+      executedBatchIdsRef.current.add(batchId);
+      if (executedBatchIdsRef.current.size > 200) {
+        const first = executedBatchIdsRef.current.values().next().value;
+        if (first) executedBatchIdsRef.current.delete(first);
+      }
       aiQueueRef.current.push({ batchId, source, commands });
       setAiQueueLength((prev) => prev + commands.length);
       void runAiQueue();
@@ -3261,16 +3270,51 @@ export function StudioWorkspace() {
     [runAiQueue],
   );
 
-  // Connect to Express SSE /api/ai/stream & fetch initial AI config
+  // Connect to SSE (/api/ai/stream) + fetch/restore persisted AI config across Vercel cold starts
   useEffect(() => {
     let active = true;
+    let savedPrefs: { enabled?: boolean; token?: string } = {};
+    try {
+      const raw = window.localStorage.getItem('stagecraft_ai_bridge_v1');
+      if (raw) savedPrefs = JSON.parse(raw) as { enabled?: boolean; token?: string };
+    } catch {
+      // Ignore storage error
+    }
+
     fetch('/api/ai/config')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (!active || !data) return;
-        setAiAccessEnabled(Boolean(data.enabled));
-        if (typeof data.token === 'string') setAiToken(data.token);
+        const effectiveEnabled =
+          typeof savedPrefs.enabled === 'boolean' ? savedPrefs.enabled : Boolean(data.enabled);
+        const effectiveToken =
+          typeof savedPrefs.token === 'string' && savedPrefs.token.trim()
+            ? savedPrefs.token.trim()
+            : typeof data.token === 'string'
+              ? data.token
+              : '';
+        setAiAccessEnabled(effectiveEnabled);
+        if (effectiveToken) setAiToken(effectiveToken);
         if (typeof data.connectedStudios === 'number') setAiConnectedStudios(data.connectedStudios);
+
+        // Re-hydrate serverless instance if client had saved live access enabled
+        if (savedPrefs.enabled || savedPrefs.token) {
+          void fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              enabled: effectiveEnabled,
+              ...(effectiveToken ? { token: effectiveToken } : {}),
+            }),
+          })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((synced) => {
+              if (active && synced && typeof synced.token === 'string') {
+                setAiToken(synced.token);
+              }
+            })
+            .catch(() => {});
+        }
       })
       .catch(() => {});
 
@@ -3278,8 +3322,10 @@ export function StudioWorkspace() {
     es.addEventListener('ai:connected', (ev) => {
       try {
         const d = JSON.parse((ev as MessageEvent).data) as { enabled?: boolean; connectedStudios?: number };
-        if (typeof d.enabled === 'boolean') setAiAccessEnabled(d.enabled);
         if (typeof d.connectedStudios === 'number') setAiConnectedStudios(d.connectedStudios);
+        if (typeof savedPrefs.enabled !== 'boolean' && typeof d.enabled === 'boolean') {
+          setAiAccessEnabled(d.enabled);
+        }
       } catch {
         // Ignore parse issue
       }
@@ -3314,18 +3360,56 @@ export function StudioWorkspace() {
     };
   }, [enqueueAiBatch]);
 
-  // Keep server AI snapshot synced while Live Access or drawer is active
+  // Persist AI Bridge toggle & token locally so Vercel serverless restarts retain the same key
+  useEffect(() => {
+    if (!aiToken) return;
+    try {
+      window.localStorage.setItem(
+        'stagecraft_ai_bridge_v1',
+        JSON.stringify({ enabled: aiAccessEnabled, token: aiToken }),
+      );
+    } catch {
+      // Ignore storage error
+    }
+  }, [aiAccessEnabled, aiToken]);
+
+  // Keep server AI snapshot synced + poll /api/ai/poll every 1.2s for Vercel serverless reliability
   useEffect(() => {
     if (!aiAccessEnabled && !aiBridgeOpen) return;
     const t = window.setTimeout(() => {
       void fetch('/api/ai/sync-state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(aiSnapshot),
+        body: JSON.stringify({
+          enabled: aiAccessEnabled,
+          token: aiToken,
+          state: aiSnapshot,
+        }),
       }).catch(() => {});
-    }, 280);
+    }, 240);
     return () => window.clearTimeout(t);
-  }, [aiAccessEnabled, aiBridgeOpen, aiSnapshot]);
+  }, [aiAccessEnabled, aiBridgeOpen, aiToken, aiSnapshot]);
+
+  useEffect(() => {
+    if (!aiAccessEnabled) return;
+    const pollId = window.setInterval(() => {
+      void fetch(`/api/ai/poll?after=${lastPollMsRef.current}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (!d || !Array.isArray(d.batches)) return;
+          for (const b of d.batches as { batchId?: string; source?: string; commands?: AiBridgeCommand[]; createdAt?: number }[]) {
+            if (typeof b.createdAt === 'number' && b.createdAt > lastPollMsRef.current) {
+              lastPollMsRef.current = b.createdAt;
+            }
+            if (Array.isArray(b.commands) && b.commands.length > 0 && b.batchId) {
+              enqueueAiBatch(b.commands, b.source ?? 'External AI', b.batchId);
+            }
+          }
+        })
+        .catch(() => {});
+    }, 1200);
+    return () => window.clearInterval(pollId);
+  }, [aiAccessEnabled, enqueueAiBatch]);
 
   // Expose browser-level window.STAGECRAFT_AI for computer-use / browser agents
   useEffect(() => {
