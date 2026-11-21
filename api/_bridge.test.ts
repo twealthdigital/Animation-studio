@@ -16,14 +16,14 @@ async function mcpCall(
   method: string,
   params: Record<string, unknown> = {},
   headers: Record<string, string> = {},
-  tok = token,
+  tok?: string,
   query = '',
 ) {
   const res = await fetch(`${baseUrl}/api/mcp${query}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${tok}`,
+      ...(tok ? { Authorization: `Bearer ${tok}` } : {}),
       ...headers,
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
@@ -42,7 +42,7 @@ function parseToolJson(rpcBody: Record<string, unknown>): Record<string, unknown
   return JSON.parse(text) as Record<string, unknown>;
 }
 
-describe('Stagecraft MCP Bridge Stability & Security', () => {
+describe('Stagecraft MCP Bridge Open Access & Stability', () => {
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'stagecraft-bridge-test-'));
     process.env.STAGECRAFT_BRIDGE_DIR = tmpDir;
@@ -59,12 +59,11 @@ describe('Stagecraft MCP Bridge Stability & Security', () => {
     if (!addr || typeof addr === 'string') throw new Error('Failed to bind test server');
     baseUrl = `http://127.0.0.1:${addr.port}`;
 
-    const cfgRes = await fetch(`${baseUrl}/api/ai/config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: true, singleClientLock: true }),
-    });
-    const cfg = (await cfgRes.json()) as { token: string };
+    const cfgRes = await fetch(`${baseUrl}/api/ai/config`);
+    const cfg = (await cfgRes.json()) as { token: string; enabled: boolean; requireAuth: boolean; singleClientLock: boolean };
+    assert.equal(cfg.enabled, true);
+    assert.equal(cfg.requireAuth, false);
+    assert.equal(cfg.singleClientLock, false);
     token = cfg.token;
 
     await fetch(`${baseUrl}/api/ai/sync-state`, {
@@ -97,6 +96,39 @@ describe('Stagecraft MCP Bridge Stability & Security', () => {
     resetBridgeStoreForTests();
     delete process.env.STAGECRAFT_BRIDGE_DIR;
     await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  test('allows Claude custom connector to connect freely without sign-in, token, or auth headers', async () => {
+    const probe = await fetch(`${baseUrl}/api/mcp`);
+    assert.equal(probe.status, 200);
+    const probeJson = (await probe.json()) as { ok: boolean; openAccess: boolean };
+    assert.equal(probeJson.ok, true);
+    assert.equal(probeJson.openAccess, true);
+
+    // Multiple completely unauthenticated clients can initialize and create sessions freely
+    const init1 = await mcpCall('initialize', { clientInfo: { name: 'claude-ai' } }, { 'X-Client-Id': 'user-1' });
+    assert.equal(init1.status, 200);
+    const sid1 = init1.sessionId!;
+    assert.match(sid1, /^sc_sess_/);
+
+    const init2 = await mcpCall('initialize', { clientInfo: { name: 'cursor-ai' } }, { 'X-Client-Id': 'user-2' });
+    assert.equal(init2.status, 200);
+    const sid2 = init2.sessionId!;
+    assert.match(sid2, /^sc_sess_/);
+
+    const ns1 = await mcpCall(
+      'tools/call',
+      { name: 'new_session', arguments: { name: 'Free Scene 1' } },
+      { 'Mcp-Session-Id': sid1, 'X-Client-Id': 'user-1' },
+    );
+    assert.equal(parseToolJson(ns1.body).ok, true);
+
+    const ns2 = await mcpCall(
+      'tools/call',
+      { name: 'new_session', arguments: { name: 'Free Scene 2' } },
+      { 'Mcp-Session-Id': sid2, 'X-Client-Id': 'user-2' },
+    );
+    assert.equal(parseToolJson(ns2.body).ok, true);
   });
 
   test('never auto-creates scenes from initialize, get_state, or run_commands', async () => {
@@ -223,7 +255,13 @@ describe('Stagecraft MCP Bridge Stability & Security', () => {
     assert.equal(parseToolJson(rightGet.body).ok, true);
   });
 
-  test('detects and rejects second client using same token and logs scene events', async () => {
+  test('enforces single-client lock when explicitly enabled', async () => {
+    await fetch(`${baseUrl}/api/ai/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ singleClientLock: true }),
+    });
+
     const init1 = await mcpCall(
       'initialize',
       { clientInfo: { name: 'claude-ai' } },
@@ -246,13 +284,6 @@ describe('Stagecraft MCP Bridge Stability & Security', () => {
     const poll2 = await fetch(`${baseUrl}/api/ai/poll?tabId=tab_studio_2`);
     const poll2Json = (await poll2.json()) as { multiStudioWarning: string | null };
     assert.ok(poll2Json.multiStudioWarning?.includes('2 Stagecraft Studio browser tabs'));
-
-    const cfg = (await (await fetch(`${baseUrl}/api/ai/config`)).json()) as {
-      multiClientWarning: string | null;
-      sceneEvents: { cause: string }[];
-    };
-    assert.ok(cfg.multiClientWarning?.includes('Another client'));
-    assert.equal(cfg.sceneEvents.some((e) => e.cause === 'another_client'), true);
   });
 
   test('returns per-command results for large batches instead of only queued', async () => {
@@ -328,7 +359,13 @@ describe('Stagecraft MCP Bridge Stability & Security', () => {
     assert.equal(fetchedJson.failedCount, 1);
   });
 
-  test('supports token rotation and revocation without stale browser poll reverting it', async () => {
+  test('supports optional token auth, rotation, and revocation when enabled', async () => {
+    await fetch(`${baseUrl}/api/ai/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requireAuth: true }),
+    });
+
     const oldToken = token;
 
     const rotRes = await fetch(`${baseUrl}/api/ai/config`, {
@@ -360,8 +397,7 @@ describe('Stagecraft MCP Bridge Stability & Security', () => {
     assert.equal(revData.enabled, false);
 
     const afterRevoke = await mcpCall('tools/call', { name: 'list_sessions', arguments: {} }, {}, rotData.token);
-    assert.equal(afterRevoke.status, 401);
-    assert.equal(afterRevoke.body.errorCode, 'TOKEN_REVOKED');
+    assert.equal(afterRevoke.status, 403);
   });
 
   test('session stays bound until explicitly deleted, then allows new session', async () => {

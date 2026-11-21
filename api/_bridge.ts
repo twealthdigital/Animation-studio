@@ -88,6 +88,7 @@ interface StudioTabRecord {
 
 export interface BridgeMemoryStore {
   enabled: boolean;
+  requireAuth: boolean;
   token: string;
   tokenRevoked: boolean;
   tokenUpdatedAt: number;
@@ -115,6 +116,7 @@ export interface BridgeMemoryStore {
 
 interface PersistedSnapshot {
   enabled: boolean;
+  requireAuth: boolean;
   token: string;
   tokenRevoked: boolean;
   tokenUpdatedAt: number;
@@ -174,13 +176,14 @@ function getStore(): BridgeMemoryStore {
   const g = globalThis as unknown as { __stagecraftAiStore?: BridgeMemoryStore };
   if (!g.__stagecraftAiStore) {
     g.__stagecraftAiStore = {
-      enabled: Boolean(process.env.STAGECRAFT_TOKEN?.trim()),
+      enabled: true,
+      requireAuth: false,
       token: createToken(),
       tokenRevoked: false,
       tokenUpdatedAt: 0,
       envTokenOverridden: false,
       revokedTokenHashes: [],
-      singleClientLock: true,
+      singleClientLock: false,
       multiClientWarning: null,
       multiClientWarningAt: 0,
       sessionCounter: 0,
@@ -319,6 +322,7 @@ function mergePersistedSnapshot(store: BridgeMemoryStore, parsed: Partial<Persis
   }
   store.revokedTokenHashes = Array.from(revokedSet).slice(-32);
 
+  if (typeof parsed.requireAuth === 'boolean') store.requireAuth = parsed.requireAuth;
   const parsedTokenUpdatedAt = typeof parsed.tokenUpdatedAt === 'number' ? parsed.tokenUpdatedAt : 0;
   if (parsedTokenUpdatedAt >= store.tokenUpdatedAt) {
     if (typeof parsed.enabled === 'boolean') store.enabled = parsed.enabled;
@@ -460,6 +464,7 @@ async function savePersistedBridge(store: BridgeMemoryStore): Promise<void> {
   pruneOldSessions(store);
   const payload: PersistedSnapshot = {
     enabled: store.enabled,
+    requireAuth: store.requireAuth,
     token: store.tokenRevoked ? '' : store.token,
     tokenRevoked: store.tokenRevoked,
     tokenUpdatedAt: store.tokenUpdatedAt,
@@ -870,8 +875,8 @@ function checkMultiClientConflict(
   );
 
   // If a DIFFERENT client fingerprint connects while an active session is leased, or any second client tries to create a new scene
-  if (fpDiffers || opts.action === 'new_session') {
-    const warning = `Another client ("${opts.clientLabel}") attempted ${opts.action} using this token while session ${activeBound.sessionId} is active on scene "${activeBound.sceneName}" (${activeBound.sceneId}).`;
+  if (store.singleClientLock && (fpDiffers || opts.action === 'new_session')) {
+    const warning = `Another client ("${opts.clientLabel}") attempted ${opts.action} while session ${activeBound.sessionId} holds the single-client lock on scene "${activeBound.sceneName}" (${activeBound.sceneId}).`;
     store.multiClientWarning = warning;
     store.multiClientWarningAt = now;
     recordSceneEvent(store, 'another_client', warning, {
@@ -885,10 +890,7 @@ function checkMultiClientConflict(
       multiClientWarning: warning,
       multiStudioWarning: getMultiStudioWarning(store, now),
     });
-    if (store.singleClientLock) {
-      return { conflict: true, warning, activeBound };
-    }
-    return { conflict: false, warning, activeBound };
+    return { conflict: true, warning, activeBound };
   }
 
   return { conflict: false, activeBound };
@@ -907,6 +909,20 @@ function extractToken(req: Request): string {
 }
 
 function isAuthorized(store: BridgeMemoryStore, req: Request, res: Response): boolean {
+  if (!store.enabled) {
+    res.status(403).json({
+      ok: false,
+      errorCode: 'BRIDGE_DISABLED',
+      error: 'AI Live Access is disabled in Stagecraft 3D. Open AI Access and turn it ON.',
+    });
+    return false;
+  }
+
+  // Open public access by default: allow Claude / MCP / REST callers without signing in or passing a token
+  if (!store.requireAuth) {
+    return true;
+  }
+
   const token = extractToken(req);
   const key =
     typeof req.query.key === 'string'
@@ -1484,7 +1500,7 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
         },
         instructions: session.sceneId
           ? `Resumed bound Stagecraft 3D session ${session.sessionId} -> scene "${session.sceneName}" (${session.sceneId}). Pass sceneId="${session.sceneId}" in get_state and run_commands to verify target scene.`
-          : `Connected to Stagecraft 3D (${session.sessionId}). No scene was auto-created.${existingNotice} Call list_sessions to view existing scenes, pass an explicit sceneId to get_state / run_commands, or call new_session when you want a brand-new scene.`,
+          : `Connected to Stagecraft 3D (${session.sessionId}) with open access (no sign-in required). No scene was auto-created.${existingNotice}${typeof store.lastState?.sceneId === 'string' ? ` Current Studio scene: "${String(store.lastState.sceneName ?? store.lastState.sceneId)}" (sceneId="${store.lastState.sceneId}").` : ''} Call list_sessions to view scenes, pass an explicit sceneId to get_state / run_commands, or call new_session to create a new scene.`,
       },
     });
     return;
@@ -2269,6 +2285,7 @@ export function mountAiBridge(app: Express): void {
     res.json({
       ok: true,
       enabled: store.enabled,
+      requireAuth: store.requireAuth,
       token: store.tokenRevoked ? '' : store.token,
       tokenRevoked: store.tokenRevoked,
       tokenUpdatedAt: store.tokenUpdatedAt,
@@ -2289,6 +2306,7 @@ export function mountAiBridge(app: Express): void {
     const store = await loadPersistedBridge();
     const body = (req.body ?? {}) as {
       enabled?: boolean;
+      requireAuth?: boolean;
       regenerateToken?: boolean;
       revokeToken?: boolean;
       token?: string;
@@ -2309,6 +2327,7 @@ export function mountAiBridge(app: Express): void {
       }
       store.token = '';
       store.tokenRevoked = true;
+      store.requireAuth = true;
       store.enabled = false;
       store.envTokenOverridden = true;
       store.tokenUpdatedAt = Date.now();
@@ -2360,6 +2379,9 @@ export function mountAiBridge(app: Express): void {
       store.enabled = body.enabled;
     }
 
+    if (typeof body.requireAuth === 'boolean' && !body.revokeToken) {
+      store.requireAuth = body.requireAuth;
+    }
     if (typeof body.singleClientLock === 'boolean') {
       store.singleClientLock = body.singleClientLock;
     }
@@ -2372,6 +2394,7 @@ export function mountAiBridge(app: Express): void {
     const now = Date.now();
     const configPayload = {
       enabled: store.enabled,
+      requireAuth: store.requireAuth,
       token: store.tokenRevoked ? '' : store.token,
       tokenRevoked: store.tokenRevoked,
       tokenUpdatedAt: store.tokenUpdatedAt,
@@ -2570,6 +2593,7 @@ export function mountAiBridge(app: Express): void {
     res.write(
       `event: ai:connected\ndata: ${JSON.stringify({
         enabled: store.enabled,
+        requireAuth: store.requireAuth,
         tokenRevoked: store.tokenRevoked,
         tokenUpdatedAt: store.tokenUpdatedAt,
         singleClientLock: store.singleClientLock,
@@ -2721,6 +2745,7 @@ export function mountAiBridge(app: Express): void {
     res.json({
       ok: true,
       enabled: store.enabled,
+      requireAuth: store.requireAuth,
       token: store.tokenRevoked ? '' : store.token,
       tokenRevoked: store.tokenRevoked,
       tokenUpdatedAt: store.tokenUpdatedAt,
@@ -2759,6 +2784,7 @@ export function mountAiBridge(app: Express): void {
     res.json({
       ok: true,
       enabled: store.enabled,
+      requireAuth: store.requireAuth,
       token: store.tokenRevoked ? '' : store.token,
       tokenRevoked: store.tokenRevoked,
       tokenUpdatedAt: store.tokenUpdatedAt,
@@ -3078,6 +3104,7 @@ export function mountAiBridge(app: Express): void {
       ok: true,
       name: 'stagecraft-3d-live-bridge',
       transport: 'streamable-http',
+      openAccess: !store.requireAuth,
       singleClientLock: store.singleClientLock,
       studioConnected: isStudioConnected(store),
     });

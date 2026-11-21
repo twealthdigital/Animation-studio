@@ -28,6 +28,7 @@ interface AiBridgeDrawerProps {
   open: boolean;
   onClose: () => void;
   enabled: boolean;
+  requireAuth: boolean;
   token: string;
   tokenRevoked: boolean;
   tokenUpdatedAt: number;
@@ -47,6 +48,7 @@ interface AiBridgeDrawerProps {
   snapshot: AiBridgeStateSnapshot;
   canUndoAiBatch: boolean;
   onToggleEnabled: (next: boolean) => void;
+  onToggleRequireAuth: (next: boolean) => void;
   onRegenerateToken: () => void;
   onRevokeToken: () => void;
   onToggleSingleClientLock: (next: boolean) => void;
@@ -90,6 +92,7 @@ export function AiBridgeDrawer({
   open,
   onClose,
   enabled,
+  requireAuth,
   token,
   tokenRevoked,
   tokenUpdatedAt,
@@ -109,6 +112,7 @@ export function AiBridgeDrawer({
   snapshot,
   canUndoAiBatch,
   onToggleEnabled,
+  onToggleRequireAuth,
   onRegenerateToken,
   onRevokeToken,
   onToggleSingleClientLock,
@@ -136,33 +140,42 @@ export function AiBridgeDrawer({
       JSON.stringify(
         {
           mcpServers: {
-            'stagecraft-3d': {
-              type: 'http',
-              url: `${origin}/api/mcp`,
-              headers: {
-                Authorization: `Bearer ${effectiveDisplayToken}`,
-              },
-            },
+            'stagecraft-3d': requireAuth
+              ? {
+                  type: 'http',
+                  url: `${origin}/api/mcp`,
+                  headers: {
+                    Authorization: `Bearer ${effectiveDisplayToken}`,
+                  },
+                }
+              : {
+                  type: 'http',
+                  url: `${origin}/api/mcp`,
+                },
           },
         },
         null,
         2,
       ),
-    [origin, effectiveDisplayToken],
+    [origin, requireAuth, effectiveDisplayToken],
   );
 
   const claudeConnectorUrl = useMemo(
     () =>
-      tokenRevoked || !token
-        ? 'Token revoked — click "Rotate Token" below to generate a new URL'
-        : `${origin}/api/mcp?token=${encodeURIComponent(token)}`,
-    [origin, token, tokenRevoked],
+      !requireAuth
+        ? `${origin}/api/mcp`
+        : tokenRevoked || !token
+          ? 'Token revoked — click "Rotate Token" below to generate a new URL'
+          : `${origin}/api/mcp?token=${encodeURIComponent(token)}`,
+    [origin, requireAuth, token, tokenRevoked],
   );
 
   const curlSnippet = useMemo(
     () =>
-      `curl -X POST "${origin}/api/ai/commands" \\\n  -H "Authorization: Bearer ${effectiveDisplayToken}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"sceneId":"${snapshot.sceneId}","source":"External AI","commands":[{"op":"add_prop","kind":"box","name":"AI Box","color":"#e8702a","position":{"x":0,"y":0,"z":0}}]}'`,
-    [origin, effectiveDisplayToken, snapshot.sceneId],
+      requireAuth
+        ? `curl -X POST "${origin}/api/ai/commands" \\\n  -H "Authorization: Bearer ${effectiveDisplayToken}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"sceneId":"${snapshot.sceneId}","source":"External AI","commands":[{"op":"add_prop","kind":"box","name":"AI Box","color":"#e8702a","position":{"x":0,"y":0,"z":0}}]}'`
+        : `curl -X POST "${origin}/api/ai/commands" \\\n  -H "Content-Type: application/json" \\\n  -d '{"sceneId":"${snapshot.sceneId}","source":"External AI","commands":[{"op":"add_prop","kind":"box","name":"AI Box","color":"#e8702a","position":{"x":0,"y":0,"z":0}}]}'`,
+    [origin, requireAuth, effectiveDisplayToken, snapshot.sceneId],
   );
 
   if (!open) return null;
@@ -193,11 +206,13 @@ export function AiBridgeDrawer({
           <div>
             <div className="font-semibold text-[#e6e8ec]">AI Live Access &amp; Watch Mode</div>
             <div className="text-[10px] text-[#98a0ad]">
-              {tokenRevoked
-                ? 'Token Revoked · Generate a new token to reconnect'
-                : enabled
-                  ? 'Bridge Active · 1 Session = 1 Stable Scene'
-                  : 'Bridge Locked · Enable to connect external AIs'}
+              {!enabled
+                ? 'Bridge Paused · Enable to connect external AIs'
+                : requireAuth
+                  ? tokenRevoked
+                    ? 'Token Revoked · Generate a new token to reconnect'
+                    : 'Token Auth Required · 1 Session = 1 Stable Scene'
+                  : 'Free Open Access · Anyone can connect without signing in'}
               {connectedStudios > 0 ? ` · ${connectedStudios} tab(s) synced` : ''}
             </div>
           </div>
@@ -260,9 +275,19 @@ export function AiBridgeDrawer({
                   : 'border border-[#383e49] bg-[#1f232b] text-[#98a0ad]'
             }`}
           >
-            {tokenRevoked ? 'REVOKED' : enabled ? 'LIVE ON' : 'LOCKED'}
+            {!enabled ? 'PAUSED' : requireAuth ? (tokenRevoked ? 'REVOKED' : 'TOKEN ON') : 'OPEN ACCESS'}
           </span>
         </div>
+
+        <label className="flex cursor-pointer items-center gap-2 text-[11px] text-[#cbd5e1]">
+          <input
+            type="checkbox"
+            checked={requireAuth}
+            onChange={(e) => onToggleRequireAuth(e.target.checked)}
+            className="accent-[#e8702a]"
+          />
+          <span>Require Token Auth (off = free open access, no sign-in)</span>
+        </label>
 
         <label className="flex cursor-pointer items-center gap-2 text-[11px] text-[#cbd5e1]">
           <input
@@ -362,7 +387,7 @@ export function AiBridgeDrawer({
               <div className="flex items-center justify-between">
                 <span className="font-semibold text-[#e6e8ec]">1. Claude Remote Connector URL</span>
                 <span className="rounded bg-[#2b211a] px-1.5 py-0.5 text-[9px] font-semibold text-[#e8702a]">
-                  STABLE SCENE LEASE
+                  {requireAuth ? 'TOKEN AUTH' : 'NO SIGN-IN NEEDED'}
                 </span>
               </div>
               <p className="text-[11px] text-[#98a0ad]">
@@ -375,7 +400,7 @@ export function AiBridgeDrawer({
                 <StudioButton
                   variant="primary"
                   size="xs"
-                  disabled={tokenRevoked || !token}
+                  disabled={requireAuth && (tokenRevoked || !token)}
                   onClick={() => void copyText('claude-url', claudeConnectorUrl)}
                 >
                   {copiedId === 'claude-url' ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
@@ -545,7 +570,7 @@ export function AiBridgeDrawer({
                 <span className="font-semibold text-[#e6e8ec]">4. MCP Config (Claude Desktop / Cursor / Windsurf)</span>
                 <StudioButton
                   size="xs"
-                  disabled={tokenRevoked || !token}
+                  disabled={requireAuth && (tokenRevoked || !token)}
                   onClick={() => void copyText('mcp', mcpSnippet)}
                 >
                   {copiedId === 'mcp' ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}

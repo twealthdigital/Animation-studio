@@ -368,11 +368,12 @@ export function StudioWorkspace() {
   const [guideOpen, setGuideOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [aiBridgeOpen, setAiBridgeOpen] = useState(false);
-  const [aiAccessEnabled, setAiAccessEnabled] = useState(false);
+  const [aiAccessEnabled, setAiAccessEnabled] = useState(true);
+  const [aiRequireAuth, setAiRequireAuth] = useState(false);
   const [aiToken, setAiToken] = useState('');
   const [aiTokenRevoked, setAiTokenRevoked] = useState(false);
   const [aiTokenUpdatedAt, setAiTokenUpdatedAt] = useState(0);
-  const [aiSingleClientLock, setAiSingleClientLock] = useState(true);
+  const [aiSingleClientLock, setAiSingleClientLock] = useState(false);
   const [aiMultiClientWarning, setAiMultiClientWarning] = useState<string | null>(null);
   const [aiMultiStudioWarning, setAiMultiStudioWarning] = useState<string | null>(null);
   const [aiConnectedStudios, setAiConnectedStudios] = useState(0);
@@ -3188,6 +3189,7 @@ export function StudioWorkspace() {
       }
       if (typeof d.enabled === 'boolean') setAiAccessEnabled(d.enabled);
     }
+    if (typeof d.requireAuth === 'boolean') setAiRequireAuth(d.requireAuth);
     if (typeof d.singleClientLock === 'boolean') setAiSingleClientLock(d.singleClientLock);
     if ('multiClientWarning' in d) {
       setAiMultiClientWarning(typeof d.multiClientWarning === 'string' ? d.multiClientWarning : null);
@@ -3574,7 +3576,7 @@ export function StudioWorkspace() {
   // Connect to SSE (/api/ai/stream) + fetch/restore persisted AI config across serverless cold starts
   useEffect(() => {
     let active = true;
-    let savedPrefs: { enabled?: boolean; token?: string; tokenUpdatedAt?: number; singleClientLock?: boolean } = {};
+    let savedPrefs: { enabled?: boolean; requireAuth?: boolean; token?: string; tokenUpdatedAt?: number; singleClientLock?: boolean } = {};
     try {
       const raw = window.localStorage.getItem('stagecraft_ai_bridge_v1');
       if (raw) savedPrefs = JSON.parse(raw) as typeof savedPrefs;
@@ -3592,7 +3594,7 @@ export function StudioWorkspace() {
         applyServerBridgeState(data as Record<string, unknown>);
 
         // Hydrate cold empty server ONLY if server has not rotated/revoked token
-        if (!data.tokenRevoked && serverUpdatedAt === 0 && (savedPrefs.enabled || (savedPrefs.token && savedUpdatedAt === 0))) {
+        if (!data.tokenRevoked && serverUpdatedAt === 0 && (typeof savedPrefs.enabled === 'boolean' || typeof savedPrefs.requireAuth === 'boolean' || (savedPrefs.token && savedUpdatedAt === 0))) {
           const effectiveEnabled =
             typeof savedPrefs.enabled === 'boolean' ? savedPrefs.enabled : Boolean(data.enabled);
           const effectiveToken =
@@ -3609,6 +3611,9 @@ export function StudioWorkspace() {
             body: JSON.stringify({
               enabled: effectiveEnabled,
               ...(effectiveToken ? { token: effectiveToken } : {}),
+              ...(typeof savedPrefs.requireAuth === 'boolean'
+                ? { requireAuth: savedPrefs.requireAuth }
+                : {}),
               ...(typeof savedPrefs.singleClientLock === 'boolean'
                 ? { singleClientLock: savedPrefs.singleClientLock }
                 : {}),
@@ -3686,6 +3691,7 @@ export function StudioWorkspace() {
         'stagecraft_ai_bridge_v1',
         JSON.stringify({
           enabled: aiAccessEnabled,
+          requireAuth: aiRequireAuth,
           token: aiTokenRevoked ? '' : aiToken,
           tokenRevoked: aiTokenRevoked,
           tokenUpdatedAt: aiTokenUpdatedAt,
@@ -3695,7 +3701,7 @@ export function StudioWorkspace() {
     } catch {
       // Ignore storage error
     }
-  }, [aiAccessEnabled, aiToken, aiTokenRevoked, aiTokenUpdatedAt, aiSingleClientLock]);
+  }, [aiAccessEnabled, aiRequireAuth, aiToken, aiTokenRevoked, aiTokenUpdatedAt, aiSingleClientLock]);
 
   // Persist bound AI sessions locally so Chrome close/reopen keeps session->scene bindings intact
   useEffect(() => {
@@ -6277,6 +6283,7 @@ export function StudioWorkspace() {
         open={aiBridgeOpen}
         onClose={() => setAiBridgeOpen(false)}
         enabled={aiAccessEnabled}
+        requireAuth={aiRequireAuth}
         token={aiToken}
         tokenRevoked={aiTokenRevoked}
         tokenUpdatedAt={aiTokenUpdatedAt}
@@ -6321,6 +6328,17 @@ export function StudioWorkspace() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ revokeToken: true }),
+          })
+            .then((r) => r.json())
+            .then((d) => applyServerBridgeState(d as Record<string, unknown>))
+            .catch(() => {});
+        }}
+        onToggleRequireAuth={(next) => {
+          setAiRequireAuth(next);
+          void fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requireAuth: next }),
           })
             .then((r) => r.json())
             .then((d) => applyServerBridgeState(d as Record<string, unknown>))
