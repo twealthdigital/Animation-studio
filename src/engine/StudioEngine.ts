@@ -1128,6 +1128,10 @@ export class StudioEngine {
     }
   }
 
+  getViewMode(): CameraViewMode {
+    return this.viewMode;
+  }
+
   setViewMode(mode: CameraViewMode): void {
     this.viewMode = mode;
     const isEditor = mode === 'editor';

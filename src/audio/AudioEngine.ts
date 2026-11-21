@@ -1,4 +1,4 @@
-import type { AudioClipData, CharacterAudioProfile } from '../core/types';
+import type { AudioClipData, AudioSynthPreset, CharacterAudioProfile } from '../core/types';
 import { clamp } from '../utils/math';
 
 export function computeWaveformPeaks(buffer: AudioBuffer, binCount = 120): number[] {
@@ -41,13 +41,20 @@ export class WebSpeechFallbackProvider implements VoiceSynthProvider {
       ? 'Browser SpeechSynthesis fallback ready for live dialogue preview.'
       : 'SpeechSynthesis API is not available in this browser.';
   }
-  speakPreview(text: string, opts?: { pitch?: number; rate?: number }): void {
+  speakPreview(text: string, opts?: { pitch?: number; rate?: number; cancelExisting?: boolean }): void {
     if (!this.isConfigured || !text.trim()) return;
-    speechSynthesis.cancel();
+    if (opts?.cancelExisting !== false) {
+      speechSynthesis.cancel();
+    }
     const u = new SpeechSynthesisUtterance(text);
     u.pitch = clamp(opts?.pitch ?? 1, 0.5, 2);
     u.rate = clamp(opts?.rate ?? 1, 0.5, 2);
     speechSynthesis.speak(u);
+  }
+
+  cancel(): void {
+    if (!this.isConfigured) return;
+    speechSynthesis.cancel();
   }
 }
 
@@ -59,6 +66,167 @@ export class ExternalVoiceProviderHook implements VoiceSynthProvider {
     return 'Not configured: Connect an external TTS API endpoint to synthesize downloadable studio voice tracks. Use Microphone Recording or Audio File Import for recorded voices.';
   }
   speakPreview(): void {}
+}
+
+
+export const AUDIO_SYNTH_PRESETS: AudioSynthPreset[] = [
+  'chime',
+  'bell',
+  'pop',
+  'whoosh',
+  'thud',
+  'footstep',
+  'boom',
+  'laser',
+  'click',
+  'success',
+  'alert',
+  'riser',
+  'ambient-pad',
+  'music-pulse',
+];
+
+export function buildSynthAssetId(preset: AudioSynthPreset, durationSec: number): string {
+  const dur = clamp(Number.isFinite(durationSec) ? durationSec : 1.5, 0.15, 120);
+  return `synth:${preset}:${dur.toFixed(2)}`;
+}
+
+export function parseSynthAssetId(assetId: string): { preset: AudioSynthPreset; durationSec: number } | null {
+  if (!assetId || !assetId.startsWith('synth:')) return null;
+  const parts = assetId.split(':');
+  const preset = parts[1] as AudioSynthPreset;
+  if (!AUDIO_SYNTH_PRESETS.includes(preset)) return null;
+  const dur = Number(parts[2]);
+  return {
+    preset,
+    durationSec: clamp(Number.isFinite(dur) ? dur : 1.5, 0.15, 120),
+  };
+}
+
+/**
+ * Pure deterministic procedural audio sample synthesis for built-in SFX, foley,
+ * ambient beds, and musical cues so AI agents can generate real audible tracks
+ * without external files.
+ */
+export function buildSynthPcmSamples(
+  preset: AudioSynthPreset,
+  durationSec: number,
+  sampleRate = 44100,
+): Float32Array {
+  const dur = clamp(durationSec, 0.15, 120);
+  const len = Math.max(1, Math.floor(dur * sampleRate));
+  const out = new Float32Array(len);
+  let seed = 1337;
+  const nextRand = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return (seed / 0xffffffff) * 2 - 1;
+  };
+  let lp = 0;
+
+  for (let i = 0; i < len; i++) {
+    const t = i / sampleRate;
+    const p = t / dur;
+    const envFade = Math.min(1, t / 0.012) * Math.min(1, (dur - t) / 0.025);
+    let s = 0;
+
+    switch (preset) {
+      case 'chime':
+      case 'bell': {
+        const base = preset === 'bell' ? 660 : 880;
+        const decay = Math.exp(-t * (preset === 'bell' ? 2.6 : 4.2));
+        s =
+          (Math.sin(2 * Math.PI * base * t) * 0.55 +
+            Math.sin(2 * Math.PI * base * 1.5 * t) * 0.25 +
+            Math.sin(2 * Math.PI * base * 2.02 * t) * 0.18) *
+          decay;
+        break;
+      }
+      case 'pop': {
+        const freq = 220 + 580 * Math.exp(-t * 36);
+        s = Math.sin(2 * Math.PI * freq * t) * Math.exp(-t * 28) * 0.75;
+        break;
+      }
+      case 'click': {
+        s = (nextRand() * 0.5 + Math.sin(2 * Math.PI * 1600 * t) * 0.5) * Math.exp(-t * 80) * 0.8;
+        break;
+      }
+      case 'whoosh': {
+        const noise = nextRand();
+        lp = lp * 0.88 + noise * 0.12;
+        const swell = Math.sin(Math.PI * p);
+        s = lp * swell * 0.85;
+        break;
+      }
+      case 'thud':
+      case 'boom': {
+        const f0 = preset === 'boom' ? 110 : 140;
+        const f1 = preset === 'boom' ? 32 : 45;
+        const freq = f1 + (f0 - f1) * Math.exp(-t * 14);
+        const decay = Math.exp(-t * (preset === 'boom' ? 2.2 : 9));
+        s = (Math.sin(2 * Math.PI * freq * t) * 0.85 + nextRand() * 0.15 * Math.exp(-t * 20)) * decay;
+        break;
+      }
+      case 'footstep': {
+        const noise = nextRand();
+        lp = lp * 0.72 + noise * 0.28;
+        s = (lp * 0.7 + Math.sin(2 * Math.PI * 95 * t) * 0.5) * Math.exp(-t * 22);
+        break;
+      }
+      case 'laser': {
+        const freq = 1400 * Math.exp(-t * 6.5) + 120;
+        s = Math.sin(2 * Math.PI * freq * t) * Math.exp(-t * 4.5) * 0.65;
+        break;
+      }
+      case 'success': {
+        const step = Math.min(2, Math.floor(p * 3));
+        const notes = [523.25, 659.25, 783.99];
+        const freq = notes[step];
+        const localT = t - (step * dur) / 3;
+        s =
+          (Math.sin(2 * Math.PI * freq * t) * 0.6 + Math.sin(2 * Math.PI * freq * 2 * t) * 0.2) *
+          Math.exp(-Math.max(0, localT) * 5.5);
+        break;
+      }
+      case 'alert': {
+        const freq = p < 0.5 ? 740 : 988;
+        const localT = p < 0.5 ? t : t - dur * 0.5;
+        s = Math.sin(2 * Math.PI * freq * t) * Math.exp(-localT * 6) * 0.55;
+        break;
+      }
+      case 'riser': {
+        const freq = 140 + 820 * p * p;
+        const noise = nextRand();
+        lp = lp * 0.92 + noise * 0.08;
+        s = (Math.sin(2 * Math.PI * freq * t) * 0.45 + lp * 0.35) * p;
+        break;
+      }
+      case 'ambient-pad': {
+        const lfo = 0.85 + 0.15 * Math.sin(2 * Math.PI * 0.25 * t);
+        const freqs = [220, 277.18, 329.63, 440];
+        let chord = 0;
+        for (const f of freqs) {
+          chord += Math.sin(2 * Math.PI * f * t) + 0.3 * Math.sin(2 * Math.PI * (f * 1.003) * t);
+        }
+        s = (chord / (freqs.length * 1.3)) * lfo * 0.45;
+        break;
+      }
+      case 'music-pulse': {
+        const beatPos = (t * 2) % 1; // 120 BPM
+        const bassEnv = Math.exp(-beatPos * 6.5);
+        const barIdx = Math.floor((t * 2) / 4) % 4;
+        const roots = [110, 146.83, 130.81, 98];
+        const root = roots[barIdx];
+        const pad =
+          Math.sin(2 * Math.PI * root * 2 * t) * 0.25 +
+          Math.sin(2 * Math.PI * root * 3 * t) * 0.15;
+        const bass = Math.sin(2 * Math.PI * root * t) * bassEnv * 0.45;
+        s = bass + pad;
+        break;
+      }
+    }
+    out[i] = clamp(s * envFade, -0.95, 0.95);
+  }
+  return out;
 }
 
 interface ActiveSourceNode {
@@ -161,6 +329,49 @@ export class AudioEngine {
     return this.buffers.has(assetId);
   }
 
+  synthesizePresetAsset(
+    assetId: string,
+    preset: AudioSynthPreset,
+    durationSec = 1.5,
+  ): { buffer: AudioBuffer; duration: number; peaks: number[] } {
+    const ctx = this.ensureContext();
+    const sampleRate = ctx.sampleRate || 44100;
+    const samples = buildSynthPcmSamples(preset, durationSec, sampleRate);
+    const buffer = ctx.createBuffer(1, samples.length, sampleRate);
+    buffer.getChannelData(0).set(samples);
+    this.buffers.set(assetId, buffer);
+    const peaks = computeWaveformPeaks(buffer, 120);
+    return { buffer, duration: buffer.duration, peaks };
+  }
+
+  ensureSynthAssetLoaded(assetId: string): AudioBuffer | undefined {
+    const existing = this.buffers.get(assetId);
+    if (existing) return existing;
+    const parsed = parseSynthAssetId(assetId);
+    if (!parsed) return undefined;
+    return this.synthesizePresetAsset(assetId, parsed.preset, parsed.durationSec).buffer;
+  }
+
+  async decodeAudioFromBase64(
+    assetId: string,
+    base64OrDataUrl: string,
+  ): Promise<{ buffer: AudioBuffer; duration: number; peaks: number[]; byteLength: number; mimeType: string }> {
+    let raw = base64OrDataUrl.trim();
+    let mimeType = 'audio/mpeg';
+    const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.*)$/s);
+    if (dataUrlMatch) {
+      mimeType = dataUrlMatch[1] || mimeType;
+      raw = dataUrlMatch[2];
+    }
+    const bin = atob(raw);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    const decoded = await this.decodeAudioAsset(assetId, bytes.buffer);
+    return { ...decoded, byteLength: bytes.byteLength, mimeType };
+  }
+
   getBuffer(assetId: string): AudioBuffer | undefined {
     return this.buffers.get(assetId);
   }
@@ -173,7 +384,7 @@ export class AudioEngine {
    * Samples normalized audio amplitude (0..1) for real audio-driven lip sync.
    */
   sampleClipAmplitudeAtTime(clip: AudioClipData, timelineTime: number): number {
-    const buffer = this.buffers.get(clip.assetId);
+    const buffer = this.buffers.get(clip.assetId) ?? this.ensureSynthAssetLoaded(clip.assetId);
     if (!buffer) {
       // Fallback syllabic envelope when text-only clip has no waveform
       const local = timelineTime - clip.startTime;
@@ -194,7 +405,7 @@ export class AudioEngine {
   }
 
   previewClip(clip: AudioClipData, profile?: CharacterAudioProfile): void {
-    const buffer = this.buffers.get(clip.assetId);
+    const buffer = this.buffers.get(clip.assetId) ?? this.ensureSynthAssetLoaded(clip.assetId);
     if (!buffer) return;
     const ctx = this.ensureContext();
     this.stopClip(clip.id);
@@ -319,7 +530,7 @@ export class AudioEngine {
     timelineTime: number,
     characterProfiles: Map<string, CharacterAudioProfile>,
   ): void {
-    const buffer = this.buffers.get(clip.assetId);
+    const buffer = this.buffers.get(clip.assetId) ?? this.ensureSynthAssetLoaded(clip.assetId);
     if (!buffer || !this.ctx || !this.masterGain) return;
 
     const profile = clip.characterInstanceId ? characterProfiles.get(clip.characterInstanceId) : undefined;

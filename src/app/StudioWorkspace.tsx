@@ -7,9 +7,11 @@ import type {
   AiSessionSummary,
   AssetRecord,
   AudioClipData,
+  AudioSynthPreset,
   AxisConstraint,
   CameraOrientationState,
   CameraPose,
+  CaptionItem,
   CharacterInstanceData,
   EasingType,
   EditorCameraPreset,
@@ -84,7 +86,7 @@ import { createCharacterAdapter, type AnyCharacterAdapter } from '../characters/
 import { HtmlThreeAdapter } from '../characters/HtmlThreeAdapter';
 import { GltfCharacterAdapter } from '../characters/GltfCharacterAdapter';
 import { HtmlIframeAdapter } from '../characters/HtmlIframeAdapter';
-import { AudioEngine } from '../audio/AudioEngine';
+import { AudioEngine, WebSpeechFallbackProvider } from '../audio/AudioEngine';
 import { type CameraViewMode, StudioEngine } from '../engine/StudioEngine';
 import {
   buildSceneFromTemplate,
@@ -92,7 +94,12 @@ import {
   ENVIRONMENT_PRESETS,
   type SceneTemplateId,
 } from '../engine/PropsFactory';
-import { exportScenesToVideo } from '../engine/ExportManager';
+import {
+  captureSceneFrame,
+  computeExportDimensions,
+  exportScenesToVideo,
+  pickPreferredExportFormat,
+} from '../engine/ExportManager';
 import {
   deleteAsset as dbDeleteAsset,
   deleteProject as dbDeleteProject,
@@ -419,6 +426,26 @@ export function StudioWorkspace() {
     afterBox: { scene: SceneData };
   } | null>(null);
 
+  const syncLiveSpeechForTime = useCallback((sc: SceneData, t: number) => {
+    const audioEng = audioEngineRef.current;
+    for (const clip of sc.audioClips) {
+      if (clip.muted || clip.role !== 'dialogue' || !clip.dialogueText?.trim()) continue;
+      if (t >= clip.startTime && t < clip.startTime + clip.duration) {
+        if (!spokenClipIdsRef.current.has(clip.id)) {
+          spokenClipIdsRef.current.add(clip.id);
+          if (!clip.assetId || !audioEng?.hasBuffer(clip.assetId)) {
+            const ch = sc.characters.find((c) => c.id === clip.characterInstanceId);
+            webSpeechRef.current.speakPreview(clip.dialogueText, {
+              pitch: ch?.audioProfile.pitch ?? 1,
+              rate: clip.playbackRate ?? ch?.audioProfile.speed ?? 1,
+              cancelExisting: false,
+            });
+          }
+        }
+      }
+    }
+  }, []);
+
   // Core imperative instances
   const viewportMountRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<StudioEngine | null>(null);
@@ -426,6 +453,9 @@ export function StudioWorkspace() {
   const commandManagerRef = useRef(new CommandManager(120));
   const glbBinaryCacheRef = useRef<Map<string, ArrayBuffer>>(new Map());
   const loadingAdaptersRef = useRef<Set<string>>(new Set());
+  const webSpeechRef = useRef(new WebSpeechFallbackProvider());
+  const spokenClipIdsRef = useRef<Set<string>>(new Set());
+  const activeAiExportIdRef = useRef<string | null>(null);
 
   if (!audioEngineRef.current) {
     audioEngineRef.current = new AudioEngine();
@@ -475,6 +505,7 @@ export function StudioWorkspace() {
   // Refs for fresh access inside Three.js callbacks & key handlers
   const projectRef = useRef(activeProject);
   const assetsRef = useRef(assets);
+  assetsRef.current = assets;
   const sceneRef = useRef(activeScene);
   const timeRef = useRef(currentTime);
   const isPlayingRef = useRef(isPlaying);
@@ -2208,7 +2239,10 @@ export function StudioWorkspace() {
             timeRef.current = workStart;
             setCurrentTime(workStart);
             const profiles = new Map(sc.characters.map((c) => [c.id, c.audioProfile]));
+            spokenClipIdsRef.current.clear();
+            webSpeechRef.current.cancel();
             audioEngineRef.current?.startPlayback(workStart, sc.audioClips, profiles);
+            syncLiveSpeechForTime(sc, workStart);
             applySceneEvaluationRef.current(sc, workStart, 0);
             return;
           }
@@ -2230,6 +2264,8 @@ export function StudioWorkspace() {
           setIsPlaying(false);
           engineRef.current?.setPlaying(false);
           audioEngineRef.current?.stopAll();
+          spokenClipIdsRef.current.clear();
+          webSpeechRef.current.cancel();
           applySceneEvaluationRef.current(sc, workEnd, 0);
           return;
         }
@@ -2237,6 +2273,7 @@ export function StudioWorkspace() {
         timeRef.current = nextTime;
         const profiles = new Map(sc.characters.map((c) => [c.id, c.audioProfile]));
         audioEngineRef.current?.syncPlayback(nextTime, sc.audioClips, profiles);
+        syncLiveSpeechForTime(sc, nextTime);
         applySceneEvaluationRef.current(sc, nextTime, dt);
 
         const nowMs = performance.now();
@@ -2431,7 +2468,12 @@ export function StudioWorkspace() {
       timeRef.current = bounded;
       setCurrentTime(bounded);
       const profiles = new Map(liveScene.characters.map((c) => [c.id, c.audioProfile]));
+      spokenClipIdsRef.current.clear();
+      webSpeechRef.current.cancel();
       audioEngineRef.current?.seek(bounded, liveScene.audioClips, profiles);
+      if (isPlayingRef.current) {
+        syncLiveSpeechForTime(liveScene, bounded);
+      }
       applySceneEvaluation(liveScene, bounded, 0);
     },
     [applySceneEvaluation],
@@ -2452,9 +2494,13 @@ export function StudioWorkspace() {
     engineRef.current?.setPlaying(next);
     if (next) {
       const profiles = new Map(activeScene.characters.map((c) => [c.id, c.audioProfile]));
+      spokenClipIdsRef.current.clear();
       audioEngineRef.current?.startPlayback(timeRef.current, activeScene.audioClips, profiles);
+      syncLiveSpeechForTime(activeScene, timeRef.current);
     } else {
       audioEngineRef.current?.pause();
+      spokenClipIdsRef.current.clear();
+      webSpeechRef.current.cancel();
     }
   }, [activeScene]);
 
@@ -2462,6 +2508,8 @@ export function StudioWorkspace() {
     setIsPlaying(false);
     engineRef.current?.setPlaying(false);
     audioEngineRef.current?.stopAll();
+    spokenClipIdsRef.current.clear();
+    webSpeechRef.current.cancel();
     handleSeek(0);
   }, [handleSeek]);
 
@@ -2822,6 +2870,13 @@ export function StudioWorkspace() {
           commitSceneMutation('Delete Audio Clip', (s) => ({
             ...s,
             audioClips: s.audioClips.filter((c) => c.id !== clipId),
+          }));
+          setSelection({ kind: 'none' });
+        } else if (selectionRef.current.kind === 'caption') {
+          const captionId = selectionRef.current.captionId;
+          commitSceneMutation('Delete Caption', (s) => ({
+            ...s,
+            captions: (s.captions ?? []).filter((c) => c.id !== captionId),
           }));
           setSelection({ kind: 'none' });
         } else if (selectionRef.current.kind === 'action-clip') {
@@ -3285,8 +3340,232 @@ export function StudioWorkspace() {
         isPlaying,
         selection,
         rigNodesByInstance,
+        undefined,
+        assets,
       ),
     [activeProject, activeScene, currentTime, isPlaying, selection, rigNodesByInstance],
+  );
+
+
+  const registerSynthAudioAsset = useCallback(
+    (assetId: string, preset: AudioSynthPreset, durationSec: number, name: string) => {
+      if (!audioEngineRef.current) return;
+      const synth = audioEngineRef.current.synthesizePresetAsset(assetId, preset, durationSec);
+      setAssets((prev) => {
+        if (prev.some((a) => a.id === assetId)) return prev;
+        const record: AssetRecord = {
+          id: assetId,
+          name,
+          kind: 'audio',
+          fileName: `${preset}.wav`,
+          mimeType: 'audio/wav',
+          sizeBytes: Math.round(synth.duration * 44100 * 2),
+          createdAt: Date.now(),
+          audioDuration: synth.duration,
+          waveformPeaks: synth.peaks,
+        };
+        return [record, ...prev];
+      });
+    },
+    [],
+  );
+
+  const reportExportProgress = useCallback(
+    (payload: Record<string, unknown>) => {
+      void fetch('/api/ai/export-progress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+    },
+    [],
+  );
+
+  const startAiVideoExport = useCallback(
+    async (cmd: AiBridgeCommand, fallbackSceneId: string) => {
+      const exportId = cmd.exportId || createId('exp');
+      const engine = engineRef.current;
+      const audioEng = audioEngineRef.current;
+      if (!engine || !audioEng) {
+        reportExportProgress({
+          exportId,
+          status: 'failed',
+          error: 'Studio 3D renderer is not initialized.',
+        });
+        return;
+      }
+      if (exportAbortRef.current) {
+        exportAbortRef.current.abort();
+      }
+      handleStop();
+
+      const targetSc =
+        projectRef.current.scenes.find((s) => s.id === (cmd.sceneId || fallbackSceneId)) ?? sceneRef.current;
+      const scenesToExport = cmd.scope === 'project' ? projectRef.current.scenes : [targetSc];
+      const aspect = cmd.aspectRatio ?? '16:9';
+      const quality = cmd.quality ?? '720p';
+      const dims = computeExportDimensions(aspect, quality);
+      const fps = cmd.fps === 24 || cmd.fps === 60 ? cmd.fps : 30;
+      const includeAudio = cmd.includeAudio !== false;
+      const includeCaptions = cmd.includeCaptions !== false;
+      const steppedFrames = cmd.steppedFrames !== false;
+      const chosenFormat = pickPreferredExportFormat(cmd.format ?? 'auto', includeAudio);
+      if (!chosenFormat) {
+        reportExportProgress({
+          exportId,
+          status: 'failed',
+          error: 'This browser does not support MediaRecorder video encoding.',
+        });
+        return;
+      }
+
+      const durationSec = scenesToExport.reduce((acc, s) => acc + Math.max(0.5, s.duration), 0);
+      const abort = new AbortController();
+      exportAbortRef.current = abort;
+      activeAiExportIdRef.current = exportId;
+      setExporting(true);
+      setExportProgress(0);
+      setExportStatusText('Recording AI video export...');
+
+      reportExportProgress({
+        exportId,
+        sessionId: cmd.sessionId,
+        sceneId: targetSc.id,
+        status: 'rendering',
+        progress: 0,
+        statusText: 'Starting video recording...',
+        width: dims.width,
+        height: dims.height,
+        fps,
+        durationSec,
+        mimeType: chosenFormat.mimeType,
+        ext: chosenFormat.ext,
+      });
+
+      let lastPostMs = 0;
+      try {
+        const blob = await exportScenesToVideo(engine, audioEng, {
+          scenes: scenesToExport,
+          fps,
+          width: dims.width,
+          height: dims.height,
+          mimeType: chosenFormat.mimeType,
+          includeAudio,
+          includeCaptions,
+          steppedFrames,
+          signal: abort.signal,
+          onSceneSwitch: (sceneIdx, localTime) => {
+            const sc = scenesToExport[sceneIdx];
+            if (sc) {
+              if (sceneRef.current.id !== sc.id) {
+                updateActiveProject((p) => ({ ...p, activeSceneId: sc.id }), false);
+              }
+              applySceneEvaluation(sc, localTime, 1 / fps);
+            }
+          },
+          onProgress: (frac, txt) => {
+            setExportProgress(frac);
+            setExportStatusText(txt);
+            const now = performance.now();
+            if (now - lastPostMs > 450 || frac >= 1) {
+              lastPostMs = now;
+              reportExportProgress({
+                exportId,
+                status: 'rendering',
+                progress: Number(frac.toFixed(3)),
+                statusText: txt,
+              });
+            }
+          },
+        });
+
+        const cleanName = (targetSc.name || projectRef.current.name || 'stagecraft_export').replace(/[^a-z0-9_-]+/gi, '_');
+        const filename = `${cleanName}.${chosenFormat.ext}`;
+        let studioDownloaded = false;
+        if (cmd.downloadInStudio !== false) {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          studioDownloaded = true;
+        }
+
+        const shouldUpload = cmd.uploadToBridge !== false && blob.size <= 24 * 1024 * 1024;
+        if (shouldUpload) {
+          const resp = await fetch(`/api/ai/exports/${encodeURIComponent(exportId)}/upload`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': blob.type || chosenFormat.mimeType,
+              'X-Export-Meta': JSON.stringify({
+                sessionId: cmd.sessionId,
+                sceneId: targetSc.id,
+                filename,
+                mimeType: blob.type || chosenFormat.mimeType,
+                ext: chosenFormat.ext,
+                width: dims.width,
+                height: dims.height,
+                fps,
+                durationSec,
+                studioDownloaded,
+              }),
+            },
+            body: blob,
+          });
+          if (!resp.ok) {
+            reportExportProgress({
+              exportId,
+              status: 'completed',
+              progress: 1,
+              statusText: 'Video recorded and downloaded in Studio browser.',
+              sizeBytes: blob.size,
+              filename,
+              mimeType: blob.type || chosenFormat.mimeType,
+              ext: chosenFormat.ext,
+              width: dims.width,
+              height: dims.height,
+              fps,
+              durationSec,
+              studioDownloaded,
+            });
+          }
+        } else {
+          reportExportProgress({
+            exportId,
+            status: 'completed',
+            progress: 1,
+            statusText: 'Video recorded and downloaded in Studio browser.',
+            sizeBytes: blob.size,
+            filename,
+            mimeType: blob.type || chosenFormat.mimeType,
+            ext: chosenFormat.ext,
+            width: dims.width,
+            height: dims.height,
+            fps,
+            durationSec,
+            studioDownloaded,
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Video export failed.';
+        const cancelled = msg.toLowerCase().includes('cancel');
+        reportExportProgress({
+          exportId,
+          status: cancelled ? 'cancelled' : 'failed',
+          error: msg,
+        });
+      } finally {
+        setExporting(false);
+        exportAbortRef.current = null;
+        if (activeAiExportIdRef.current === exportId) {
+          activeAiExportIdRef.current = null;
+        }
+      }
+    },
+    [applySceneEvaluation, handleStop, reportExportProgress, updateActiveProject],
   );
 
   const runAiQueue = useCallback(async () => {
@@ -3351,6 +3630,67 @@ export function StudioWorkspace() {
           setAiBatchUndoStack((prev) => [cloneScene(initialTargetScene), ...prev].slice(0, 15));
         }
 
+
+        const preloadedAudioAssets = new Map<string, { assetId: string; duration: number; name: string }>();
+        for (const cmd of batch.commands) {
+          if ((cmd.op === 'add_dialogue' || cmd.op === 'add_audio_clip') && audioEngineRef.current) {
+            if (cmd.audioBase64) {
+              try {
+                const aid = createId('audio');
+                const decoded = await audioEngineRef.current.decodeAudioFromBase64(aid, cmd.audioBase64);
+                const rec: AssetRecord = {
+                  id: aid,
+                  name: cmd.name?.trim() || 'AI Audio',
+                  kind: 'audio',
+                  fileName: `${aid}.mp3`,
+                  mimeType: decoded.mimeType,
+                  sizeBytes: decoded.byteLength,
+                  createdAt: Date.now(),
+                  audioDuration: decoded.duration,
+                  waveformPeaks: decoded.peaks,
+                };
+                setAssets((prev) => [rec, ...prev]);
+                preloadedAudioAssets.set(`b64:${cmd.audioBase64.slice(0, 48)}`, {
+                  assetId: aid,
+                  duration: decoded.duration,
+                  name: rec.name,
+                });
+              } catch {
+                // Handled cleanly as missing audio
+              }
+            } else if (cmd.audioUrl) {
+              try {
+                const resp = await fetch(cmd.audioUrl);
+                if (resp.ok) {
+                  const buf = await resp.arrayBuffer();
+                  const aid = createId('audio');
+                  const decoded = await audioEngineRef.current.decodeAudioAsset(aid, buf);
+                  const rec: AssetRecord = {
+                    id: aid,
+                    name: cmd.name?.trim() || cmd.audioUrl.split('/').pop() || 'AI Audio URL',
+                    kind: 'audio',
+                    fileName: `${aid}.mp3`,
+                    mimeType: resp.headers.get('content-type') || 'audio/mpeg',
+                    sizeBytes: buf.byteLength,
+                    createdAt: Date.now(),
+                    audioDuration: decoded.duration,
+                    waveformPeaks: decoded.peaks,
+                  };
+                  await dbSaveAsset(rec, buf).catch(() => {});
+                  setAssets((prev) => [rec, ...prev]);
+                  preloadedAudioAssets.set(cmd.audioUrl, {
+                    assetId: aid,
+                    duration: decoded.duration,
+                    name: rec.name,
+                  });
+                }
+              } catch {
+                // Handled cleanly if fetch blocked by CORS or network
+              }
+            }
+          }
+        }
+
         const fastBatch = aiStepDelayRef.current === 0 && batch.commands.length > 8;
         const results: { index: number; op: string; ok: boolean; summary: string }[] = [];
 
@@ -3385,12 +3725,71 @@ export function StudioWorkspace() {
             projectRef.current.scenes.find((s) => s.id === targetSceneId) ?? initialTargetScene;
           const isViewingThisScene = targetSceneId === sceneRef.current.id;
 
+
+          if (cmd.op === 'capture_frame') {
+            const frameId = cmd.exportId || createId('frame');
+            if (!engineRef.current) {
+              results.push({ index: i, op: cmd.op, ok: false, summary: '3D renderer is not ready.' });
+              continue;
+            }
+            try {
+              const targetT = typeof cmd.time === 'number' ? Math.max(0, cmd.time) : timeRef.current;
+              const mime = cmd.format === 'webm' || (cmd.format as string) === 'png' ? 'image/png' : 'image/jpeg';
+              const captured = await captureSceneFrame(engineRef.current, liveTargetScene, targetT, {
+                width: cmd.width ?? 1280,
+                height: cmd.height ?? 720,
+                includeCaptions: cmd.includeCaptions !== false,
+                mimeType: mime,
+                quality: 0.85,
+                onEvaluateAtTime: (t) => applySceneEvaluation(liveTargetScene, t, 0),
+              });
+              const ext = mime === 'image/png' ? 'png' : 'jpg';
+              await fetch(`/api/ai/exports/${encodeURIComponent(frameId)}/upload`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': captured.mimeType,
+                  'X-Export-Meta': JSON.stringify({
+                    sessionId: batch.sessionId,
+                    sceneId: liveTargetScene.id,
+                    filename: `${liveTargetScene.name.replace(/[^a-z0-9_-]+/gi, '_')}_frame.${ext}`,
+                    mimeType: captured.mimeType,
+                    ext,
+                    width: captured.width,
+                    height: captured.height,
+                    durationSec: 0,
+                    dataUrl: captured.dataUrl.length <= 800000 ? captured.dataUrl : undefined,
+                  }),
+                },
+                body: captured.blob,
+              });
+              results.push({
+                index: i,
+                op: cmd.op,
+                ok: true,
+                summary: `Captured ${captured.width}x${captured.height} frame @ ${targetT.toFixed(2)}s (${frameId})`,
+              });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : 'Frame capture failed.';
+              reportExportProgress({ exportId: frameId, status: 'failed', error: msg });
+              results.push({ index: i, op: cmd.op, ok: false, summary: msg });
+            }
+            continue;
+          }
+
           const res = executeSingleAiCommand(
             {
               scene: liveTargetScene,
               currentTime: isViewingThisScene ? timeRef.current : 0,
               rigNodesByInstance: rigNodesRef.current,
               ensureSessionScene: (sid, scId, scName) => ensureAiSessionScene(sid, scId, scName),
+              registerSynthAudio: registerSynthAudioAsset,
+              preloadedAudioAssets,
+              startVideoExport: (exportCmd) => {
+                void startAiVideoExport(exportCmd, targetSceneId);
+              },
+              cancelVideoExport: () => {
+                exportAbortRef.current?.abort();
+              },
               updateScene: (mutator, desc) => commitSceneMutationForId(targetSceneId, desc, mutator),
               setSelection: (t) => {
                 if (targetSceneId === sceneRef.current.id) setSelection(t);
@@ -3512,6 +3911,7 @@ export function StudioWorkspace() {
           updatedTargetScene.id === sceneRef.current.id ? selectionRef.current : { kind: 'none' },
           rigNodesRef.current,
           batch.sessionId,
+          assetsRef.current,
         );
         void fetch('/api/ai/ack', {
           method: 'POST',
@@ -3532,9 +3932,13 @@ export function StudioWorkspace() {
       aiProcessingRef.current = false;
     }
   }, [
+    applySceneEvaluation,
     commitSceneMutationForId,
     ensureAiSessionScene,
     handleBakeHtmlMotion,
+    registerSynthAudioAsset,
+    reportExportProgress,
+    startAiVideoExport,
     handleBreakApartCharacter,
     handleDetachBodyPart,
     handleSeek,
@@ -3730,6 +4134,7 @@ export function StudioWorkspace() {
             sc.id === activeScene.id ? selection : { kind: 'none' },
             rigNodesByInstance,
             sess.sessionId,
+            assets,
           );
         }
       }
@@ -3747,6 +4152,8 @@ export function StudioWorkspace() {
           sc.id === activeScene.id ? isPlaying : false,
           sc.id === activeScene.id ? selection : { kind: 'none' },
           rigNodesByInstance,
+          undefined,
+          assets,
         ),
       }));
 
@@ -4948,6 +5355,9 @@ export function StudioWorkspace() {
           characterCount={activeScene.characters.length}
           propCount={activeScene.props?.length ?? 0}
           beginnerTip={beginnerTip}
+          captions={activeScene.captions ?? []}
+          currentTime={currentTime}
+          showCaptions={true}
           isolatedIframeHtml={isolatedIframeData}
           onRegisterIframe={(instId, el) => {
             const adp = engineRef.current?.getAdapter(instId);
@@ -5664,7 +6074,24 @@ export function StudioWorkspace() {
             const char = activeScene.characters.find((c) => c.id === clip.characterInstanceId);
             audioEngineRef.current?.previewClip(clip, char?.audioProfile);
           }}
-          onDeleteAudioClip={(clipId) => {
+          onUpdateCaption={(captionId, patch) =>
+            commitSceneMutation(
+              'Update Caption',
+              (s) => ({
+                ...s,
+                captions: (s.captions ?? []).map((c) => (c.id === captionId ? { ...c, ...patch } : c)),
+              }),
+              `cap:${captionId}`,
+            )
+          }
+          onDeleteCaption={(captionId) => {
+            commitSceneMutation('Delete Caption', (s) => ({
+              ...s,
+              captions: (s.captions ?? []).filter((c) => c.id !== captionId),
+            }));
+            setSelection({ kind: 'none' });
+          }}
+        onDeleteAudioClip={(clipId) => {
             commitSceneMutation('Delete Audio Clip', (s) => ({
               ...s,
               audioClips: s.audioClips.filter((c) => c.id !== clipId),
@@ -5896,6 +6323,24 @@ export function StudioWorkspace() {
             }),
             `moveaud:${clipId}`,
           )
+        }
+        onMoveCaption={(captionId, startTime, duration) =>
+          commitSceneMutation(
+            'Move Caption',
+            (s) => ({
+              ...s,
+              captions: (s.captions ?? []).map((c) =>
+                c.id === captionId ? { ...c, startTime, duration: duration ?? c.duration } : c,
+              ),
+            }),
+            `movecap:${captionId}`,
+          )
+        }
+        onDeleteCaption={(captionId) =>
+          commitSceneMutation('Delete Caption', (s) => ({
+            ...s,
+            captions: (s.captions ?? []).filter((c) => c.id !== captionId),
+          }))
         }
         onDeleteAudioClip={(clipId) =>
           commitSceneMutation('Delete Audio Clip', (s) => ({
@@ -6184,6 +6629,7 @@ export function StudioWorkspace() {
           volume,
           playbackRate,
           pauseAfterSec,
+          createCaption,
         }) => {
           const char = activeScene.characters.find((c) => c.id === characterInstanceId);
           const clip: AudioClipData = {
@@ -6203,9 +6649,23 @@ export function StudioWorkspace() {
             playbackRate,
             pauseAfterSec,
           };
+          const newCap: CaptionItem | null =
+            createCaption !== false && dialogueText.trim()
+              ? {
+                  id: createId('cap'),
+                  text: dialogueText.trim(),
+                  speaker: char?.name,
+                  characterInstanceId,
+                  startTime,
+                  duration,
+                  linkedAudioClipId: clip.id,
+                  style: { position: 'bottom' },
+                }
+              : null;
           commitSceneMutation(`Add Dialogue Clip`, (s) => ({
             ...s,
             audioClips: [...s.audioClips, clip],
+            ...(newCap ? { captions: [...(s.captions ?? []), newCap] } : {}),
           }));
           setSelection({ kind: 'audio-clip', clipId: clip.id });
         }}
@@ -6220,7 +6680,7 @@ export function StudioWorkspace() {
         progress={exportProgress}
         statusText={exportStatusText}
         onCancelExport={() => exportAbortRef.current?.abort()}
-        onStartExport={async ({ scope, width, height, fps, mimeType, ext, includeAudio, steppedFrames }) => {
+        onStartExport={async ({ scope, width, height, fps, mimeType, ext, includeAudio, includeCaptions, steppedFrames }) => {
           if (!engineRef.current || !audioEngineRef.current) return;
           handleStop();
           const scenesToExport = scope === 'project' ? activeProject.scenes : [activeScene];
@@ -6238,6 +6698,7 @@ export function StudioWorkspace() {
               height,
               mimeType,
               includeAudio,
+              includeCaptions,
               steppedFrames,
               signal: abort.signal,
               onSceneSwitch: (sceneIdx, localTime) => {

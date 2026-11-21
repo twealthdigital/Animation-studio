@@ -34,6 +34,8 @@ import type {
   AssetRecord,
   AudioClipData,
   CameraPose,
+  CaptionItem,
+  CaptionPosition,
   CharacterInstanceData,
   EasingType,
   EnvironmentPresetId,
@@ -192,6 +194,8 @@ interface RightInspectorProps {
   onUpdateAudioClip: (clipId: string, patch: Partial<AudioClipData>) => void;
   onPreviewAudioClip: (clip: AudioClipData) => void;
   onDeleteAudioClip: (clipId: string) => void;
+  onUpdateCaption?: (captionId: string, patch: Partial<CaptionItem>) => void;
+  onDeleteCaption?: (captionId: string) => void;
   onUpdateActionClip: (instanceId: string, clipId: string, patch: Partial<ActionClip>) => void;
   onDeleteActionClip: (instanceId: string, clipId: string) => void;
   onUpdateSceneProps: (patch: Partial<SceneData>) => void;
@@ -316,6 +320,8 @@ export function RightInspector({
   onUpdateAudioClip,
   onPreviewAudioClip,
   onDeleteAudioClip,
+  onUpdateCaption,
+  onDeleteCaption,
   onUpdateActionClip,
   onDeleteActionClip,
   onUpdateSceneProps,
@@ -1777,6 +1783,78 @@ export function RightInspector({
     </div>
   );
 
+
+  const renderCaptionInspector = (cap: CaptionItem) => (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between border-b border-[#2a2e36] pb-2">
+        <span className="font-semibold text-[#e6e8ec]">Caption / Subtitle</span>
+        {onDeleteCaption && (
+          <IconButton label="Delete caption" onClick={() => onDeleteCaption(cap.id)}>
+            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+          </IconButton>
+        )}
+      </div>
+      <label className="block">
+        <span className="text-[11px] text-[#98a0ad]">Speaker (Optional)</span>
+        <input
+          type="text"
+          value={cap.speaker ?? ''}
+          placeholder="Speaker name"
+          onChange={(e) => onUpdateCaption?.(cap.id, { speaker: e.target.value || undefined })}
+          className="mt-1 h-7 w-full rounded border border-[#2e333d] bg-[#14161a] px-2 text-xs text-[#e6e8ec]"
+        />
+      </label>
+      <label className="block">
+        <span className="text-[11px] text-[#98a0ad]">Caption Text</span>
+        <textarea
+          rows={3}
+          value={cap.text}
+          onChange={(e) => onUpdateCaption?.(cap.id, { text: e.target.value })}
+          className="mt-1 w-full rounded border border-[#2e333d] bg-[#14161a] p-2 text-xs text-[#e6e8ec]"
+        />
+      </label>
+      <div className="grid grid-cols-2 gap-2">
+        <NumericInput
+          label="In"
+          min={0}
+          value={cap.startTime}
+          onChange={(startTime) => onUpdateCaption?.(cap.id, { startTime })}
+        />
+        <NumericInput
+          label="Dur"
+          min={0.2}
+          value={cap.duration}
+          onChange={(duration) => onUpdateCaption?.(cap.id, { duration })}
+        />
+      </div>
+      <CustomSelect
+        label="Position"
+        value={cap.style?.position ?? 'bottom'}
+        options={[
+          { value: 'bottom', label: 'Bottom (Subtitle)' },
+          { value: 'center', label: 'Center (Title Card)' },
+          { value: 'top', label: 'Top Banner' },
+        ]}
+        onChange={(v) =>
+          onUpdateCaption?.(cap.id, {
+            style: { ...(cap.style ?? {}), position: v as CaptionPosition },
+          })
+        }
+      />
+      <StudioSlider
+        label="Font Size (720p base)"
+        min={14}
+        max={56}
+        step={1}
+        value={cap.style?.fontSize ?? 26}
+        displayValue={`${cap.style?.fontSize ?? 26}px`}
+        onChange={(fontSize) =>
+          onUpdateCaption?.(cap.id, { style: { ...(cap.style ?? {}), fontSize } })
+        }
+      />
+    </div>
+  );
+
   const renderActionClipInspector = (instanceId: string, clip: ActionClip) => (
     <div className="space-y-4">
       <div className="flex items-center justify-between border-b border-[#2a2e36] pb-2">
@@ -2442,6 +2520,9 @@ export function RightInspector({
     body = renderCameraInspector();
   } else if (selection.kind === 'audio-clip' && selectedAudioClip) {
     body = renderAudioInspector(selectedAudioClip);
+  } else if (selection.kind === 'caption') {
+    const cap = (activeScene.captions ?? []).find((c) => c.id === selection.captionId);
+    body = cap ? renderCaptionInspector(cap) : renderSceneInspector();
   } else if (selection.kind === 'action-clip' && selectedActionClip && selection.kind === 'action-clip') {
     body = renderActionClipInspector(selection.instanceId, selectedActionClip);
   } else {

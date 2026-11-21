@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { Express, Request, Response } from 'express';
+import express, { type Express, type Request, type Response } from 'express';
 
 export type SceneEventCause =
   | 'new_session'
@@ -80,6 +80,31 @@ interface StoredCloudProject {
   assets: unknown[];
 }
 
+
+export interface ExportJobRecord {
+  exportId: string;
+  sessionId?: string;
+  sceneId?: string;
+  kind: 'video' | 'frame';
+  status: 'queued' | 'rendering' | 'completed' | 'failed' | 'cancelled';
+  progress: number;
+  statusText: string;
+  filename?: string;
+  mimeType?: string;
+  ext?: string;
+  width?: number;
+  height?: number;
+  fps?: number;
+  durationSec?: number;
+  sizeBytes?: number;
+  studioDownloaded?: boolean;
+  downloadUrl?: string;
+  dataUrl?: string;
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 interface StudioTabRecord {
   tabId: string;
   lastSeenAt: number;
@@ -111,6 +136,9 @@ export interface BridgeMemoryStore {
   history: PendingBatch[];
   ackResults: Map<string, Record<string, unknown>>;
   cloudProjects: Record<string, StoredCloudProject>;
+  exports: Record<string, ExportJobRecord>;
+  exportFiles: Map<string, Buffer>;
+  exportWaiters: Map<string, { resolve: (rec: ExportJobRecord) => void; timer: ReturnType<typeof setTimeout> }[]>;
   hasLoadedSnapshot: boolean;
 }
 
@@ -200,6 +228,9 @@ function getStore(): BridgeMemoryStore {
       history: [],
       ackResults: new Map<string, Record<string, unknown>>(),
       cloudProjects: {},
+      exports: {},
+      exportFiles: new Map<string, Buffer>(),
+      exportWaiters: new Map(),
       hasLoadedSnapshot: false,
     };
   }
@@ -1031,8 +1062,180 @@ export const COMMAND_SCHEMA_SUMMARY = {
     { op: 'pause' },
     { op: 'bake_html_motion', characterId: 'string' },
     { op: 'rename_scene', name: 'string' },
+    { op: 'add_caption', text: 'string', speaker: 'optional string', characterId: 'optional string', startTime: 'number (seconds)', duration: 'optional number', captionPosition: 'bottom|top|center', fontSize: 'optional number', textColor: 'optional #hex', backgroundColor: 'optional rgba/hex', speakerColor: 'optional #hex' },
+    { op: 'update_caption', captionId: 'string', text: 'optional string', speaker: 'optional string', startTime: 'optional number', duration: 'optional number', captionPosition: 'bottom|top|center' },
+    { op: 'delete_caption', captionId: 'string' },
+    { op: 'clear_captions' },
+    { op: 'add_dialogue', characterId: 'optional string', speaker: 'optional string', text: 'string (supports | split)', startTime: 'number', duration: 'optional number', volume: '0..2', speed: '0.5..2', pauseAfterSec: 0.35, createCaption: true, captionPosition: 'bottom|top|center', audioUrl: 'optional url', audioBase64: 'optional base64', cuePreset: 'optional sfx preset' },
+    { op: 'add_audio_clip', role: 'sfx|music|ambient|dialogue', name: 'optional string', preset: 'chime|bell|pop|whoosh|thud|footstep|boom|laser|click|success|alert|riser|ambient-pad|music-pulse', audioUrl: 'optional url', audioBase64: 'optional base64', assetId: 'optional existing audio assetId', startTime: 0, duration: 1.5, volume: 0.85, fadeIn: 0.05, fadeOut: 0.1 },
+    { op: 'update_audio_clip', clipId: 'string', startTime: 'optional number', duration: 'optional number', volume: 'optional number', muted: 'optional boolean', dialogueText: 'optional string' },
+    { op: 'delete_audio_clip', clipId: 'string', keepCaption: false },
+    { op: 'set_character_voice', characterId: 'string', voiceLabel: 'optional string', pitch: '0.5..2', speed: '0.5..2', volume: '0..2', pan: '-1..1' },
+    { op: 'export_video', scope: 'scene|project', aspectRatio: '16:9|9:16|1:1|4:3', quality: '540p|720p|1080p', fps: 30, format: 'auto|mp4|webm', includeAudio: true, includeCaptions: true, steppedFrames: true },
+    { op: 'cancel_export' },
+    { op: 'capture_frame', time: 'optional number', width: 1280, height: 720, includeCaptions: true },
   ],
 };
+
+
+function getBaseOrigin(req: Request): string {
+  const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'http';
+  const host = (req.headers['x-forwarded-host'] as string) || req.get('host') || 'localhost:3000';
+  return `${proto}://${host}`;
+}
+
+function sanitizeExportId(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+}
+
+async function upsertExportJob(
+  store: BridgeMemoryStore,
+  exportId: string,
+  patch: Partial<ExportJobRecord>,
+): Promise<ExportJobRecord> {
+  const now = Date.now();
+  const prev = store.exports[exportId];
+  const next: ExportJobRecord = {
+    ...prev,
+    ...patch,
+    exportId,
+    kind: patch.kind ?? prev?.kind ?? 'video',
+    status: patch.status ?? prev?.status ?? 'queued',
+    progress: patch.progress ?? prev?.progress ?? 0,
+    statusText: patch.statusText ?? prev?.statusText ?? 'Queued...',
+    createdAt: prev?.createdAt ?? patch.createdAt ?? now,
+    updatedAt: now,
+  };
+  store.exports[exportId] = next;
+
+  // Bound stored export metadata entries to latest 20
+  const keys = Object.keys(store.exports);
+  if (keys.length > 20) {
+    keys
+      .sort((a, b) => store.exports[a].updatedAt - store.exports[b].updatedAt)
+      .slice(0, keys.length - 20)
+      .forEach((oldId) => {
+        delete store.exports[oldId];
+        store.exportFiles.delete(oldId);
+      });
+  }
+
+  if (getKvConfig()) {
+    const kvCopy = { ...next, dataUrl: undefined };
+    await kvCommand(['SET', `stagecraft:export:${exportId}`, JSON.stringify(kvCopy), 'EX', 60 * 60]);
+  }
+
+  if (next.status === 'completed' || next.status === 'failed' || next.status === 'cancelled') {
+    const waiters = store.exportWaiters.get(exportId);
+    if (waiters) {
+      store.exportWaiters.delete(exportId);
+      for (const w of waiters) {
+        clearTimeout(w.timer);
+        w.resolve(next);
+      }
+    }
+  }
+  return next;
+}
+
+async function loadExportJob(store: BridgeMemoryStore, exportId: string): Promise<ExportJobRecord | null> {
+  const cleanId = sanitizeExportId(exportId);
+  if (!cleanId) return null;
+  if (store.exports[cleanId]) return store.exports[cleanId];
+  if (getKvConfig()) {
+    const raw = await kvCommand(['GET', `stagecraft:export:${cleanId}`]);
+    if (typeof raw === 'string' && raw) {
+      const parsed = JSON.parse(raw) as ExportJobRecord;
+      store.exports[cleanId] = parsed;
+      return parsed;
+    }
+  }
+  return null;
+}
+
+async function saveExportBinary(
+  store: BridgeMemoryStore,
+  exportId: string,
+  buf: Buffer,
+  ext: string,
+): Promise<void> {
+  const cleanId = sanitizeExportId(exportId);
+  store.exportFiles.set(cleanId, buf);
+  if (store.exportFiles.size > 12) {
+    const firstKey = store.exportFiles.keys().next().value;
+    if (firstKey && firstKey !== cleanId) store.exportFiles.delete(firstKey);
+  }
+  for (const dir of getDataDirCandidates()) {
+    try {
+      const expDir = path.join(dir, 'exports');
+      await fs.mkdir(expDir, { recursive: true });
+      await fs.writeFile(path.join(expDir, `${cleanId}.${ext || 'bin'}`), buf);
+      return;
+    } catch {
+      // Try next candidate
+    }
+  }
+}
+
+async function loadExportBinary(
+  store: BridgeMemoryStore,
+  exportId: string,
+  ext?: string,
+): Promise<Buffer | null> {
+  const cleanId = sanitizeExportId(exportId);
+  const mem = store.exportFiles.get(cleanId);
+  if (mem) return mem;
+  for (const dir of getDataDirCandidates()) {
+    try {
+      const filePath = path.join(dir, 'exports', `${cleanId}.${ext || 'bin'}`);
+      return await fs.readFile(filePath);
+    } catch {
+      // Try next
+    }
+  }
+  return null;
+}
+
+function waitForExportCompletion(
+  store: BridgeMemoryStore,
+  exportId: string,
+  timeoutMs: number,
+): Promise<ExportJobRecord | null> {
+  const existing = store.exports[exportId];
+  if (existing && (existing.status === 'completed' || existing.status === 'failed' || existing.status === 'cancelled')) {
+    return Promise.resolve(existing);
+  }
+  const clamped = Math.max(1500, Math.min(45000, timeoutMs));
+  return new Promise((resolve) => {
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    const entry = {
+      timer: setTimeout(() => {
+        if (pollTimer) clearInterval(pollTimer);
+        const list = store.exportWaiters.get(exportId) ?? [];
+        store.exportWaiters.set(exportId, list.filter((w) => w !== entry));
+        resolve(store.exports[exportId] ?? null);
+      }, clamped),
+      resolve: (rec: ExportJobRecord) => {
+        if (pollTimer) clearInterval(pollTimer);
+        resolve(rec);
+      },
+    };
+    const arr = store.exportWaiters.get(exportId) ?? [];
+    arr.push(entry);
+    store.exportWaiters.set(exportId, arr);
+
+    if (getKvConfig()) {
+      pollTimer = setInterval(async () => {
+        const rec = await loadExportJob(store, exportId);
+        if (rec && (rec.status === 'completed' || rec.status === 'failed' || rec.status === 'cancelled')) {
+          clearTimeout(entry.timer);
+          if (pollTimer) clearInterval(pollTimer);
+          resolve(rec);
+        }
+      }, 300);
+    }
+  });
+}
 
 function findSceneSnapshotById(
   store: BridgeMemoryStore,
@@ -1630,6 +1833,251 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
           additionalProperties: false,
         },
       },
+      {
+        name: 'add_caption',
+        description:
+          'Add a timed caption/subtitle (or title card) to the scene. Visible live in viewport and automatically burned into exported MP4/WebM videos.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string', description: 'Explicit scene ID.' },
+            text: { type: 'string', description: 'Caption/subtitle text to display.' },
+            speaker: { type: 'string', description: 'Optional speaker label above the caption.' },
+            characterId: { type: 'string', description: 'Optional character ID or name to associate as speaker.' },
+            startTime: { type: 'number', description: 'Start time in seconds (defaults to current playhead).' },
+            duration: { type: 'number', description: 'Duration in seconds (auto-estimated from word count if omitted).' },
+            position: { type: 'string', enum: ['bottom', 'center', 'top'], description: 'Screen placement (default bottom).' },
+            fontSize: { type: 'number', description: 'Base font size at 720p (12..72, default 26).' },
+            textColor: { type: 'string' },
+            backgroundColor: { type: 'string' },
+            speakerColor: { type: 'string' },
+            showSpeaker: { type: 'boolean' },
+          },
+          required: ['text'],
+        },
+      },
+      {
+        name: 'update_caption',
+        description: 'Update an existing caption text, speaker, timing, or style.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            captionId: { type: 'string' },
+            text: { type: 'string' },
+            speaker: { type: 'string' },
+            startTime: { type: 'number' },
+            duration: { type: 'number' },
+            position: { type: 'string', enum: ['bottom', 'center', 'top'] },
+            fontSize: { type: 'number' },
+            textColor: { type: 'string' },
+            backgroundColor: { type: 'string' },
+            speakerColor: { type: 'string' },
+            showSpeaker: { type: 'boolean' },
+          },
+          required: ['captionId'],
+        },
+      },
+      {
+        name: 'delete_caption',
+        description: 'Delete a caption from the scene by captionId.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            captionId: { type: 'string' },
+          },
+          required: ['captionId'],
+        },
+      },
+      {
+        name: 'clear_captions',
+        description: 'Remove all captions from the target scene.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+          },
+        },
+      },
+      {
+        name: 'add_dialogue',
+        description:
+          'Add character (or narrator) dialogue with automatic lip-sync animation, browser speech playback, and a synced on-screen caption (burned into exported video). Optionally attach audioUrl, audioBase64, assetId, or cuePreset for embedded WebAudio output.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            characterId: { type: 'string', description: 'Character ID or name (optional for narrator).' },
+            speaker: { type: 'string', description: 'Speaker label shown on captions.' },
+            text: { type: 'string', description: 'Dialogue line (supports "|" to split into timed beats).' },
+            startTime: { type: 'number', description: 'Start time in seconds.' },
+            duration: { type: 'number', description: 'Optional duration in seconds (auto-estimated if omitted).' },
+            volume: { type: 'number', description: 'Clip volume 0..2 (default 1).' },
+            speed: { type: 'number', description: 'Speech rate 0.5..2 (default 1).' },
+            pauseAfterSec: { type: 'number', description: 'Gap between "|" split beats (default 0.35).' },
+            createCaption: { type: 'boolean', description: 'Auto-create synced caption (default true).' },
+            captionPosition: { type: 'string', enum: ['bottom', 'center', 'top'] },
+            audioUrl: { type: 'string', description: 'Optional URL to MP3/WAV/OGG/WebM voice audio.' },
+            audioBase64: { type: 'string', description: 'Optional base64 or data URL voice audio.' },
+            assetId: { type: 'string', description: 'Optional existing audio asset ID from get_state.' },
+            cuePreset: { type: 'string', description: 'Optional built-in synth cue (e.g. chime, pop, bell).' },
+          },
+          required: ['text'],
+        },
+      },
+      {
+        name: 'add_audio_clip',
+        description:
+          'Add a music, ambient, or sound effect (SFX) clip to the timeline. Supports built-in synthesized presets (no external file needed!) as well as audioUrl, audioBase64, or existing assetId.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            role: { type: 'string', enum: ['sfx', 'music', 'ambient', 'dialogue'] },
+            name: { type: 'string' },
+            preset: {
+              type: 'string',
+              enum: ['chime', 'bell', 'pop', 'whoosh', 'thud', 'footstep', 'boom', 'laser', 'click', 'success', 'alert', 'riser', 'ambient-pad', 'music-pulse'],
+              description: 'Built-in WebAudio procedural sound preset (plays live and exports into video audio track).',
+            },
+            audioUrl: { type: 'string' },
+            audioBase64: { type: 'string' },
+            assetId: { type: 'string' },
+            startTime: { type: 'number' },
+            duration: { type: 'number' },
+            volume: { type: 'number' },
+            fadeIn: { type: 'number' },
+            fadeOut: { type: 'number' },
+            playbackRate: { type: 'number' },
+            muted: { type: 'boolean' },
+          },
+        },
+      },
+      {
+        name: 'update_audio_clip',
+        description: 'Update timing, volume, fades, mute, or dialogueText of an audio clip (also updates any linked caption).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            clipId: { type: 'string' },
+            name: { type: 'string' },
+            dialogueText: { type: 'string' },
+            startTime: { type: 'number' },
+            duration: { type: 'number' },
+            volume: { type: 'number' },
+            fadeIn: { type: 'number' },
+            fadeOut: { type: 'number' },
+            playbackRate: { type: 'number' },
+            muted: { type: 'boolean' },
+          },
+          required: ['clipId'],
+        },
+      },
+      {
+        name: 'delete_audio_clip',
+        description: 'Delete an audio/dialogue clip by clipId (and its linked caption unless keepCaption=true).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            clipId: { type: 'string' },
+            keepCaption: { type: 'boolean' },
+          },
+          required: ['clipId'],
+        },
+      },
+      {
+        name: 'set_character_voice',
+        description: 'Configure a character voice profile (pitch, speed, defaultVolume, pan, voiceLabel, muted).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            characterId: { type: 'string' },
+            voiceLabel: { type: 'string' },
+            pitch: { type: 'number' },
+            speed: { type: 'number' },
+            volume: { type: 'number' },
+            pan: { type: 'number' },
+            muted: { type: 'boolean' },
+          },
+          required: ['characterId'],
+        },
+      },
+      {
+        name: 'export_video',
+        description:
+          'Record and export the animated 3D scene (or full multi-scene project) to MP4/WebM video with mixed audio and burned-in captions. Triggers Studio recording and returns completion status + downloadUrl (or rendering exportId to poll with get_export_status).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            scope: { type: 'string', enum: ['scene', 'project'], description: 'Export active scene or full story (default scene).' },
+            aspectRatio: { type: 'string', enum: ['16:9', '9:16', '1:1', '4:3'], description: 'Default 16:9.' },
+            quality: { type: 'string', enum: ['540p', '720p', '1080p'], description: 'Default 720p.' },
+            fps: { type: 'number', enum: [24, 30, 60], description: 'Default 30.' },
+            format: { type: 'string', enum: ['auto', 'mp4', 'webm'], description: 'Preferred container format (default auto).' },
+            includeAudio: { type: 'boolean', description: 'Include mixed audio track (default true).' },
+            includeCaptions: { type: 'boolean', description: 'Burn on-screen captions into video frames (default true).' },
+            steppedFrames: { type: 'boolean', description: 'Deterministic stepped frame capture (default true).' },
+            downloadInStudio: { type: 'boolean', description: 'Also trigger file download in the Studio browser tab (default true).' },
+            uploadToBridge: { type: 'boolean', description: 'Upload finished video to server for downloadUrl access (default true).' },
+            waitForCompletion: { type: 'boolean', description: 'Wait up to 22s for recording to finish before returning (default true).' },
+          },
+        },
+      },
+      {
+        name: 'get_export_status',
+        description: 'Check progress, resolution, file size, and downloadUrl of an export_video job.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            exportId: { type: 'string', description: 'Export ID returned by export_video (omit for latest).' },
+          },
+        },
+      },
+      {
+        name: 'cancel_export',
+        description: 'Cancel an in-progress video recording in Stagecraft 3D.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            exportId: { type: 'string' },
+          },
+        },
+      },
+      {
+        name: 'capture_frame',
+        description:
+          'Capture a PNG/JPEG render of the Scene Camera (with captions composited) at an optional timestamp so the AI can visually inspect the scene or save a still image.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string' },
+            sceneId: { type: 'string' },
+            time: { type: 'number', description: 'Optional timeline time in seconds to evaluate before capturing.' },
+            width: { type: 'number', description: 'Image width (default 1280).' },
+            height: { type: 'number', description: 'Image height (default 720).' },
+            format: { type: 'string', enum: ['jpeg', 'png'], description: 'Default jpeg.' },
+            includeCaptions: { type: 'boolean', description: 'Composite active captions onto frame (default true).' },
+            includeImage: { type: 'boolean', description: 'Return MCP image content block alongside metadata (default true).' },
+          },
+        },
+      }
     ];
     res.json({ jsonrpc: '2.0', id, result: { tools } });
     return;
@@ -1847,6 +2295,403 @@ async function handleMcpPost(req: Request, res: Response): Promise<void> {
               ),
             },
           ],
+        },
+      });
+      return;
+    }
+
+
+    const SINGLE_CMD_TOOLS: Record<string, string> = {
+      add_caption: 'add_caption',
+      update_caption: 'update_caption',
+      delete_caption: 'delete_caption',
+      clear_captions: 'clear_captions',
+      add_dialogue: 'add_dialogue',
+      add_audio_clip: 'add_audio_clip',
+      update_audio_clip: 'update_audio_clip',
+      delete_audio_clip: 'delete_audio_clip',
+      set_character_voice: 'set_character_voice',
+    };
+
+    if (toolName in SINGLE_CMD_TOOLS) {
+      const argSessionId = typeof toolArgs.sessionId === 'string' ? toolArgs.sessionId : undefined;
+      const argSceneId = typeof toolArgs.sceneId === 'string' ? toolArgs.sceneId : undefined;
+      const resolved = resolveExistingTarget(store, req, {
+        explicitSessionId: argSessionId,
+        explicitSceneId: argSceneId,
+        clientLabel: 'Claude',
+        clientFingerprint: fp,
+      });
+      if (!resolved.ok) {
+        await savePersistedBridge(store);
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  { ok: false, errorCode: resolved.errorCode, error: resolved.error, ...resolved.extra },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          },
+        });
+        return;
+      }
+      if (resolved.sessionId) res.setHeader('Mcp-Session-Id', resolved.sessionId);
+      const cmdPayload: Record<string, unknown> = {
+        ...toolArgs,
+        op: SINGLE_CMD_TOOLS[toolName],
+        ...(typeof toolArgs.position === 'string' ? { captionPosition: toolArgs.position, position: undefined } : {}),
+      };
+      const outcome = await dispatchCommandsToStudio(
+        store,
+        {
+          session: resolved.session,
+          sessionId: resolved.sessionId,
+          sceneId: resolved.sceneId,
+          sceneName: resolved.sceneName,
+        },
+        [cmdPayload],
+        resolved.session?.label ?? 'Claude',
+        true,
+      );
+      res.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          isError: outcome.ok === false,
+          content: [{ type: 'text', text: JSON.stringify(outcome, null, 2) }],
+        },
+      });
+      return;
+    }
+
+    if (toolName === 'export_video') {
+      const argSessionId = typeof toolArgs.sessionId === 'string' ? toolArgs.sessionId : undefined;
+      const argSceneId = typeof toolArgs.sceneId === 'string' ? toolArgs.sceneId : undefined;
+      const resolved = resolveExistingTarget(store, req, {
+        explicitSessionId: argSessionId,
+        explicitSceneId: argSceneId,
+        clientLabel: 'Claude',
+        clientFingerprint: fp,
+      });
+      if (!resolved.ok) {
+        await savePersistedBridge(store);
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  { ok: false, errorCode: resolved.errorCode, error: resolved.error, ...resolved.extra },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          },
+        });
+        return;
+      }
+      if (resolved.sessionId) res.setHeader('Mcp-Session-Id', resolved.sessionId);
+
+      const exportId = `exp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      await upsertExportJob(store, exportId, {
+        sessionId: resolved.sessionId,
+        sceneId: resolved.sceneId,
+        kind: 'video',
+        status: 'queued',
+        progress: 0,
+        statusText: 'Dispatching video export to Stagecraft 3D...',
+      });
+
+      const exportCmd = {
+        ...toolArgs,
+        op: 'export_video',
+        exportId,
+        sessionId: resolved.sessionId,
+        sceneId: resolved.sceneId,
+      };
+      const dispatchOutcome = await dispatchCommandsToStudio(
+        store,
+        {
+          session: resolved.session,
+          sessionId: resolved.sessionId,
+          sceneId: resolved.sceneId,
+          sceneName: resolved.sceneName,
+        },
+        [exportCmd],
+        resolved.session?.label ?? 'Claude',
+        true,
+        false,
+        8000,
+      );
+
+      if (dispatchOutcome.ok === false && dispatchOutcome.status === 'studio_offline') {
+        await upsertExportJob(store, exportId, {
+          status: 'failed',
+          error: String(dispatchOutcome.error ?? 'Studio is offline.'),
+        });
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            isError: true,
+            content: [{ type: 'text', text: JSON.stringify(dispatchOutcome, null, 2) }],
+          },
+        });
+        return;
+      }
+
+      const waitForCompletion = toolArgs.waitForCompletion !== false;
+      const finalRec = waitForCompletion
+        ? await waitForExportCompletion(store, exportId, 22000)
+        : store.exports[exportId] ?? null;
+
+      const baseOrigin = getBaseOrigin(req);
+      const downloadUrl =
+        finalRec?.downloadUrl && finalRec.downloadUrl.startsWith('/')
+          ? `${baseOrigin}${finalRec.downloadUrl}`
+          : finalRec?.downloadUrl;
+
+      res.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          isError: finalRec?.status === 'failed',
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  ok: finalRec?.status !== 'failed',
+                  exportId,
+                  sessionId: resolved.sessionId,
+                  sceneId: resolved.sceneId,
+                  sceneName: resolved.sceneName,
+                  status: finalRec?.status ?? 'rendering',
+                  progress: finalRec?.progress ?? 0,
+                  statusText: finalRec?.statusText ?? 'Recording in Stagecraft 3D...',
+                  mimeType: finalRec?.mimeType,
+                  ext: finalRec?.ext,
+                  width: finalRec?.width,
+                  height: finalRec?.height,
+                  fps: finalRec?.fps,
+                  durationSec: finalRec?.durationSec,
+                  sizeBytes: finalRec?.sizeBytes,
+                  studioDownloaded: finalRec?.studioDownloaded,
+                  downloadUrl,
+                  ...(finalRec?.error ? { error: finalRec.error } : {}),
+                  ...(finalRec?.status === 'rendering' || finalRec?.status === 'queued'
+                    ? { note: 'Video recording is still running in Stagecraft 3D. Call get_export_status with exportId to track completion and get downloadUrl.' }
+                    : {}),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        },
+      });
+      return;
+    }
+
+    if (toolName === 'get_export_status') {
+      let exportId = typeof toolArgs.exportId === 'string' ? toolArgs.exportId.trim() : '';
+      if (!exportId) {
+        const latest = Object.values(store.exports).sort((a, b) => b.updatedAt - a.updatedAt)[0];
+        exportId = latest?.exportId ?? '';
+      }
+      const rec = exportId ? await loadExportJob(store, exportId) : null;
+      if (!rec) {
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ ok: false, error: 'Export ID not found.', exportId }, null, 2),
+              },
+            ],
+          },
+        });
+        return;
+      }
+      const baseOrigin = getBaseOrigin(req);
+      const downloadUrl =
+        rec.downloadUrl && rec.downloadUrl.startsWith('/')
+          ? `${baseOrigin}${rec.downloadUrl}`
+          : rec.downloadUrl;
+      res.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          isError: rec.status === 'failed',
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ ok: rec.status !== 'failed', ...rec, downloadUrl, dataUrl: undefined }, null, 2),
+            },
+          ],
+        },
+      });
+      return;
+    }
+
+    if (toolName === 'cancel_export') {
+      const argSessionId = typeof toolArgs.sessionId === 'string' ? toolArgs.sessionId : undefined;
+      const argSceneId = typeof toolArgs.sceneId === 'string' ? toolArgs.sceneId : undefined;
+      const resolved = resolveExistingTarget(store, req, {
+        explicitSessionId: argSessionId,
+        explicitSceneId: argSceneId,
+        clientLabel: 'Claude',
+        clientFingerprint: fp,
+      });
+      if (!resolved.ok) {
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: { isError: true, content: [{ type: 'text', text: JSON.stringify(resolved, null, 2) }] },
+        });
+        return;
+      }
+      const outcome = await dispatchCommandsToStudio(
+        store,
+        {
+          session: resolved.session,
+          sessionId: resolved.sessionId,
+          sceneId: resolved.sceneId,
+          sceneName: resolved.sceneName,
+        },
+        [{ op: 'cancel_export', exportId: toolArgs.exportId }],
+        resolved.session?.label ?? 'Claude',
+        true,
+      );
+      res.json({
+        jsonrpc: '2.0',
+        id,
+        result: { content: [{ type: 'text', text: JSON.stringify(outcome, null, 2) }] },
+      });
+      return;
+    }
+
+    if (toolName === 'capture_frame') {
+      const argSessionId = typeof toolArgs.sessionId === 'string' ? toolArgs.sessionId : undefined;
+      const argSceneId = typeof toolArgs.sceneId === 'string' ? toolArgs.sceneId : undefined;
+      const resolved = resolveExistingTarget(store, req, {
+        explicitSessionId: argSessionId,
+        explicitSceneId: argSceneId,
+        clientLabel: 'Claude',
+        clientFingerprint: fp,
+      });
+      if (!resolved.ok) {
+        await savePersistedBridge(store);
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  { ok: false, errorCode: resolved.errorCode, error: resolved.error, ...resolved.extra },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          },
+        });
+        return;
+      }
+      if (resolved.sessionId) res.setHeader('Mcp-Session-Id', resolved.sessionId);
+
+      const frameId = `frame_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      await upsertExportJob(store, frameId, {
+        sessionId: resolved.sessionId,
+        sceneId: resolved.sceneId,
+        kind: 'frame',
+        status: 'rendering',
+        progress: 0,
+        statusText: 'Capturing Scene Camera frame...',
+      });
+
+      const outcome = await dispatchCommandsToStudio(
+        store,
+        {
+          session: resolved.session,
+          sessionId: resolved.sessionId,
+          sceneId: resolved.sceneId,
+          sceneName: resolved.sceneName,
+        },
+        [{ ...toolArgs, op: 'capture_frame', exportId: frameId }],
+        resolved.session?.label ?? 'Claude',
+        true,
+        false,
+        15000,
+      );
+
+      const frameRec = await waitForExportCompletion(store, frameId, 4000);
+      const baseOrigin = getBaseOrigin(req);
+      const downloadUrl =
+        frameRec?.downloadUrl && frameRec.downloadUrl.startsWith('/')
+          ? `${baseOrigin}${frameRec.downloadUrl}`
+          : frameRec?.downloadUrl;
+
+      const contentBlocks: Array<Record<string, unknown>> = [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              ok: outcome.ok !== false && frameRec?.status !== 'failed',
+              exportId: frameId,
+              sessionId: resolved.sessionId,
+              sceneId: resolved.sceneId,
+              sceneName: resolved.sceneName,
+              status: frameRec?.status ?? outcome.status,
+              width: frameRec?.width,
+              height: frameRec?.height,
+              mimeType: frameRec?.mimeType,
+              sizeBytes: frameRec?.sizeBytes,
+              downloadUrl,
+              results: outcome.results,
+              ...(frameRec?.error ? { error: frameRec.error } : {}),
+            },
+            null,
+            2,
+          ),
+        },
+      ];
+
+      if (toolArgs.includeImage !== false && frameRec?.dataUrl) {
+        const m = frameRec.dataUrl.match(/^data:([^;]+);base64,(.*)$/s);
+        if (m && m[2]) {
+          contentBlocks.push({
+            type: 'image',
+            data: m[2],
+            mimeType: m[1] || frameRec.mimeType || 'image/jpeg',
+          });
+        }
+      }
+
+      res.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          isError: outcome.ok === false || frameRec?.status === 'failed',
+          content: contentBlocks,
         },
       });
       return;
@@ -3079,6 +3924,125 @@ export function mountAiBridge(app: Express): void {
       return;
     }
     res.json({ ok: true, ...loaded });
+  });
+
+
+  // Studio -> Server: Export progress & video/frame artifact upload + retrieval
+  app.post('/api/ai/export-progress', async (req, res) => {
+    const store = await loadPersistedBridge();
+    const body = (req.body ?? {}) as Partial<ExportJobRecord> & { exportId?: string };
+    const exportId = sanitizeExportId(String(body.exportId ?? ''));
+    if (!exportId) {
+      res.status(400).json({ ok: false, error: 'Missing exportId' });
+      return;
+    }
+    const rec = await upsertExportJob(store, exportId, {
+      ...(body.sessionId ? { sessionId: body.sessionId } : {}),
+      ...(body.sceneId ? { sceneId: body.sceneId } : {}),
+      ...(body.kind ? { kind: body.kind } : {}),
+      ...(body.status ? { status: body.status } : {}),
+      ...(typeof body.progress === 'number' ? { progress: body.progress } : {}),
+      ...(typeof body.statusText === 'string' ? { statusText: body.statusText } : {}),
+      ...(typeof body.filename === 'string' ? { filename: body.filename } : {}),
+      ...(typeof body.mimeType === 'string' ? { mimeType: body.mimeType } : {}),
+      ...(typeof body.ext === 'string' ? { ext: body.ext } : {}),
+      ...(typeof body.width === 'number' ? { width: body.width } : {}),
+      ...(typeof body.height === 'number' ? { height: body.height } : {}),
+      ...(typeof body.fps === 'number' ? { fps: body.fps } : {}),
+      ...(typeof body.durationSec === 'number' ? { durationSec: body.durationSec } : {}),
+      ...(typeof body.sizeBytes === 'number' ? { sizeBytes: body.sizeBytes } : {}),
+      ...(typeof body.studioDownloaded === 'boolean' ? { studioDownloaded: body.studioDownloaded } : {}),
+      ...(typeof body.error === 'string' ? { error: body.error } : {}),
+    });
+    res.json({ ok: true, export: rec });
+  });
+
+  app.post(
+    '/api/ai/exports/:exportId/upload',
+    express.raw({ type: '*/*', limit: '30mb' }),
+    async (req, res) => {
+      const store = await loadPersistedBridge();
+      const exportId = sanitizeExportId(String(req.params.exportId ?? ''));
+      if (!exportId) {
+        res.status(400).json({ ok: false, error: 'Invalid exportId' });
+        return;
+      }
+      const rawBuf = Buffer.isBuffer(req.body)
+        ? req.body
+        : typeof req.body === 'string'
+          ? Buffer.from(req.body, 'binary')
+          : Buffer.alloc(0);
+      let meta: Record<string, unknown> = {};
+      try {
+        const hdr = req.headers['x-export-meta'];
+        if (typeof hdr === 'string' && hdr.trim()) {
+          meta = JSON.parse(hdr) as Record<string, unknown>;
+        }
+      } catch {
+        // Ignore invalid metadata header
+      }
+      const mimeType =
+        (typeof meta.mimeType === 'string' && meta.mimeType) ||
+        (typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : 'application/octet-stream');
+      const ext =
+        (typeof meta.ext === 'string' && meta.ext) ||
+        (mimeType.includes('mp4') ? 'mp4' : mimeType.includes('webm') ? 'webm' : mimeType.includes('png') ? 'png' : 'jpg');
+
+      await saveExportBinary(store, exportId, rawBuf, ext);
+      const downloadUrl = `/api/ai/exports/${exportId}`;
+      const rec = await upsertExportJob(store, exportId, {
+        ...(typeof meta.sessionId === 'string' ? { sessionId: meta.sessionId } : {}),
+        ...(typeof meta.sceneId === 'string' ? { sceneId: meta.sceneId } : {}),
+        status: 'completed',
+        progress: 1,
+        statusText: 'Export ready',
+        filename: typeof meta.filename === 'string' ? meta.filename : `${exportId}.${ext}`,
+        mimeType,
+        ext,
+        ...(typeof meta.width === 'number' ? { width: meta.width } : {}),
+        ...(typeof meta.height === 'number' ? { height: meta.height } : {}),
+        ...(typeof meta.fps === 'number' ? { fps: meta.fps } : {}),
+        ...(typeof meta.durationSec === 'number' ? { durationSec: meta.durationSec } : {}),
+        sizeBytes: rawBuf.byteLength,
+        ...(typeof meta.studioDownloaded === 'boolean' ? { studioDownloaded: meta.studioDownloaded } : {}),
+        ...(typeof meta.dataUrl === 'string' ? { dataUrl: meta.dataUrl } : {}),
+        downloadUrl,
+      });
+      res.json({ ok: true, exportId, downloadUrl, sizeBytes: rec.sizeBytes });
+    },
+  );
+
+  app.get('/api/ai/exports/:exportId/status', async (req, res) => {
+    const store = await loadPersistedBridge();
+    if (!isAuthorized(store, req, res)) return;
+    const rec = await loadExportJob(store, String(req.params.exportId ?? ''));
+    if (!rec) {
+      res.status(404).json({ ok: false, error: 'Export not found.' });
+      return;
+    }
+    const baseOrigin = getBaseOrigin(req);
+    const downloadUrl =
+      rec.downloadUrl && rec.downloadUrl.startsWith('/') ? `${baseOrigin}${rec.downloadUrl}` : rec.downloadUrl;
+    res.json({ ok: true, ...rec, downloadUrl, dataUrl: undefined });
+  });
+
+  app.get('/api/ai/exports/:exportId', async (req, res) => {
+    const store = await loadPersistedBridge();
+    if (!isAuthorized(store, req, res)) return;
+    const exportId = sanitizeExportId(String(req.params.exportId ?? ''));
+    const rec = await loadExportJob(store, exportId);
+    const bin = await loadExportBinary(store, exportId, rec?.ext);
+    if (!bin) {
+      res.status(404).json({ ok: false, error: 'Exported file not found or expired.' });
+      return;
+    }
+    res.setHeader('Content-Type', rec?.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Length', String(bin.byteLength));
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${(rec?.filename || `${exportId}.${rec?.ext || 'bin'}`).replace(/"/g, '')}"`,
+    );
+    res.send(bin);
   });
 
   // External AI: MCP endpoints (both /api/ai/mcp and /api/mcp for Claude custom connectors!)

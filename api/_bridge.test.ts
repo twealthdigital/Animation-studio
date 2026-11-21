@@ -430,4 +430,173 @@ describe('Stagecraft MCP Bridge Open Access & Stability', () => {
     );
     assert.equal(parseToolJson(created2.body).ok, true);
   });
+  test('tools/list exposes caption, dialogue, audio, export, and capture_frame tools', async () => {
+    const res = await mcpCall('tools/list');
+    const body = res.body as { result: { tools: { name: string }[] } };
+    const names = new Set(body.result.tools.map((tool) => tool.name));
+    for (const expected of [
+      'add_caption',
+      'update_caption',
+      'delete_caption',
+      'clear_captions',
+      'add_dialogue',
+      'add_audio_clip',
+      'update_audio_clip',
+      'delete_audio_clip',
+      'set_character_voice',
+      'export_video',
+      'get_export_status',
+      'cancel_export',
+      'capture_frame',
+    ]) {
+      assert.ok(names.has(expected), `Missing MCP tool ${expected}`);
+    }
+  });
+
+  test('add_dialogue, add_caption, export_video, and capture_frame work end-to-end with Studio upload & downloadUrl', async () => {
+    const init = await mcpCall('initialize', { clientInfo: { name: 'claude-ai' } });
+    const sid = init.sessionId!;
+    const created = await mcpCall(
+      'tools/call',
+      { name: 'new_session', arguments: { name: 'Dialogue Export Scene' } },
+      { 'Mcp-Session-Id': sid },
+    );
+    const createdJson = parseToolJson(created.body);
+    const sceneId = String(createdJson.sceneId);
+
+    // Connect Studio tab
+    await fetch(`${baseUrl}/api/ai/poll?tabId=tab_media_1`);
+
+    // Helper Studio poller loop for 3 batches
+    let stopWorker = false;
+    const studioWorker = (async () => {
+      while (!stopWorker) {
+        const pollRes = await fetch(`${baseUrl}/api/ai/poll?tabId=tab_media_1`);
+        const pollData = (await pollRes.json()) as {
+          batches?: { batchId: string; sceneId: string; commands: Record<string, unknown>[] }[];
+        };
+        for (const batch of pollData.batches ?? []) {
+          const results: { index: number; op: string; ok: boolean; summary: string }[] = [];
+          for (let i = 0; i < batch.commands.length; i++) {
+            const cmd = batch.commands[i];
+            results.push({ index: i, op: String(cmd.op), ok: true, summary: `Executed ${cmd.op}` });
+            if (cmd.op === 'export_video' && typeof cmd.exportId === 'string') {
+              const fakeMp4 = Buffer.from('FAKE_MP4_BYTES_123456');
+              await fetch(`${baseUrl}/api/ai/exports/${encodeURIComponent(cmd.exportId)}/upload`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'video/mp4',
+                  'X-Export-Meta': JSON.stringify({
+                    sessionId: sid,
+                    sceneId,
+                    filename: 'dialogue_scene.mp4',
+                    mimeType: 'video/mp4',
+                    ext: 'mp4',
+                    width: 1280,
+                    height: 720,
+                    fps: 30,
+                    durationSec: 10,
+                    studioDownloaded: true,
+                  }),
+                },
+                body: fakeMp4,
+              });
+            }
+            if (cmd.op === 'capture_frame' && typeof cmd.exportId === 'string') {
+              const fakePng = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+              await fetch(`${baseUrl}/api/ai/exports/${encodeURIComponent(cmd.exportId)}/upload`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'image/png',
+                  'X-Export-Meta': JSON.stringify({
+                    sessionId: sid,
+                    sceneId,
+                    filename: 'frame.png',
+                    mimeType: 'image/png',
+                    ext: 'png',
+                    width: 1280,
+                    height: 720,
+                    dataUrl: `data:image/png;base64,${fakePng.toString('base64')}`,
+                  }),
+                },
+                body: fakePng,
+              });
+            }
+          }
+          await fetch(`${baseUrl}/api/ai/ack`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              batchId: batch.batchId,
+              sessionId: sid,
+              sceneId: batch.sceneId,
+              appliedSceneId: batch.sceneId,
+              ok: true,
+              results,
+            }),
+          });
+        }
+        await new Promise((r) => setTimeout(r, 30));
+      }
+    })();
+
+    const dlgRes = await mcpCall(
+      'tools/call',
+      {
+        name: 'add_dialogue',
+        arguments: { sceneId, speaker: 'Hero', text: 'Welcome to Stagecraft!', startTime: 0.5 },
+      },
+      { 'Mcp-Session-Id': sid },
+    );
+    const dlgJson = parseToolJson(dlgRes.body);
+    assert.equal(dlgJson.ok, true);
+    assert.equal(dlgJson.sceneId, sceneId);
+
+    const capRes = await mcpCall(
+      'tools/call',
+      {
+        name: 'add_caption',
+        arguments: { sceneId, text: 'Act I: Opening', position: 'top', startTime: 0, duration: 2 },
+      },
+      { 'Mcp-Session-Id': sid },
+    );
+    assert.equal(parseToolJson(capRes.body).ok, true);
+
+    const expRes = await mcpCall(
+      'tools/call',
+      {
+        name: 'export_video',
+        arguments: { sceneId, aspectRatio: '16:9', quality: '720p', fps: 30 },
+      },
+      { 'Mcp-Session-Id': sid },
+    );
+    const expJson = parseToolJson(expRes.body);
+    assert.equal(expJson.ok, true);
+    assert.equal(expJson.status, 'completed');
+    assert.ok(typeof expJson.downloadUrl === 'string' && expJson.downloadUrl.includes('/api/ai/exports/'));
+
+    // Fetch video binary via downloadUrl
+    const dlBin = await fetch(String(expJson.downloadUrl));
+    assert.equal(dlBin.status, 200);
+    assert.equal(await dlBin.text(), 'FAKE_MP4_BYTES_123456');
+
+    // Verify get_export_status works too
+    const statusRes = await mcpCall('tools/call', {
+      name: 'get_export_status',
+      arguments: { exportId: expJson.exportId },
+    });
+    assert.equal(parseToolJson(statusRes.body).status, 'completed');
+
+    // Verify capture_frame returns both metadata and image content block
+    const frameRes = await mcpCall(
+      'tools/call',
+      { name: 'capture_frame', arguments: { sceneId, time: 1.0, format: 'png' } },
+      { 'Mcp-Session-Id': sid },
+    );
+    const frameBody = frameRes.body as { result: { content: { type: string; mimeType?: string }[] } };
+    assert.ok(frameBody.result.content.some((c) => c.type === 'image' && c.mimeType === 'image/png'));
+
+    stopWorker = true;
+    await studioWorker;
+  });
 });

@@ -204,6 +204,44 @@ export interface ActionClip {
 
 export type AudioTrackRole = 'dialogue' | 'music' | 'sfx' | 'ambient';
 
+export type AudioSynthPreset =
+  | 'chime'
+  | 'bell'
+  | 'pop'
+  | 'whoosh'
+  | 'thud'
+  | 'footstep'
+  | 'boom'
+  | 'laser'
+  | 'click'
+  | 'success'
+  | 'alert'
+  | 'riser'
+  | 'ambient-pad'
+  | 'music-pulse';
+
+export type CaptionPosition = 'bottom' | 'top' | 'center';
+
+export interface CaptionStyle {
+  position?: CaptionPosition;
+  fontSize?: number;
+  textColor?: string;
+  backgroundColor?: string;
+  speakerColor?: string;
+  showSpeaker?: boolean;
+}
+
+export interface CaptionItem {
+  id: string;
+  text: string;
+  speaker?: string;
+  characterInstanceId?: string;
+  startTime: number;
+  duration: number;
+  linkedAudioClipId?: string;
+  style?: CaptionStyle;
+}
+
 export interface AudioClipData {
   id: string;
   assetId: string;
@@ -481,6 +519,7 @@ export interface SceneData {
   groups?: SceneGroupData[];
   characters: CharacterInstanceData[];
   audioClips: AudioClipData[];
+  captions?: CaptionItem[];
 }
 
 export type AssetKind = 'character-html' | 'character-glb' | 'prop-glb' | 'audio';
@@ -631,6 +670,7 @@ export type SelectionTarget =
   | { kind: 'light'; lightId: string }
   | { kind: 'camera'; cameraId?: string }
   | { kind: 'audio-clip'; clipId: string }
+  | { kind: 'caption'; captionId: string }
   | { kind: 'action-clip'; instanceId: string; clipId: string }
   | { kind: 'waypoint'; instanceId: string; pointId: string; ownerKind?: 'character' | 'prop' | 'camera' };
 
@@ -745,7 +785,19 @@ export interface AiBridgeCommand {
     | 'play'
     | 'pause'
     | 'bake_html_motion'
-    | 'rename_scene';
+    | 'rename_scene'
+    | 'add_caption'
+    | 'update_caption'
+    | 'delete_caption'
+    | 'clear_captions'
+    | 'add_dialogue'
+    | 'add_audio_clip'
+    | 'update_audio_clip'
+    | 'delete_audio_clip'
+    | 'set_character_voice'
+    | 'export_video'
+    | 'cancel_export'
+    | 'capture_frame';
   sessionId?: string;
   sceneId?: string;
   sceneName?: string;
@@ -804,6 +856,50 @@ export interface AiBridgeCommand {
   fov?: number;
   speed?: number;
   force?: boolean;
+  // Captions & subtitles
+  captionId?: string;
+  text?: string;
+  speaker?: string;
+  captionPosition?: CaptionPosition;
+  fontSize?: number;
+  textColor?: string;
+  speakerColor?: string;
+  showSpeaker?: boolean;
+  linkedAudioClipId?: string;
+  // Audio & dialogue
+  clipId?: string;
+  role?: AudioTrackRole;
+  dialogueText?: string;
+  assetId?: string;
+  audioUrl?: string;
+  audioBase64?: string;
+  preset?: AudioSynthPreset;
+  cuePreset?: AudioSynthPreset;
+  volume?: number;
+  fadeIn?: number;
+  fadeOut?: number;
+  trimStart?: number;
+  muted?: boolean;
+  playbackRate?: number;
+  pauseAfterSec?: number;
+  pitch?: number;
+  pan?: number;
+  voiceLabel?: string;
+  createCaption?: boolean;
+  keepCaption?: boolean;
+  // Video export / recording
+  exportId?: string;
+  scope?: 'scene' | 'project';
+  aspectRatio?: '16:9' | '9:16' | '1:1' | '4:3';
+  quality?: '540p' | '720p' | '1080p';
+  fps?: number;
+  format?: 'auto' | 'mp4' | 'webm';
+  includeAudio?: boolean;
+  includeCaptions?: boolean;
+  steppedFrames?: boolean;
+  downloadInStudio?: boolean;
+  uploadToBridge?: boolean;
+  width?: number;
 }
 
 export type SceneEventCause =
@@ -907,6 +1003,16 @@ export interface AiBridgeStateSnapshot {
     memberIds: string[];
     visible: boolean;
   }[];
+  captions?: CaptionItem[];
+  audioClips?: AudioClipData[];
+  audioAssets?: {
+    id: string;
+    name: string;
+    duration?: number;
+  }[];
+  exportCapabilities?: {
+    supportedFormats: { mimeType: string; label: string; ext: 'mp4' | 'webm' }[];
+  };
 }
 
 

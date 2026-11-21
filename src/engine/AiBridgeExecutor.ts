@@ -2,6 +2,11 @@ import type {
   ActionClip,
   AiBridgeCommand,
   AiBridgeStateSnapshot,
+  AssetRecord,
+  AudioClipData,
+  AudioSynthPreset,
+  CaptionItem,
+  CaptionStyle,
   CharacterInstanceData,
   EasingType,
   EnvironmentPresetId,
@@ -27,6 +32,8 @@ import {
   createDefaultTransform,
 } from '../core/types';
 import { evaluateSceneAtTime } from '../animation/SceneEvaluator';
+import { buildSynthAssetId } from '../audio/AudioEngine';
+import { detectVideoExportCapabilities } from './ExportManager';
 import { createId } from '../utils/ids';
 import { createPropData, ENVIRONMENT_PRESETS } from './PropsFactory';
 
@@ -83,6 +90,7 @@ export function buildAiSceneSnapshot(
   selection: SelectionTarget,
   rigNodesByInstance: Record<string, RigNodeInfo[]>,
   sessionId?: string,
+  assets: AssetRecord[] = [],
 ): AiBridgeStateSnapshot {
   const evalSnap = evaluateSceneAtTime(scene, currentTime);
   const envSpec = ENVIRONMENT_PRESETS.find((e) => e.id === scene.environmentPreset);
@@ -152,6 +160,14 @@ export function buildAiSceneSnapshot(
       memberIds: g.memberIds,
       visible: g.visible,
     })),
+    captions: (scene.captions ?? []).map((c) => ({ ...c })),
+    audioClips: scene.audioClips.map((a) => ({ ...a })),
+    audioAssets: assets
+      .filter((a) => a.kind === 'audio')
+      .map((a) => ({ id: a.id, name: a.name, duration: a.audioDuration })),
+    exportCapabilities: {
+      supportedFormats: detectVideoExportCapabilities(true).supportedMimeTypes,
+    },
   };
 }
 
@@ -180,7 +196,7 @@ export function buildUniversalAiPrompt(
     `}`,
     ``,
     `SUPPORTED OPS:`,
-    `set_duration, update_scene, select, clear_selection, move, rotate, scale, set_color, set_visibility, duplicate_target, pose_part, reset_part, detach_part, ungroup_all, add_keyframe, delete_keyframe, add_prop, delete_target, add_wall, remove_wall, update_stage, add_light, update_light, delete_light, set_camera_pose, add_camera_keyframe, add_action_clip, set_facial_expression, update_motion_path, create_group, ungroup_scene_group, set_time, play, pause, bake_html_motion, rename_scene`,
+    `set_duration, update_scene, select, clear_selection, move, rotate, scale, set_color, set_visibility, duplicate_target, pose_part, reset_part, detach_part, ungroup_all, add_keyframe, delete_keyframe, add_prop, delete_target, add_wall, remove_wall, update_stage, add_light, update_light, delete_light, set_camera_pose, add_camera_keyframe, add_action_clip, set_facial_expression, update_motion_path, create_group, ungroup_scene_group, set_time, play, pause, bake_html_motion, rename_scene, add_caption, update_caption, delete_caption, clear_captions, add_dialogue, add_audio_clip, update_audio_clip, delete_audio_clip, set_character_voice, export_video, cancel_export`,
     ``,
     `CURRENT LIVE 3D SCENE SNAPSHOT:`,
     JSON.stringify(snapshot, null, 2),
@@ -229,6 +245,10 @@ export interface AiCommandExecutionContext {
   bakeHtmlMotion: (instanceId: string) => void;
   addStageWall: (side: StageWallSide, opts?: { color?: string; height?: number }) => void;
   ensureSessionScene?: (sessionId: string, sceneId: string, sceneName: string) => void;
+  registerSynthAudio?: (assetId: string, preset: AudioSynthPreset, durationSec: number, name: string) => void;
+  preloadedAudioAssets?: Map<string, { assetId: string; duration: number; name: string }>;
+  startVideoExport?: (cmd: AiBridgeCommand) => void;
+  cancelVideoExport?: (exportId?: string) => void;
 }
 
 function resolveCharacterAndNode(
@@ -1240,6 +1260,417 @@ export function executeSingleAiCommand(
       if (!char) return { ok: false, summary: 'Character/HTML scene not found for bake_html_motion' };
       ctx.bakeHtmlMotion(char.id);
       return { ok: true, summary: `Baked "${char.name}" HTML movements into editable keyframes` };
+    }
+
+
+    case 'add_caption': {
+      const rawText = (cmd.text ?? cmd.dialogueText ?? '').trim();
+      if (!rawText) return { ok: false, summary: 'Provide text for add_caption' };
+      const { char } = resolveCharacterAndNode(scene, rigNodesByInstance, cmd);
+      const startTime =
+        typeof cmd.startTime === 'number'
+          ? Math.max(0, cmd.startTime)
+          : typeof cmd.time === 'number'
+            ? Math.max(0, cmd.time)
+            : currentTime;
+      const wordCount = rawText.split(/\s+/).filter(Boolean).length;
+      const dur =
+        typeof cmd.duration === 'number' && cmd.duration > 0
+          ? Math.max(0.2, Math.min(300, cmd.duration))
+          : Number(Math.max(1.5, Math.min(12, wordCount * 0.42 + 0.65)).toFixed(2));
+      const style: CaptionStyle = {
+        position: cmd.captionPosition ?? 'bottom',
+        ...(typeof cmd.fontSize === 'number' ? { fontSize: Math.max(12, Math.min(72, cmd.fontSize)) } : {}),
+        ...(cmd.textColor ? { textColor: cmd.textColor } : {}),
+        ...(cmd.backgroundColor ? { backgroundColor: cmd.backgroundColor } : {}),
+        ...(cmd.speakerColor ? { speakerColor: cmd.speakerColor } : {}),
+        ...(typeof cmd.showSpeaker === 'boolean' ? { showSpeaker: cmd.showSpeaker } : {}),
+      };
+      const caption: CaptionItem = {
+        id: cmd.captionId?.trim() || cmd.id?.trim() || createId('cap'),
+        text: rawText,
+        speaker: cmd.speaker?.trim() || char?.name || undefined,
+        ...(char ? { characterInstanceId: char.id } : {}),
+        startTime,
+        duration: dur,
+        ...(cmd.linkedAudioClipId ? { linkedAudioClipId: cmd.linkedAudioClipId } : {}),
+        style,
+      };
+      ctx.updateScene(
+        (s) => ({
+          ...s,
+          duration: autoExpandedDuration(s.duration, startTime + dur),
+          captions: [...(s.captions ?? []), caption].sort((a, b) => a.startTime - b.startTime),
+        }),
+        `AI Add Caption "${rawText.slice(0, 24)}"`,
+      );
+      if (autoHighlight) ctx.setSelection({ kind: 'caption', captionId: caption.id });
+      return { ok: true, summary: `Added caption "${rawText.slice(0, 32)}" (${caption.id}, ${startTime}s–${(startTime + dur).toFixed(2)}s)` };
+    }
+
+    case 'update_caption': {
+      const cid = cmd.captionId ?? cmd.id ?? cmd.targetId;
+      const captions = scene.captions ?? [];
+      const existing = cid ? captions.find((c) => c.id === cid) : undefined;
+      if (!existing) return { ok: false, summary: `Caption "${cid ?? ''}" not found for update_caption` };
+      const nextStart =
+        typeof cmd.startTime === 'number'
+          ? Math.max(0, cmd.startTime)
+          : typeof cmd.time === 'number'
+            ? Math.max(0, cmd.time)
+            : existing.startTime;
+      const nextDur =
+        typeof cmd.duration === 'number' && cmd.duration > 0
+          ? Math.max(0.2, Math.min(300, cmd.duration))
+          : existing.duration;
+      ctx.updateScene(
+        (s) => ({
+          ...s,
+          duration: autoExpandedDuration(s.duration, nextStart + nextDur),
+          captions: (s.captions ?? [])
+            .map((c) =>
+              c.id === existing.id
+                ? {
+                    ...c,
+                    text: typeof cmd.text === 'string' && cmd.text.trim() ? cmd.text.trim() : c.text,
+                    speaker: typeof cmd.speaker === 'string' ? cmd.speaker.trim() || undefined : c.speaker,
+                    startTime: nextStart,
+                    duration: nextDur,
+                    style: {
+                      ...(c.style ?? {}),
+                      ...(cmd.captionPosition ? { position: cmd.captionPosition } : {}),
+                      ...(typeof cmd.fontSize === 'number' ? { fontSize: Math.max(12, Math.min(72, cmd.fontSize)) } : {}),
+                      ...(cmd.textColor ? { textColor: cmd.textColor } : {}),
+                      ...(cmd.backgroundColor ? { backgroundColor: cmd.backgroundColor } : {}),
+                      ...(cmd.speakerColor ? { speakerColor: cmd.speakerColor } : {}),
+                      ...(typeof cmd.showSpeaker === 'boolean' ? { showSpeaker: cmd.showSpeaker } : {}),
+                    },
+                  }
+                : c,
+            )
+            .sort((a, b) => a.startTime - b.startTime),
+        }),
+        `AI Update Caption ${existing.id}`,
+      );
+      return { ok: true, summary: `Updated caption ${existing.id}` };
+    }
+
+    case 'delete_caption': {
+      const cid = cmd.captionId ?? cmd.id ?? cmd.targetId;
+      if (!cid || !(scene.captions ?? []).some((c) => c.id === cid)) {
+        return { ok: false, summary: `Caption "${cid ?? ''}" not found` };
+      }
+      ctx.updateScene(
+        (s) => ({
+          ...s,
+          captions: (s.captions ?? []).filter((c) => c.id !== cid),
+        }),
+        `AI Delete Caption ${cid}`,
+      );
+      return { ok: true, summary: `Deleted caption ${cid}` };
+    }
+
+    case 'clear_captions': {
+      ctx.updateScene((s) => ({ ...s, captions: [] }), 'AI Clear Captions');
+      return { ok: true, summary: 'Cleared all scene captions' };
+    }
+
+    case 'add_dialogue': {
+      const rawText = (cmd.dialogueText ?? cmd.text ?? '').trim();
+      const explicitTarget = cmd.characterId ?? cmd.targetId ?? cmd.id;
+      let { char } = resolveCharacterAndNode(scene, rigNodesByInstance, cmd);
+      if (!char && cmd.speaker?.trim()) {
+        const sp = cmd.speaker.trim().toLowerCase();
+        char = scene.characters.find((c) => c.name.toLowerCase() === sp);
+      }
+      if (!char && explicitTarget) {
+        return { ok: false, summary: `Character "${explicitTarget}" not found for add_dialogue` };
+      }
+      if (!char && !rawText && !cmd.assetId && !cmd.audioUrl && !cmd.audioBase64) {
+        return { ok: false, summary: 'Provide text/dialogueText or audio source for add_dialogue' };
+      }
+      if (!char && scene.characters.length === 1) {
+        char = scene.characters[0];
+      }
+
+      const speakerName = cmd.speaker?.trim() || char?.name || 'Narrator';
+      const baseStart =
+        typeof cmd.startTime === 'number'
+          ? Math.max(0, cmd.startTime)
+          : typeof cmd.time === 'number'
+            ? Math.max(0, cmd.time)
+            : currentTime;
+      const pauseAfter = typeof cmd.pauseAfterSec === 'number' ? Math.max(0, cmd.pauseAfterSec) : 0.35;
+      const volume = typeof cmd.volume === 'number' ? Math.max(0, Math.min(2, cmd.volume)) : 1;
+      const playbackRate =
+        typeof cmd.playbackRate === 'number'
+          ? Math.max(0.5, Math.min(2, cmd.playbackRate))
+          : typeof cmd.speed === 'number'
+            ? Math.max(0.5, Math.min(2, cmd.speed))
+            : char?.audioProfile.speed ?? 1;
+
+      const preloaded =
+        (cmd.id && ctx.preloadedAudioAssets?.get(cmd.id)) ||
+        (cmd.audioUrl && ctx.preloadedAudioAssets?.get(cmd.audioUrl)) ||
+        (cmd.audioBase64 && ctx.preloadedAudioAssets?.get(`b64:${cmd.audioBase64.slice(0, 48)}`)) ||
+        undefined;
+
+      const parts = rawText.includes('|')
+        ? rawText.split('|').map((p) => p.trim()).filter(Boolean)
+        : [rawText || (cmd.name?.trim() ?? 'Dialogue')];
+
+      const createdClips: AudioClipData[] = [];
+      const createdCaptions: CaptionItem[] = [];
+      let cursor = baseStart;
+
+      parts.forEach((part, idx) => {
+        const words = part.split(/\s+/).filter(Boolean).length;
+        const autoDur = Number(Math.max(1.2, Math.min(18, (words * 0.42 + 0.55) / playbackRate)).toFixed(2));
+        const partDur =
+          typeof cmd.duration === 'number' && cmd.duration > 0
+            ? Number(Math.max(0.3, cmd.duration / parts.length).toFixed(2))
+            : idx === 0 && preloaded?.duration
+              ? Number(Math.max(0.4, preloaded.duration / playbackRate).toFixed(2))
+              : autoDur;
+
+        const cuePreset = cmd.cuePreset ?? cmd.preset;
+        let resolvedAssetId = idx === 0 ? preloaded?.assetId ?? cmd.assetId ?? '' : '';
+        if (!resolvedAssetId && cuePreset) {
+          resolvedAssetId = buildSynthAssetId(cuePreset, partDur);
+          ctx.registerSynthAudio?.(resolvedAssetId, cuePreset, partDur, `${speakerName} Cue (${cuePreset})`);
+        }
+
+        const clipId = parts.length === 1 && cmd.clipId?.trim() ? cmd.clipId.trim() : createId('dlg');
+        const clip: AudioClipData = {
+          id: clipId,
+          assetId: resolvedAssetId,
+          name: parts.length === 1 && cmd.name?.trim() ? cmd.name.trim() : part.slice(0, 28) || `${speakerName} Dialogue`,
+          role: 'dialogue',
+          ...(char ? { characterInstanceId: char.id } : {}),
+          dialogueText: part,
+          startTime: Number(cursor.toFixed(2)),
+          duration: partDur,
+          trimStart: typeof cmd.trimStart === 'number' ? Math.max(0, cmd.trimStart) : 0,
+          volume,
+          fadeIn: typeof cmd.fadeIn === 'number' ? Math.max(0, cmd.fadeIn) : 0.05,
+          fadeOut: typeof cmd.fadeOut === 'number' ? Math.max(0, cmd.fadeOut) : 0.05,
+          muted: Boolean(cmd.muted),
+          playbackRate,
+          pauseAfterSec: pauseAfter,
+        };
+        createdClips.push(clip);
+
+        if (cmd.createCaption !== false && rawText) {
+          createdCaptions.push({
+            id: createId('cap'),
+            text: part,
+            speaker: speakerName,
+            ...(char ? { characterInstanceId: char.id } : {}),
+            startTime: clip.startTime,
+            duration: clip.duration,
+            linkedAudioClipId: clip.id,
+            style: {
+              position: cmd.captionPosition ?? 'bottom',
+              ...(typeof cmd.fontSize === 'number' ? { fontSize: Math.max(12, Math.min(72, cmd.fontSize)) } : {}),
+              ...(cmd.textColor ? { textColor: cmd.textColor } : {}),
+              ...(cmd.backgroundColor ? { backgroundColor: cmd.backgroundColor } : {}),
+              ...(cmd.speakerColor ? { speakerColor: cmd.speakerColor } : {}),
+              ...(typeof cmd.showSpeaker === 'boolean' ? { showSpeaker: cmd.showSpeaker } : {}),
+            },
+          });
+        }
+        cursor += partDur + pauseAfter;
+      });
+
+      const endCursor = createdClips.length > 0 ? createdClips[createdClips.length - 1].startTime + createdClips[createdClips.length - 1].duration : baseStart;
+      ctx.updateScene(
+        (s) => ({
+          ...s,
+          duration: autoExpandedDuration(s.duration, endCursor),
+          audioClips: [...s.audioClips, ...createdClips],
+          captions: [...(s.captions ?? []), ...createdCaptions].sort((a, b) => a.startTime - b.startTime),
+        }),
+        `AI Add Dialogue (${speakerName})`,
+      );
+      if (autoHighlight && createdClips[0]) {
+        ctx.setSelection({ kind: 'audio-clip', clipId: createdClips[0].id });
+      }
+      return {
+        ok: true,
+        summary: `Added ${createdClips.length} dialogue clip(s) for ${speakerName} (${createdClips.map((c) => c.id).join(', ')})${createdCaptions.length > 0 ? ` + ${createdCaptions.length} synced caption(s)` : ''}`,
+      };
+    }
+
+    case 'add_audio_clip': {
+      const preset = cmd.preset;
+      const role =
+        cmd.role ??
+        (preset === 'ambient-pad' ? 'ambient' : preset === 'music-pulse' ? 'music' : 'sfx');
+      const { char } = resolveCharacterAndNode(scene, rigNodesByInstance, cmd);
+      const startTime =
+        typeof cmd.startTime === 'number'
+          ? Math.max(0, cmd.startTime)
+          : typeof cmd.time === 'number'
+            ? Math.max(0, cmd.time)
+            : currentTime;
+      const preloaded =
+        (cmd.id && ctx.preloadedAudioAssets?.get(cmd.id)) ||
+        (cmd.audioUrl && ctx.preloadedAudioAssets?.get(cmd.audioUrl)) ||
+        (cmd.audioBase64 && ctx.preloadedAudioAssets?.get(`b64:${cmd.audioBase64.slice(0, 48)}`)) ||
+        undefined;
+      const dur =
+        typeof cmd.duration === 'number' && cmd.duration > 0
+          ? Math.max(0.15, Math.min(3600, cmd.duration))
+          : preloaded?.duration ?? (role === 'music' || role === 'ambient' ? Math.max(4, scene.duration - startTime) : 1.5);
+      const clipName = cmd.name?.trim() || (preset ? `SFX: ${preset}` : preloaded?.name ?? `AI ${role.toUpperCase()}`);
+      let assetId = preloaded?.assetId ?? cmd.assetId ?? '';
+      if (!assetId && preset) {
+        assetId = buildSynthAssetId(preset, dur);
+        ctx.registerSynthAudio?.(assetId, preset, dur, clipName);
+      }
+      if (!assetId && !cmd.dialogueText?.trim()) {
+        return { ok: false, summary: 'Provide preset, assetId, audioUrl, or audioBase64 for add_audio_clip' };
+      }
+      const clip: AudioClipData = {
+        id: cmd.clipId?.trim() || cmd.id?.trim() || createId('aud'),
+        assetId,
+        name: clipName,
+        role,
+        ...(char ? { characterInstanceId: char.id } : {}),
+        ...(cmd.dialogueText ? { dialogueText: cmd.dialogueText } : {}),
+        startTime,
+        duration: Number(dur.toFixed(2)),
+        trimStart: typeof cmd.trimStart === 'number' ? Math.max(0, cmd.trimStart) : 0,
+        volume: typeof cmd.volume === 'number' ? Math.max(0, Math.min(2, cmd.volume)) : role === 'music' || role === 'ambient' ? 0.45 : 0.9,
+        fadeIn: typeof cmd.fadeIn === 'number' ? Math.max(0, cmd.fadeIn) : 0.05,
+        fadeOut: typeof cmd.fadeOut === 'number' ? Math.max(0, cmd.fadeOut) : 0.1,
+        muted: Boolean(cmd.muted),
+        playbackRate: typeof cmd.playbackRate === 'number' ? Math.max(0.5, Math.min(2, cmd.playbackRate)) : 1,
+      };
+      ctx.updateScene(
+        (s) => ({
+          ...s,
+          duration: autoExpandedDuration(s.duration, startTime + clip.duration),
+          audioClips: [...s.audioClips, clip],
+        }),
+        `AI Add Audio "${clip.name}"`,
+      );
+      if (autoHighlight) ctx.setSelection({ kind: 'audio-clip', clipId: clip.id });
+      return { ok: true, summary: `Added ${role} clip "${clip.name}" (${clip.id}, ${startTime}s–${(startTime + clip.duration).toFixed(2)}s)` };
+    }
+
+    case 'update_audio_clip': {
+      const cid = cmd.clipId ?? cmd.id ?? cmd.targetId;
+      const existing = scene.audioClips.find(
+        (c) => c.id === cid || (cmd.name && c.name.toLowerCase() === cmd.name.toLowerCase()),
+      );
+      if (!existing) return { ok: false, summary: `Audio clip "${cid ?? cmd.name ?? ''}" not found` };
+      const nextStart =
+        typeof cmd.startTime === 'number'
+          ? Math.max(0, cmd.startTime)
+          : typeof cmd.time === 'number'
+            ? Math.max(0, cmd.time)
+            : existing.startTime;
+      const nextDur =
+        typeof cmd.duration === 'number' && cmd.duration > 0
+          ? Math.max(0.15, Math.min(3600, cmd.duration))
+          : existing.duration;
+      const nextText = typeof cmd.dialogueText === 'string' ? cmd.dialogueText : typeof cmd.text === 'string' ? cmd.text : existing.dialogueText;
+      ctx.updateScene(
+        (s) => ({
+          ...s,
+          duration: autoExpandedDuration(s.duration, nextStart + nextDur),
+          audioClips: s.audioClips.map((c) =>
+            c.id === existing.id
+              ? {
+                  ...c,
+                  ...(cmd.name ? { name: cmd.name } : {}),
+                  ...(nextText !== undefined ? { dialogueText: nextText } : {}),
+                  startTime: nextStart,
+                  duration: nextDur,
+                  ...(typeof cmd.volume === 'number' ? { volume: Math.max(0, Math.min(2, cmd.volume)) } : {}),
+                  ...(typeof cmd.fadeIn === 'number' ? { fadeIn: Math.max(0, cmd.fadeIn) } : {}),
+                  ...(typeof cmd.fadeOut === 'number' ? { fadeOut: Math.max(0, cmd.fadeOut) } : {}),
+                  ...(typeof cmd.muted === 'boolean' ? { muted: cmd.muted } : {}),
+                  ...(typeof cmd.playbackRate === 'number' ? { playbackRate: Math.max(0.5, Math.min(2, cmd.playbackRate)) } : {}),
+                }
+              : c,
+          ),
+          captions: (s.captions ?? []).map((cap) =>
+            cap.linkedAudioClipId === existing.id
+              ? {
+                  ...cap,
+                  ...(typeof nextText === 'string' && nextText.trim() ? { text: nextText.trim() } : {}),
+                  startTime: nextStart,
+                  duration: nextDur,
+                }
+              : cap,
+          ),
+        }),
+        `AI Update Audio Clip ${existing.id}`,
+      );
+      return { ok: true, summary: `Updated audio clip ${existing.id}` };
+    }
+
+    case 'delete_audio_clip': {
+      const cid = cmd.clipId ?? cmd.id ?? cmd.targetId;
+      if (!cid || !scene.audioClips.some((c) => c.id === cid)) {
+        return { ok: false, summary: `Audio clip "${cid ?? ''}" not found` };
+      }
+      ctx.updateScene(
+        (s) => ({
+          ...s,
+          audioClips: s.audioClips.filter((c) => c.id !== cid),
+          ...(cmd.keepCaption ? {} : { captions: (s.captions ?? []).filter((cap) => cap.linkedAudioClipId !== cid) }),
+        }),
+        `AI Delete Audio Clip ${cid}`,
+      );
+      return { ok: true, summary: `Deleted audio clip ${cid}` };
+    }
+
+    case 'set_character_voice': {
+      const { char } = resolveCharacterAndNode(scene, rigNodesByInstance, cmd);
+      if (!char) return { ok: false, summary: 'Character not found for set_character_voice' };
+      ctx.updateScene(
+        (s) => ({
+          ...s,
+          characters: s.characters.map((c) =>
+            c.id === char.id
+              ? {
+                  ...c,
+                  audioProfile: {
+                    ...c.audioProfile,
+                    ...(cmd.voiceLabel ? { voiceLabel: cmd.voiceLabel } : {}),
+                    ...(typeof cmd.pitch === 'number' ? { pitch: Math.max(0.5, Math.min(2, cmd.pitch)) } : {}),
+                    ...(typeof cmd.speed === 'number' ? { speed: Math.max(0.5, Math.min(2, cmd.speed)) } : {}),
+                    ...(typeof cmd.playbackRate === 'number' ? { speed: Math.max(0.5, Math.min(2, cmd.playbackRate)) } : {}),
+                    ...(typeof cmd.volume === 'number' ? { defaultVolume: Math.max(0, Math.min(2, cmd.volume)) } : {}),
+                    ...(typeof cmd.pan === 'number' ? { pan: Math.max(-1, Math.min(1, cmd.pan)) } : {}),
+                    ...(typeof cmd.muted === 'boolean' ? { muted: cmd.muted } : {}),
+                  },
+                }
+              : c,
+          ),
+        }),
+        `AI Configure Voice for ${char.name}`,
+      );
+      return { ok: true, summary: `Updated voice profile for "${char.name}"` };
+    }
+
+    case 'export_video': {
+      if (!ctx.startVideoExport) {
+        return { ok: false, summary: 'Video exporter hook is not mounted in this workspace.' };
+      }
+      ctx.startVideoExport(cmd);
+      return {
+        ok: true,
+        summary: `Started video export ${cmd.exportId ?? ''} (${cmd.aspectRatio ?? '16:9'} ${cmd.quality ?? '720p'} @ ${cmd.fps ?? 30}fps)`.trim(),
+      };
+    }
+
+    case 'cancel_export': {
+      ctx.cancelVideoExport?.(cmd.exportId);
+      return { ok: true, summary: 'Requested video export cancellation' };
     }
 
     case 'rename_scene': {

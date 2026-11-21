@@ -29,6 +29,7 @@ import {
 import type {
   AxisConstraint,
   CameraOrientationState,
+  CaptionItem,
   EditorCameraPreset,
   GizmoMode,
   GizmoSpace,
@@ -109,6 +110,9 @@ interface CenterViewportProps {
   beginnerTip?: string | null;
   isolatedIframeHtml?: { instanceId: string; name: string; html: string } | null;
   onRegisterIframe?: (instanceId: string, el: HTMLIFrameElement | null) => void;
+  captions?: CaptionItem[];
+  currentTime?: number;
+  showCaptions?: boolean;
 }
 
 const FILTER_OPTIONS: { value: SelectionFilter; label: string }[] = [
@@ -226,6 +230,9 @@ export function CenterViewport({
   beginnerTip,
   isolatedIframeHtml,
   onRegisterIframe,
+  captions = [],
+  currentTime = 0,
+  showCaptions = true,
 }: CenterViewportProps) {
   const [sizeDraft, setSizeDraft] = useState<string>('');
   const [sizeInputFocused, setSizeInputFocused] = useState(false);
@@ -793,6 +800,67 @@ export function CenterViewport({
             </StudioButton>
           </div>
         )}
+
+
+        {/* Live Captions & Subtitles Overlay (also burned into exported MP4/WebM) */}
+        {showCaptions && (() => {
+          const activeCaps = captions.filter(
+            (c) =>
+              c.text.trim() &&
+              currentTime >= c.startTime - 0.001 &&
+              currentTime < c.startTime + Math.max(0.05, c.duration),
+          );
+          if (activeCaps.length === 0) return null;
+          const renderPosGroup = (pos: 'top' | 'center' | 'bottom') => {
+            const items = activeCaps.filter((c) => (c.style?.position ?? 'bottom') === pos);
+            if (items.length === 0) return null;
+            const posClass =
+              pos === 'top'
+                ? 'top-14 left-1/2 -translate-x-1/2'
+                : pos === 'center'
+                  ? 'top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2'
+                  : 'bottom-10 left-1/2 -translate-x-1/2';
+            return (
+              <div
+                key={pos}
+                data-testid={`viewport-caption-${pos}`}
+                className={`pointer-events-none absolute ${posClass} z-20 flex max-w-[82%] flex-col items-center gap-1.5`}
+              >
+                {items.map((cap) => {
+                  const showSpeaker = cap.style?.showSpeaker !== false && Boolean(cap.speaker?.trim());
+                  return (
+                    <div
+                      key={cap.id}
+                      style={{
+                        backgroundColor: cap.style?.backgroundColor || 'rgba(10, 12, 16, 0.82)',
+                        color: cap.style?.textColor || '#ffffff',
+                        fontSize: cap.style?.fontSize ? `${Math.max(12, Math.min(36, Math.round(cap.style.fontSize * 0.72)))}px` : '15px',
+                      }}
+                      className="rounded-md border border-white/15 px-3.5 py-1.5 text-center font-semibold leading-snug shadow-2xl backdrop-blur-xs"
+                    >
+                      {showSpeaker && cap.speaker && (
+                        <div
+                          style={{ color: cap.style?.speakerColor || '#e8702a' }}
+                          className="mb-0.5 text-[10px] font-bold uppercase tracking-wider"
+                        >
+                          {cap.speaker}
+                        </div>
+                      )}
+                      <div className="whitespace-pre-wrap">{cap.text}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          };
+          return (
+            <>
+              {renderPosGroup('top')}
+              {renderPosGroup('center')}
+              {renderPosGroup('bottom')}
+            </>
+          );
+        })()}
 
         {/* Non-obstructive Hover Identification Tooltip */}
         {hoverInfo && !tabHud.open && (

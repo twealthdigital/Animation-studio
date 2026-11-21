@@ -322,6 +322,7 @@ export function buildSceneFromTemplate(templateId: SceneTemplateId, name: string
       ],
       characters: [],
       audioClips: [],
+      captions: [],
     };
   }
   if (templateId === 'outdoor-park') {
@@ -352,6 +353,7 @@ export function buildSceneFromTemplate(templateId: SceneTemplateId, name: string
       ],
       characters: [],
       audioClips: [],
+      captions: [],
     };
   }
   if (templateId === 'spotlight-monologue') {
@@ -374,6 +376,7 @@ export function buildSceneFromTemplate(templateId: SceneTemplateId, name: string
       props: [createPropData('podium', 'Center Spot Podium', '#e8702a', 0, 0)],
       characters: [],
       audioClips: [],
+      captions: [],
     };
   }
 
@@ -396,5 +399,6 @@ export function buildSceneFromTemplate(templateId: SceneTemplateId, name: string
     props: [],
     characters: [],
     audioClips: [],
+      captions: [],
   };
 }

@@ -474,6 +474,7 @@ interface DialogueDialogProps {
     volume: number;
     playbackRate?: number;
     pauseAfterSec?: number;
+    createCaption?: boolean;
   }) => void;
 }
 
@@ -495,6 +496,7 @@ export function DialogueDialog({
   const [duration, setDuration] = useState(3);
   const [volume, setVolume] = useState(1);
   const [pauseAfterSec, setPauseAfterSec] = useState(0.35);
+  const [createCaption, setCreateCaption] = useState(true);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recSessionRef = useRef<MicRecordingSession | null>(null);
@@ -593,6 +595,7 @@ export function DialogueDialog({
         volume,
         playbackRate: activeChar?.audioProfile.speed ?? 1,
         pauseAfterSec,
+        createCaption,
       });
       cursor += perPartDur + pauseAfterSec;
     });
@@ -651,6 +654,15 @@ export function DialogueDialog({
           </label>
         </div>
 
+        <label className="flex items-center gap-2 text-xs text-[#e6e8ec]">
+          <input
+            type="checkbox"
+            checked={createCaption}
+            onChange={(e) => setCreateCaption(e.target.checked)}
+            className="accent-[#e8702a]"
+          />
+          <span>Create synced on-screen caption (burned into exported video)</span>
+        </label>
         <div className="rounded border border-[#2a2e36] bg-[#14161a] p-2 text-[10px] text-[#98a0ad]">
           <div>{webSpeech.getStatusText()}</div>
           <div className="mt-0.5 text-[#6b7280]">{externalVoice.getStatusText()}</div>
@@ -723,6 +735,7 @@ interface ExportVideoDialogProps {
     mimeType: string;
     ext: 'mp4' | 'webm';
     includeAudio: boolean;
+    includeCaptions: boolean;
     steppedFrames: boolean;
   }) => Promise<void>;
   exporting: boolean;
@@ -749,6 +762,7 @@ export function ExportVideoDialog({
   const [fps, setFps] = useState<'24' | '30' | '60'>('30');
   const [mimeType, setMimeType] = useState(caps.supportedMimeTypes[0]?.mimeType ?? '');
   const [includeAudio, setIncludeAudio] = useState(true);
+  const [includeCaptions, setIncludeCaptions] = useState(true);
   const [steppedFrames, setSteppedFrames] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -768,6 +782,7 @@ export function ExportVideoDialog({
         mimeType: chosenFormat.mimeType,
         ext: chosenFormat.ext,
         includeAudio,
+        includeCaptions,
         steppedFrames,
       });
     } catch (err) {
@@ -857,6 +872,16 @@ export function ExportVideoDialog({
               className="accent-[#e8702a]"
             />
             <span>Include mixed dialogue, music, and sound effects</span>
+          </label>
+          <label className="flex items-center gap-2 text-[#e6e8ec]">
+            <input
+              type="checkbox"
+              checked={includeCaptions}
+              disabled={exporting}
+              onChange={(e) => setIncludeCaptions(e.target.checked)}
+              className="accent-[#e8702a]"
+            />
+            <span>Burn in on-screen captions &amp; dialogue subtitles</span>
           </label>
           <label className="flex items-center gap-2 text-[#e6e8ec]">
             <input

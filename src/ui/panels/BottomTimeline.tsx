@@ -81,6 +81,8 @@ interface BottomTimelineProps {
   onSelectTarget: (target: SelectionTarget) => void;
   onMoveAudioClip: (clipId: string, startTime: number, duration?: number) => void;
   onDeleteAudioClip: (clipId: string) => void;
+  onMoveCaption?: (captionId: string, startTime: number, duration?: number) => void;
+  onDeleteCaption?: (captionId: string) => void;
   onMoveActionClip: (instanceId: string, clipId: string, startTime: number, duration?: number) => void;
   onDeleteActionClip: (instanceId: string, clipId: string) => void;
   onDeleteKeyframe: (target: KeyframeRef) => void;
@@ -137,6 +139,8 @@ export function BottomTimeline({
   onSelectTarget,
   onMoveAudioClip,
   onDeleteAudioClip,
+  onMoveCaption,
+  onDeleteCaption,
   onMoveActionClip,
   onDeleteActionClip,
   onDeleteKeyframe,
@@ -506,6 +510,7 @@ export function BottomTimeline({
 
   const musicClips = scene.audioClips.filter((c) => c.role === 'music' || c.role === 'ambient');
   const sfxClips = scene.audioClips.filter((c) => c.role === 'sfx');
+  const captions = scene.captions ?? [];
   const workArea = scene.workArea;
   const effectiveHeight = collapseState === 'compact' ? 40 : height;
 
@@ -1170,6 +1175,79 @@ export function BottomTimeline({
                   ))}
                 </div>
               )}
+
+
+              {/* Captions & Subtitles Track */}
+              <div className="flex h-7 border-b border-[#22262e] bg-[#17191e]">
+                <div
+                  style={{ width: labelColWidth }}
+                  className="sticky left-0 z-10 flex shrink-0 items-center border-r border-[#2a2e36] bg-[#17191e] px-3 text-[11px] text-[#f7be97]"
+                >
+                  Captions ({captions.length})
+                </div>
+                <div style={{ width: trackWidth }} className="relative h-full">
+                  {captions.map((cap) => {
+                    const selected = selection.kind === 'caption' && selection.captionId === cap.id;
+                    const left = cap.startTime * pxPerSec;
+                    const width = Math.max(24, cap.duration * pxPerSec);
+                    return (
+                      <div
+                        key={cap.id}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`Caption: ${cap.text}`}
+                        style={{ left, width }}
+                        onPointerDown={(e) => {
+                          onSelectTarget({ kind: 'caption', captionId: cap.id });
+                          if (e.button === 0 && onMoveCaption) {
+                            startClipDrag(e, cap.startTime, cap.duration, 'move', (s, d) =>
+                              onMoveCaption(cap.id, s, d),
+                            );
+                          }
+                        }}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          setCtxMenu({
+                            x: e.clientX,
+                            y: e.clientY,
+                            items: [
+                              { label: 'Seek to Caption', onClick: () => onSeek(cap.startTime) },
+                              ...(onDeleteCaption
+                                ? [
+                                    {
+                                      label: 'Delete Caption',
+                                      danger: true,
+                                      onClick: () => onDeleteCaption(cap.id),
+                                    },
+                                  ]
+                                : []),
+                            ],
+                          });
+                        }}
+                        className={`absolute top-1 bottom-1 flex items-center overflow-hidden rounded border px-1.5 text-[10px] cursor-grab active:cursor-grabbing ${
+                          selected
+                            ? 'border-[#fbbf24] bg-[#3b2d18] text-white'
+                            : 'border-[#524329] bg-[#262017] text-[#fde68a]'
+                        }`}
+                      >
+                        <span className="truncate font-medium">
+                          {cap.speaker ? `${cap.speaker}: ${cap.text}` : cap.text}
+                        </span>
+                        {onMoveCaption && (
+                          <div
+                            onPointerDown={(e) =>
+                              startClipDrag(e, cap.startTime, cap.duration, 'resize', (s, d) =>
+                                onMoveCaption(cap.id, s, d),
+                              )
+                            }
+                            className="absolute right-0 top-0 bottom-0 w-1.5 cursor-ew-resize hover:bg-[#fbbf24]"
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
 
               {/* Global Background Music & SFX Tracks */}
               <div className="flex h-7 border-b border-[#22262e] bg-[#17191e]">

@@ -247,6 +247,7 @@ export function migrateProjectData(raw: ProjectData): ProjectData {
         },
       })),
       audioClips: Array.isArray(sc.audioClips) ? sc.audioClips : [],
+      captions: Array.isArray(sc.captions) ? sc.captions : [],
     };
   });
 
